@@ -188,10 +188,10 @@ function install_uv() {
             echo "Please manually chmod +x $UV_INSTALL_SH"
             exit 1
         fi
-        if [ -d "$CURRENT_DIR/.uv" ]; then
-            rm -rf "$CURRENT_DIR/.uv"
+        if [ -d "$UV_HOME" ]; then
+            rm -rf "$UV_HOME"
             if [ $? -ne 0 ]; then
-                echo "Please manually rm -rf $CURRENT_DIR/.uv-bin directory.\
+                echo "Please manually rm -rf $UV_HOME directory.\
                 Then retry to exec the script."
                 exit 1
             fi
@@ -201,17 +201,17 @@ function install_uv() {
         print_function "STEP" "download uv... [SUCCESS]"
     fi
 
-    if [ ! -d "$CURRENT_DIR/.uv/venv" ]; then
+    if [ ! -x "$UV_HOME/bin/pip" ] || [ ! -x "$UV_HOME/bin/uv" ]; then
         print_function "STEP" "setup uv virtualenv"
         # Create a Python 3.12 virtual environment as the base environment.
-        $CURRENT_DIR/download/uv venv "$CURRENT_DIR/.uv" --seed --python 3.12
+        $CURRENT_DIR/download/uv venv "$UV_HOME" --seed --python 3.12
         print_function "STEP" "setup uv virtualenv... [SUCCESS]"
         # orjson depend on pip >= 20.3
         print_function "STEP" "upgrade pip..."
-        $CURRENT_DIR/.uv/bin/pip install --upgrade pip setuptools 2>&1 >/dev/null
+        $UV_HOME/bin/pip install --upgrade pip setuptools 2>&1 >/dev/null
         print_function "STEP" "upgrade pip... [SUCCESS]"
         # move uv binaries into virtual env
-        mv "$CURRENT_DIR/download/uv" "$CURRENT_DIR/.uv/bin/"
+        mv "$CURRENT_DIR/download/uv" "$UV_HOME/bin/"
     fi
 }
 
@@ -219,11 +219,11 @@ function install_uv() {
 function install_py_env() {
     py_env=("3.9" "3.10" "3.11" "3.12")
     for ((i=0;i<${#py_env[@]};i++)) do
-        if [ -d "$CURRENT_DIR/.uv/envs/${py_env[i]}" ]; then
-            rm -rf "$CURRENT_DIR/.uv/envs/${py_env[i]}"
+        if [ -d "$UV_ENVS_HOME/envs/${py_env[i]}" ]; then
+            rm -rf "$UV_ENVS_HOME/envs/${py_env[i]}"
             if [ $? -ne 0 ]; then
-                echo "rm -rf $CURRENT_DIR/.uv/envs/${py_env[i]} failed, please \
-                rm -rf $CURRENT_DIR/.uv/envs/${py_env[i]} manually.\
+                echo "rm -rf $UV_ENVS_HOME/envs/${py_env[i]} failed, please \
+                rm -rf $UV_ENVS_HOME/envs/${py_env[i]} manually.\
                 Then retry to exec the script."
                 exit 1
             fi
@@ -231,7 +231,7 @@ function install_py_env() {
         print_function "STEP" "installing python${py_env[i]}..."
         max_retry_times=3
         retry_times=0
-        install_command="$UV_PATH venv $CURRENT_DIR/.uv/envs/${py_env[i]} -q --python=${py_env[i]} --seed"
+        install_command="$UV_PATH venv $UV_ENVS_HOME/envs/${py_env[i]} -q --python=${py_env[i]} --seed"
         ${install_command} 2>&1 >/dev/null
         status=$?
         while [[ ${status} -ne 0 ]] && [[ ${retry_times} -lt ${max_retry_times} ]]; do
@@ -248,7 +248,7 @@ function install_py_env() {
             exit 1
         fi
 
-        $CURRENT_DIR/.uv/envs/${py_env[i]}/bin/pip install -q uv==${UV_VERSION}
+        $UV_ENVS_HOME/envs/${py_env[i]}/bin/pip install -q uv==${UV_VERSION}
         print_function "STEP" "install python${py_env[i]}... [SUCCESS]"
     done
 }
@@ -440,13 +440,13 @@ function create_dir() {
 
 # Set created py-env in $PATH for tox's creating virtual env
 function activate () {
-    if [ ! -d $CURRENT_DIR/.uv/envs ]; then
-        echo "For some unknown reasons, missing the directory $CURRENT_DIR/.uv/envs,\
+    if [ ! -d $UV_ENVS_HOME/envs ]; then
+        echo "For some unknown reasons, missing the directory $UV_ENVS_HOME/envs,\
         you should exec the script with the option: -f"
         exit 1
     fi
 
-    for py_dir in $CURRENT_DIR/.uv/envs/*
+    for py_dir in $UV_ENVS_HOME/envs/*
     do
         PATH=$py_dir/bin:$PATH
     done
@@ -687,6 +687,8 @@ else
     UV_HOME=$FLINK_UV_HOME
     ENV_HOME="${UV_PREFIX-$UV_HOME}"
 fi
+
+UV_ENVS_HOME="${UV_PREFIX-$CURRENT_DIR/.uv}"
 
 # uv path
 UV_PATH=$UV_HOME/bin/uv
