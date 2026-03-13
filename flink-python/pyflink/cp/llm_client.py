@@ -70,6 +70,7 @@ class LLMClientConfig:
     mock_delay_s: float = 0.1
     mock_response: Optional[str] = None     # fixed response; None → echo prompt
     mock_fail_first_n: int = 0              # simulate N transient failures
+    mock_bad_json_first_n: int = 0          # return invalid JSON for first N calls (Flink retry test)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ class MockLLMClient(LLMClient):
         self._delay = config.mock_delay_s
         self._response = config.mock_response
         self._fail_first_n = config.mock_fail_first_n
+        self._bad_json_first_n = config.mock_bad_json_first_n
         self._call_count = 0
 
     async def call(self, prompt: str) -> tuple[str, LLMCallMetrics]:
@@ -110,13 +112,21 @@ class MockLLMClient(LLMClient):
             attempts += 1
             self._call_count += 1
 
-            # simulate transient failures
+            # simulate transient failures (Layer 1 retry)
             if self._call_count <= self._fail_first_n:
                 last_err = "mock transient failure"
                 await asyncio.sleep(self._delay)
                 continue
 
             await asyncio.sleep(self._delay)
+
+            # simulate bad JSON responses (triggers Flink Layer 2 retry)
+            if self._call_count <= self._fail_first_n + self._bad_json_first_n:
+                return "INVALID_JSON_FOR_RETRY_TEST", LLMCallMetrics(
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    attempts=attempts,
+                )
+
             text = self._response if self._response is not None else prompt
             return text, LLMCallMetrics(
                 latency_ms=(time.monotonic() - t0) * 1000,

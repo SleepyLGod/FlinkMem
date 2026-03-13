@@ -35,6 +35,7 @@ from typing import List, Optional
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.cp.llm_client import LLMClient, LLMClientConfig, create_llm_client
+from pyflink.cp.metrics import OperatorMetrics
 from pyflink.cp.operators._common import attach_metrics, make_degraded_json
 
 logger = logging.getLogger(__name__)
@@ -67,11 +68,13 @@ class SemFilterFunction(AsyncFunction):
         self._llm_config = llm_config
         self._default_decision = default_decision
         self._client: Optional[LLMClient] = None
+        self._op_metrics: Optional[OperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
     def open(self, runtime_context: RuntimeContext) -> None:
         self._client = create_llm_client(self._llm_config)
+        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_filter")
         logger.info("SemFilterFunction opened (backend=%s)", self._llm_config.backend)
 
     def close(self) -> None:
@@ -97,6 +100,7 @@ class SemFilterFunction(AsyncFunction):
 
     async def async_invoke(self, value) -> List[str]:
         assert self._client is not None, "open() was not called"
+        om = self._op_metrics
 
         prompt = self._prompt_template.format(input=value)
 
@@ -104,18 +108,28 @@ class SemFilterFunction(AsyncFunction):
             text, metrics = await self._client.call(prompt)
         except Exception as e:
             logger.warning("LLM call failed for sem_filter: %s", e)
+            if om:
+                om.record_error()
             return [self._degraded_result(value, f"llm_call_error: {e}")]
+
+        if om:
+            om.record_call(metrics.latency_ms, metrics.input_tokens,
+                           metrics.output_tokens, metrics.attempts)
 
         # Parse JSON
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning("sem_filter JSON parse failed: %s", e)
+            if om:
+                om.record_invalid_output()
             return [self._degraded_result(value, f"json_parse_error: {e}")]
 
         # Validate required keys
         if not isinstance(parsed, dict) or not _FILTER_SCHEMA_KEYS.issubset(parsed):
             logger.warning("sem_filter schema validation failed: %s", parsed)
+            if om:
+                om.record_invalid_output()
             return [self._degraded_result(value, "schema_validation_error")]
 
         # Normalise types
@@ -129,5 +143,7 @@ class SemFilterFunction(AsyncFunction):
 
     def timeout(self, value) -> List[str]:
         """Return degraded record on Flink-level timeout — never throw."""
+        if self._op_metrics:
+            self._op_metrics.record_timeout()
         return [self._degraded_result(value, "flink_timeout")]
 

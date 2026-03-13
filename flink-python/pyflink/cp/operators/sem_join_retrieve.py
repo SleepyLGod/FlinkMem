@@ -43,6 +43,7 @@ from typing import Any, List, Optional
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.cp.llm_client import LLMClient, LLMClientConfig, create_llm_client
+from pyflink.cp.metrics import OperatorMetrics
 from pyflink.cp.operators._common import attach_metrics, make_degraded_json
 
 logger = logging.getLogger(__name__)
@@ -115,9 +116,11 @@ class SemJoinRetrieveFunction(AsyncFunction):
         self._join_config = join_config
         self._client: Optional[LLMClient] = None
         self._retriever: Optional[CandidateRetriever] = None
+        self._op_metrics: Optional[OperatorMetrics] = None
 
     def open(self, runtime_context: RuntimeContext) -> None:
         self._client = create_llm_client(self._llm_config)
+        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_join_retrieve")
         cfg = self._join_config
         # V0.1: only mock retriever; real implementations plugged in later.
         if cfg.mock_candidates is not None:
@@ -138,6 +141,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
     async def async_invoke(self, value) -> List[str]:
         assert self._client is not None, "open() was not called"
         assert self._retriever is not None
+        om = self._op_metrics
 
         cfg = self._join_config
         truncated = False
@@ -151,9 +155,13 @@ class SemJoinRetrieveFunction(AsyncFunction):
             )
         except asyncio.TimeoutError:
             logger.warning("sem_join_retrieve: retrieval timed out for %s", value)
+            if om:
+                om.record_timeout()
             return [make_degraded_json(value, "retrieve_timeout")]
         except Exception as e:
             logger.warning("sem_join_retrieve: retrieval error: %s", e)
+            if om:
+                om.record_error()
             return [make_degraded_json(value, f"retrieve_error: {e}")]
 
         # 2. Enforce hard cap + truncate overflow
@@ -173,13 +181,21 @@ class SemJoinRetrieveFunction(AsyncFunction):
             text, metrics = await self._client.call(prompt)
         except Exception as e:
             logger.warning("LLM call failed for sem_join_retrieve: %s", e)
+            if om:
+                om.record_error()
             return [make_degraded_json(value, f"llm_call_error: {e}")]
+
+        if om:
+            om.record_call(metrics.latency_ms, metrics.input_tokens,
+                           metrics.output_tokens, metrics.attempts)
 
         # 4. Parse response
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning("sem_join_retrieve JSON parse failed: %s", e)
+            if om:
+                om.record_invalid_output()
             return [make_degraded_json(value, f"json_parse_error: {e}")]
 
         result = {
@@ -193,5 +209,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
 
     def timeout(self, value) -> List[str]:
         """Return degraded record on Flink-level timeout — never throw."""
+        if self._op_metrics:
+            self._op_metrics.record_timeout()
         return [make_degraded_json(value, "flink_timeout")]
 

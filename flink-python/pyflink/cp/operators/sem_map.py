@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.cp.llm_client import LLMCallMetrics, LLMClient, LLMClientConfig, create_llm_client
+from pyflink.cp.metrics import OperatorMetrics
 from pyflink.cp.operators._common import (
     attach_metrics, make_degraded_json, validate_schema,
 )
@@ -76,11 +77,13 @@ class SemMapFunction(AsyncFunction):
         self._llm_config = llm_config
         # Initialised in open().
         self._client: Optional[LLMClient] = None
+        self._op_metrics: Optional[OperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
     def open(self, runtime_context: RuntimeContext) -> None:
         self._client = create_llm_client(self._llm_config)
+        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_map")
         logger.info("SemMapFunction opened (backend=%s)", self._llm_config.backend)
 
     def close(self) -> None:
@@ -92,6 +95,7 @@ class SemMapFunction(AsyncFunction):
 
     async def async_invoke(self, value) -> List[str]:
         assert self._client is not None, "open() was not called"
+        om = self._op_metrics
 
         prompt = self._prompt_template.format(input=value)
 
@@ -99,18 +103,28 @@ class SemMapFunction(AsyncFunction):
             text, metrics = await self._client.call(prompt)
         except Exception as e:
             logger.warning("LLM call failed for sem_map: %s", e)
+            if om:
+                om.record_error()
             return [make_degraded_json(value, f"llm_call_error: {e}")]
+
+        if om:
+            om.record_call(metrics.latency_ms, metrics.input_tokens,
+                           metrics.output_tokens, metrics.attempts)
 
         # Parse JSON response
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning("sem_map JSON parse failed: %s", e)
+            if om:
+                om.record_invalid_output()
             return [make_degraded_json(value, f"json_parse_error: {e}")]
 
         # Validate schema
         if not validate_schema(parsed, self._output_schema):
             logger.warning("sem_map schema validation failed for: %s", parsed)
+            if om:
+                om.record_invalid_output()
             return [make_degraded_json(value, "schema_validation_error")]
 
         attach_metrics(parsed, metrics)
@@ -118,5 +132,7 @@ class SemMapFunction(AsyncFunction):
 
     def timeout(self, value) -> List[str]:
         """Return degraded record on Flink-level timeout — never throw."""
+        if self._op_metrics:
+            self._op_metrics.record_timeout()
         return [make_degraded_json(value, "flink_timeout")]
 
