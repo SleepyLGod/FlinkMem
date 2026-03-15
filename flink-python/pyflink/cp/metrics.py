@@ -93,7 +93,16 @@ class OperatorMetrics:
     ) -> "OperatorMetrics":
         """Try to register Flink metrics; fall back to local-only on failure."""
         try:
-            mg = runtime_context.get_metric_group().add_group("cp", operator_name)
+            # DataStream RuntimeContext exposes get_metrics_group(); some other contexts may expose
+            # get_metric_group(). Support both for compatibility.
+            if hasattr(runtime_context, "get_metrics_group"):
+                root_mg = runtime_context.get_metrics_group()
+            elif hasattr(runtime_context, "get_metric_group"):
+                root_mg = runtime_context.get_metric_group()
+            else:
+                raise AttributeError("RuntimeContext has no metric-group accessor")
+
+            mg = root_mg.add_group("cp", operator_name)
             return cls(
                 call_counter=mg.counter("call_count"),
                 error_counter=mg.counter("error_count"),
@@ -161,4 +170,3 @@ class OperatorMetrics:
         self.local_retry_exhaustion_count += 1
         if self._retry_exhaustion_counter is not None:
             self._retry_exhaustion_counter.inc()
-
