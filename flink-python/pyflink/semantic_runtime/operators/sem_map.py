@@ -37,9 +37,9 @@ from typing import Any, Dict, List, Optional
 
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
-from pyflink.cp.llm_client import LLMCallMetrics, LLMClient, LLMClientConfig, create_llm_client
-from pyflink.cp.metrics import OperatorMetrics
-from pyflink.cp.operators._common import (
+from pyflink.semantic_runtime.llm_client import LLMCallMetrics, LLMClient, LLMClientConfig, create_llm_client
+from pyflink.semantic_runtime.metrics import OperatorMetrics
+from pyflink.semantic_runtime.operators._common import (
     attach_metrics, make_degraded_json, validate_schema,
 )
 

@@ -71,7 +71,7 @@ User Code
 
 ### Step 1: Project Skeleton + Environment Validation
 
-- Create working directory `flink-python/pyflink/cp/`.
+- Create working directory `flink-python/pyflink/semantic_runtime/`.
 - Write a minimal PyFlink DataStream job: source → `AsyncDataStream.unordered_wait(mock_async_func)` → print sink.
 - Mock function: `async_invoke` does `await asyncio.sleep(0.1)` + returns original data.
 - Add an explicit startup guard that validates Python execution mode is not `thread`.
@@ -162,7 +162,7 @@ User Code
 ## File Structure
 
 ```text
-flink-python/pyflink/cp/
+flink-python/pyflink/semantic_runtime/
 ├── __init__.py
 ├── llm_client.py              # LLMClient base + MockLLMClient + OpenAILLMClient
 ├── operators/

@@ -144,7 +144,7 @@ metric group is unavailable (e.g. unit tests).  Tracked metrics:
 ## 4. File Structure
 
 ```text
-flink-python/pyflink/cp/
+flink-python/pyflink/semantic_runtime/
 ├── __init__.py
 ├── llm_client.py                  # LLMClient base + Mock + OpenAI backends
 ├── metrics.py                     # OperatorMetrics (Flink MetricGroup wrapper)

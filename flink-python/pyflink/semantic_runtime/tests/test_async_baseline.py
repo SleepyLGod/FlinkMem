@@ -27,12 +27,12 @@ Expected output: 5 records printed to stdout (values 2, 4, 6, 8, 10 in any order
 
 import asyncio
 
-# Bootstrap: ensure pyflink.cp is importable via symlink
+# Bootstrap: ensure pyflink.semantic_runtime is importable via symlink
 import os, pathlib, pyflink as _pf  # noqa: E401
-_cp_src = pathlib.Path(__file__).resolve().parents[1]
-_cp_dst = pathlib.Path(_pf.__file__).parent / "cp"
-if not _cp_dst.exists():
-    os.symlink(_cp_src, _cp_dst)
+_sem_runtime_src = pathlib.Path(__file__).resolve().parents[1]
+_sem_runtime_dst = pathlib.Path(_pf.__file__).parent / "semantic_runtime"
+if not _sem_runtime_dst.exists():
+    os.symlink(_sem_runtime_src, _sem_runtime_dst)
 
 from pyflink.common import Time, Types
 from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream

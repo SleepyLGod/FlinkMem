@@ -17,22 +17,21 @@ Two-level metrics:
 Notes:
 - This suite intentionally stays in V0.1 boundaries:
   no keyed-state semantic operators are introduced.
-- This script reads API credentials from environment variables only.
-  It does NOT parse `.env` directly.
+- In `real/all` mode, this script will also try to load a local `.env` file
+  (without overriding already-exported environment variables).
 
 Run examples (isolated env):
   1) Mock-only dual-path structural check
      export JAVA_HOME=/Users/von/Projects/FlinkMem/.isolation/jdk/jdk-17.0.18+8/Contents/Home
      export PYFLINK_CLIENT_EXECUTABLE=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python
      export PATH=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin:$PATH
-     python flink-python/pyflink/cp/tests/test_v01_conversational_correctness_suite.py --mode mock
+     python flink-python/pyflink/semantic_runtime/tests/test_v01_conversational_correctness_suite.py --mode mock
 
   2) Real API check (LoCoMo 1 user x 20 QA)
-     set -a && source .env && set +a
      export JAVA_HOME=/Users/von/Projects/FlinkMem/.isolation/jdk/jdk-17.0.18+8/Contents/Home
      export PYFLINK_CLIENT_EXECUTABLE=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python
      export PATH=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin:$PATH
-     python flink-python/pyflink/cp/tests/test_v01_conversational_correctness_suite.py \
+     python flink-python/pyflink/semantic_runtime/tests/test_v01_conversational_correctness_suite.py \
        --mode real --locomo-data /tmp/locomo10.json --sample-index 0 --qa-limit 20
 """
 
@@ -47,22 +46,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-# Bootstrap: ensure pyflink.cp is importable via symlink.
+# Bootstrap: ensure pyflink.semantic_runtime is importable via symlink.
 import pyflink as _pf
 
-_cp_src = pathlib.Path(__file__).resolve().parents[1]
-_cp_dst = pathlib.Path(_pf.__file__).parent / "cp"
-if not _cp_dst.exists():
-    os.symlink(_cp_src, _cp_dst)
+_sem_runtime_src = pathlib.Path(__file__).resolve().parents[1]
+_sem_runtime_dst = pathlib.Path(_pf.__file__).parent / "semantic_runtime"
+if not _sem_runtime_dst.exists():
+    os.symlink(_sem_runtime_src, _sem_runtime_dst)
 
 from pyflink.common import Time, Types
 from pyflink.datastream import AsyncDataStream, StreamExecutionEnvironment
 from pyflink.datastream.functions import WindowFunction
 
-from pyflink.cp.llm_client import LLMClientConfig
-from pyflink.cp.operators.sem_filter import SemFilterFunction
-from pyflink.cp.operators.sem_join_retrieve import SemJoinRetrieveConfig, SemJoinRetrieveFunction
-from pyflink.cp.operators.sem_map import SemMapFunction
+from pyflink.semantic_runtime.llm_client import LLMClientConfig
+from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction
+from pyflink.semantic_runtime.operators.sem_join_retrieve import SemJoinRetrieveConfig, SemJoinRetrieveFunction
+from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
 
 
 EVENT_REQUIRED_FIELDS = (
@@ -138,6 +137,49 @@ def relaxed_match(pred: str, gold: str) -> bool:
     if not p or not g:
         return False
     return p == g or p in g or g in p
+
+
+def _parse_dotenv_line(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None, None
+    if line.startswith("export "):
+        line = line[len("export "):].strip()
+    if "=" not in line:
+        return None, None
+    key, val = line.split("=", 1)
+    key = key.strip()
+    val = val.strip()
+    if not key:
+        return None, None
+    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+        val = val[1:-1]
+    return key, val
+
+
+def try_load_env_file(env_file: str) -> Optional[str]:
+    path_arg = pathlib.Path(env_file).expanduser()
+    if path_arg.is_absolute():
+        candidates = [path_arg]
+    else:
+        repo_root = pathlib.Path(__file__).resolve().parents[4]
+        candidates = [pathlib.Path.cwd() / path_arg, repo_root / path_arg]
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        loaded = 0
+        with candidate.open("r", encoding="utf-8") as f:
+            for raw in f:
+                key, val = _parse_dotenv_line(raw)
+                if not key:
+                    continue
+                if key in os.environ:
+                    continue
+                os.environ[key] = val or ""
+                loaded += 1
+        return f"{candidate} (loaded={loaded})"
+    return None
 
 
 def collect_stream(stream, job_name: str) -> List[str]:
@@ -867,6 +909,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--capacity", type=int, default=4)
     p.add_argument("--max-allowed-attempts", type=int, default=6)
     p.add_argument("--artifact-dir", default="/tmp/cp_v01_correctness_artifacts")
+    p.add_argument("--env-file", default=".env")
 
     p.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     p.add_argument("--api-base", default="https://api.deepseek.com/v1")
@@ -884,6 +927,9 @@ def main() -> None:
 
     record: Optional[Dict[str, Any]] = None
     if args.mode in ("real", "all"):
+        env_load_info = try_load_env_file(args.env_file)
+        if env_load_info is not None:
+            summary["env_file"] = env_load_info
         record = load_locomo_record(args.locomo_data, args.sample_index)
         summary["locomo_sample_id"] = record.get("sample_id", "")
 
