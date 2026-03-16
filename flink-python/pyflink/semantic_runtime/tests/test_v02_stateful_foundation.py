@@ -274,6 +274,535 @@ class TestSemWindowBoundaryLogic:
 
 
 # ============================================================================
+# Async Bridge Tests
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.async_bridge import (
+    AsyncWorkItem,
+    AsyncResult,
+    ASYNC_WORK_TAG,
+)
+
+class TestAsyncWorkItem:
+    def test_roundtrip(self):
+        item = AsyncWorkItem(key="u1", task_type="classify",
+                             payload={"text": "hello"})
+        d = item.to_dict()
+        item2 = AsyncWorkItem.from_dict(d)
+        assert item2.key == "u1"
+        assert item2.task_type == "classify"
+        assert item2.payload == {"text": "hello"}
+        assert len(item2.request_id) == 12
+
+    def test_from_dict_ignores_extra(self):
+        d = {"key": "k", "task_type": "t", "payload": {}, "request_id": "abc",
+             "extra": 42}
+        item = AsyncWorkItem.from_dict(d)
+        assert item.key == "k"
+
+class TestAsyncResult:
+    def test_roundtrip(self):
+        r = AsyncResult(key="u1", task_type="classify",
+                        result={"group_id": "g1"}, request_id="abc")
+        d = r.to_dict()
+        r2 = AsyncResult.from_dict(d)
+        assert r2.key == "u1"
+        assert r2.success is True
+        assert r2.result == {"group_id": "g1"}
+
+    def test_error_result(self):
+        r = AsyncResult(key="u1", task_type="classify",
+                        success=False, error="timeout")
+        assert r.success is False
+        assert r.error == "timeout"
+
+class TestAsyncWorkTag:
+    def test_tag_exists(self):
+        assert ASYNC_WORK_TAG is not None
+        assert ASYNC_WORK_TAG.tag_id == "async_work_items"
+
+
+# ============================================================================
+# SemGroupby Logic Tests (no Flink runtime — test pure internals)
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
+    SemGroupbyConfig,
+    SemGroupbyFunction,
+    _new_group_profile,
+)
+
+class TestGroupProfile:
+    def test_new_profile(self):
+        p = _new_group_profile("g1", "machine learning", 1000)
+        assert p["group_id"] == "g1"
+        assert p["label"] == "machine learning"
+        assert p["event_count"] == 0
+        assert p["created_ms"] == 1000
+        assert p["last_update_ms"] == 1000
+
+class TestSemGroupbyConfig:
+    def test_defaults(self):
+        cfg = SemGroupbyConfig()
+        assert cfg.max_groups_per_key == 50
+        assert cfg.confidence_threshold == 0.7
+        assert cfg.new_group_creation_threshold == 0.3
+        assert cfg.overflow_policy == OverflowPolicy.DROP_OLDEST
+
+class TestSemGroupbyLocalAssign:
+    """Test _local_assign without Flink state — using a mock MapState."""
+
+    def _make_func_with_groups(self, groups):
+        """Create a SemGroupbyFunction with injected mock MapState."""
+        func = SemGroupbyFunction(SemGroupbyConfig())
+        func._group_profiles = _FakeMapState(groups)
+        return func
+
+    def test_exact_match(self):
+        func = self._make_func_with_groups({
+            "g1": {"label": "machine learning algorithms", "event_count": 5},
+            "g2": {"label": "web development frontend", "event_count": 3},
+        })
+        event = SemanticEvent(key="k", payload="machine learning algorithms rock", seq_id=0)
+        gid, score = func._local_assign(event)
+        assert gid == "g1"
+        assert score > 0.5
+
+    def test_no_match(self):
+        func = self._make_func_with_groups({
+            "g1": {"label": "machine learning", "event_count": 5},
+        })
+        event = SemanticEvent(key="k", payload="completely unrelated topic", seq_id=0)
+        gid, score = func._local_assign(event)
+        assert score == 0.0
+
+    def test_empty_groups(self):
+        func = self._make_func_with_groups({})
+        event = SemanticEvent(key="k", payload="anything", seq_id=0)
+        gid, score = func._local_assign(event)
+        assert gid is None
+        assert score == 0.0
+
+    def test_best_of_multiple(self):
+        func = self._make_func_with_groups({
+            "g1": {"label": "python programming", "event_count": 5},
+            "g2": {"label": "python web flask django", "event_count": 3},
+        })
+        event = SemanticEvent(key="k", payload="python web flask", seq_id=0)
+        gid, score = func._local_assign(event)
+        assert gid == "g2"
+
+
+# ============================================================================
+# CtsRetrieve Logic Tests (no Flink runtime)
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.cts_retrieve import (
+    CtsRetrieveConfig,
+    CtsRetrieveFunction,
+)
+
+class TestCtsRetrieveConfig:
+    def test_defaults(self):
+        cfg = CtsRetrieveConfig()
+        assert cfg.max_candidates_per_request == 20
+        assert cfg.max_cache_entries_per_key == 200
+        assert cfg.ttl_seconds == 1800
+        assert cfg.overflow_policy == OverflowPolicy.DROP_OLDEST
+
+class TestCtsRetrieveLocalRetrieve:
+    """Test _local_retrieve without Flink state."""
+
+    def _make_func_with_cache(self, cache_entries):
+        func = CtsRetrieveFunction(CtsRetrieveConfig())
+        func._cache = _FakeMapState(cache_entries)
+        return func
+
+    def test_keyword_match(self):
+        func = self._make_func_with_cache({
+            "c1": {"content": "machine learning deep neural network", "source": "doc1"},
+            "c2": {"content": "web development react frontend", "source": "doc2"},
+            "c3": {"content": "machine learning pytorch training", "source": "doc3"},
+        })
+        event = SemanticEvent(key="k", payload="machine learning", seq_id=0)
+        results = func._local_retrieve(event)
+        assert len(results) >= 2
+        # Top results should be ML-related
+        assert results[0]["candidate_id"] in ("c1", "c3")
+
+    def test_no_match(self):
+        func = self._make_func_with_cache({
+            "c1": {"content": "completely irrelevant xyz", "source": "doc1"},
+        })
+        event = SemanticEvent(key="k", payload="quantum computing", seq_id=0)
+        results = func._local_retrieve(event)
+        assert len(results) == 0
+
+    def test_empty_cache(self):
+        func = self._make_func_with_cache({})
+        event = SemanticEvent(key="k", payload="anything", seq_id=0)
+        results = func._local_retrieve(event)
+        assert results == []
+
+    def test_score_ordering(self):
+        func = self._make_func_with_cache({
+            "c1": {"content": "python", "source": "a"},
+            "c2": {"content": "python programming language", "source": "b"},
+        })
+        event = SemanticEvent(key="k", payload="python", seq_id=0)
+        results = func._local_retrieve(event)
+        assert len(results) >= 1
+        # c1 has perfect keyword match (1/1), c2 partial (1/3)
+        assert results[0]["candidate_id"] == "c1"
+
+class TestCtsRetrieveCacheEnforcement:
+    def test_enforce_cache_limit(self):
+        entries = {f"c{i}": {"content": f"text {i}", "_cached_at_ms": i * 100}
+                   for i in range(10)}
+        func = CtsRetrieveFunction(CtsRetrieveConfig(max_cache_entries_per_key=5))
+        func._cache = _FakeMapState(entries)
+        evicted = func._enforce_cache_limit()
+        assert evicted == 5
+        # Should keep the 5 newest (c5-c9)
+        remaining_keys = list(func._cache.keys())
+        assert len(remaining_keys) == 5
+
+    def test_under_limit_no_eviction(self):
+        entries = {"c1": {"content": "a"}, "c2": {"content": "b"}}
+        func = CtsRetrieveFunction(CtsRetrieveConfig(max_cache_entries_per_key=10))
+        func._cache = _FakeMapState(entries)
+        evicted = func._enforce_cache_limit()
+        assert evicted == 0
+
+
+# ============================================================================
+# Helpers — Fake MapState for testing without Flink runtime
+# ============================================================================
+
+class _FakeMapState:
+    """Minimal MapState mock for unit tests."""
+    def __init__(self, data: dict = None):
+        self._data = dict(data) if data else {}
+
+    def get(self, key):
+        return self._data.get(key)
+
+    def put(self, key, value):
+        self._data[key] = value
+
+    def contains(self, key):
+        return key in self._data
+
+    def remove(self, key):
+        self._data.pop(key, None)
+
+    def keys(self):
+        return list(self._data.keys())
+
+    def values(self):
+        return list(self._data.values())
+
+    def items(self):
+        return list(self._data.items())
+
+    def is_empty(self):
+        return len(self._data) == 0
+
+
+# ============================================================================
+# SemAgg Logic Tests
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.sem_agg_stateful import (
+    SemAggConfig,
+    SemAggFunction,
+)
+
+class TestSemAggConfig:
+    def test_defaults(self):
+        cfg = SemAggConfig()
+        assert cfg.mode == "algebraic"
+        assert cfg.max_buffer_events == 100
+        assert cfg.overflow_policy == OverflowPolicy.DROP_OLDEST
+
+    def test_summarize_mode(self):
+        cfg = SemAggConfig(mode="summarize", max_buffer_events=20)
+        assert cfg.mode == "summarize"
+        assert cfg.max_buffer_events == 20
+
+
+class TestSemAggAlgebraic:
+    """Test algebraic aggregation path (no Flink runtime)."""
+
+    def _make_func(self, reduce_fn=None):
+        cfg = SemAggConfig(mode="algebraic", reduce_fn=reduce_fn)
+        func = SemAggFunction(cfg)
+        func._buffer = _FakeListState()
+        func._agg_value = _FakeValueState()
+        func._meta = _FakeValueState()
+        return func
+
+    def test_first_event_stores_directly(self):
+        func = self._make_func()
+        func._meta.update({"key": "k", "event_count": 1, "version": 0})
+        result = list(func._algebraic_step(
+            {"key": "k", "count": 1}, func._meta.value(), 1000
+        ))
+        assert len(result) == 1
+        assert result[0]["mode"] == "algebraic"
+        assert result[0]["version"] == 1
+
+    def test_reduce_fn_applied(self):
+        def sum_reduce(a, b):
+            return {"key": a.get("key", "k"),
+                    "total": a.get("total", 0) + b.get("total", 0)}
+
+        func = self._make_func(reduce_fn=sum_reduce)
+        func._agg_value.update({"key": "k", "total": 10})
+        func._meta.update({"key": "k", "event_count": 2, "version": 1})
+        result = list(func._algebraic_step(
+            {"key": "k", "total": 5}, func._meta.value(), 2000
+        ))
+        assert result[0]["aggregate"]["total"] == 15
+        assert result[0]["version"] == 2
+
+
+class TestSemAggSummarize:
+    """Test summarize path buffer logic (no Flink runtime)."""
+
+    def _make_func(self, max_buf=3):
+        cfg = SemAggConfig(mode="summarize", max_buffer_events=max_buf)
+        func = SemAggFunction(cfg)
+        func._buffer = _FakeListState()
+        func._agg_value = _FakeValueState()
+        func._meta = _FakeValueState()
+        return func
+
+    def test_buffer_accumulates(self):
+        func = self._make_func(max_buf=5)
+        meta = {"key": "k", "event_count": 1, "version": 0,
+                "pending_summarize": False, "_last_summarize_count": 0}
+        func._meta.update(meta)
+        results = list(func._summarize_step(
+            {"key": "k", "payload": "hello"}, meta, 1000
+        ))
+        # Should not emit yet (1 < 5)
+        assert len(results) == 0
+        assert len(list(func._buffer.get())) == 1
+
+    def test_buffer_triggers_summarize(self):
+        func = self._make_func(max_buf=2)
+        # Pre-fill buffer
+        func._buffer.add({"key": "k", "payload": "a"})
+        meta = {"key": "k", "event_count": 2, "version": 0,
+                "pending_summarize": False, "_last_summarize_count": 0}
+        func._meta.update(meta)
+        results = list(func._summarize_step(
+            {"key": "k", "payload": "b"}, meta, 2000
+        ))
+        # Should emit an async work item via side output
+        assert len(results) == 1
+        assert results[0][0] == ASYNC_WORK_TAG  # (tag, dict) tuple
+
+    def test_handle_summarize_result(self):
+        func = self._make_func()
+        func._meta.update({"key": "k", "event_count": 5, "version": 1,
+                           "pending_summarize": True})
+        result_dict = {
+            "task_type": "summarize", "key": "k", "success": True,
+            "result": {"summary": "A summary of events"},
+        }
+        results = list(func._handle_summarize_result(result_dict, 3000))
+        assert len(results) == 1
+        assert results[0]["mode"] == "summarize"
+        assert results[0]["aggregate"]["summary"] == "A summary of events"
+        assert results[0]["version"] == 2
+
+
+# ============================================================================
+# SemTopK Logic Tests
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
+    SemTopKConfig,
+    SemTopKFunction,
+)
+
+class TestSemTopKConfig:
+    def test_defaults(self):
+        cfg = SemTopKConfig()
+        assert cfg.k == 10
+        assert cfg.max_candidates == 100
+        assert cfg.emission_policy == "delta"
+
+
+class TestSemTopKRecompute:
+    """Test top-k recomputation logic (no Flink runtime)."""
+
+    def _make_func(self, k=3, max_cand=10, policy="delta"):
+        cfg = SemTopKConfig(k=k, max_candidates=max_cand, emission_policy=policy)
+        func = SemTopKFunction(cfg)
+        func._candidates = _FakeMapState()
+        func._snapshot = _FakeValueState()
+        func._meta = _FakeValueState()
+        return func
+
+    def test_basic_topk(self):
+        func = self._make_func(k=2)
+        func._candidates = _FakeMapState({
+            "c1": {"candidate_id": "c1", "score": 0.9},
+            "c2": {"candidate_id": "c2", "score": 0.5},
+            "c3": {"candidate_id": "c3", "score": 0.7},
+        })
+        meta = {"key": "k", "update_count": 3}
+        func._meta.update(meta)
+
+        results = list(func._recompute_and_emit(meta, 1000))
+        assert len(results) == 1
+        assert results[0]["top_ids"] == ["c1", "c3"]
+        assert results[0]["total_candidates"] == 3
+
+    def test_delta_no_change(self):
+        func = self._make_func(k=2, policy="delta")
+        func._candidates = _FakeMapState({
+            "c1": {"candidate_id": "c1", "score": 0.9},
+            "c2": {"candidate_id": "c2", "score": 0.5},
+        })
+        # Pre-set snapshot with same order
+        func._snapshot.update({"top_ids": ["c1", "c2"]})
+        meta = {"key": "k", "update_count": 2}
+        func._meta.update(meta)
+
+        results = list(func._recompute_and_emit(meta, 2000))
+        # Delta policy: no change → no emission
+        assert len(results) == 0
+
+    def test_snapshot_always_emits(self):
+        func = self._make_func(k=2, policy="snapshot")
+        func._candidates = _FakeMapState({
+            "c1": {"candidate_id": "c1", "score": 0.9},
+            "c2": {"candidate_id": "c2", "score": 0.5},
+        })
+        func._snapshot.update({"top_ids": ["c1", "c2"]})
+        meta = {"key": "k", "update_count": 2}
+        func._meta.update(meta)
+
+        results = list(func._recompute_and_emit(meta, 2000))
+        assert len(results) == 1
+        assert results[0]["changed"] is False
+
+    def test_enforce_candidate_limit(self):
+        func = self._make_func(k=2, max_cand=3)
+        entries = {f"c{i}": {"candidate_id": f"c{i}", "score": i * 0.1,
+                              "_updated_ms": i * 100}
+                   for i in range(5)}
+        func._candidates = _FakeMapState(entries)
+        evicted = func._enforce_candidate_limit()
+        assert evicted == 2
+        assert len(func._candidates.keys()) == 3
+
+
+# ============================================================================
+# State Safety Audit Tests
+# ============================================================================
+
+class TestStateSafetyAudit:
+    """Verify state safety guardrails across operators."""
+
+    def test_new_descriptors_exist(self):
+        """Verify sem_agg and sem_topk descriptors are declared."""
+        from pyflink.semantic_runtime.stateful.state_descriptors import (
+            sem_agg_buffer_descriptor,
+            sem_agg_value_descriptor,
+            sem_agg_meta_descriptor,
+            sem_topk_candidates_descriptor,
+            sem_topk_snapshot_descriptor,
+        )
+        assert sem_agg_buffer_descriptor().name == "sem_agg_buffer"
+        assert sem_agg_value_descriptor().name == "sem_agg_value"
+        assert sem_agg_meta_descriptor().name == "sem_agg_meta"
+        assert sem_topk_candidates_descriptor().name == "sem_topk_candidates"
+        assert sem_topk_snapshot_descriptor().name == "sem_topk_snapshot"
+
+    def test_groupby_overflow_drop_oldest_evicts(self):
+        """sem_groupby: DROP_OLDEST should evict when at max groups."""
+        cfg = SemGroupbyConfig(max_groups_per_key=2, overflow_policy=OverflowPolicy.DROP_OLDEST)
+        func = SemGroupbyFunction(cfg)
+        func._group_profiles = _FakeMapState({
+            "g1": {"label": "old group", "event_count": 1, "last_update_ms": 100,
+                    "created_ms": 100, "summary": "", "group_id": "g1"},
+            "g2": {"label": "newer group", "event_count": 2, "last_update_ms": 200,
+                    "created_ms": 200, "summary": "", "group_id": "g2"},
+        })
+        event = SemanticEvent(key="k", payload="brand new topic", seq_id=0)
+        gid = func._maybe_create_group(event, 300)
+        assert gid is not None
+        # g1 (oldest) should have been evicted
+        assert not func._group_profiles.contains("g1")
+        assert func._group_profiles.contains("g2")
+
+    def test_groupby_overflow_drop_newest_refuses(self):
+        """sem_groupby: DROP_NEWEST should refuse to create group at limit."""
+        cfg = SemGroupbyConfig(max_groups_per_key=2, overflow_policy=OverflowPolicy.DROP_NEWEST)
+        func = SemGroupbyFunction(cfg)
+        func._group_profiles = _FakeMapState({
+            "g1": {"label": "a", "event_count": 1, "last_update_ms": 100},
+            "g2": {"label": "b", "event_count": 1, "last_update_ms": 200},
+        })
+        event = SemanticEvent(key="k", payload="c", seq_id=0)
+        gid = func._maybe_create_group(event, 300)
+        assert gid is None
+
+    def test_retrieve_overflow_degrade_tag(self):
+        """cts_retrieve: DEGRADE_TAG should keep all entries."""
+        cfg = CtsRetrieveConfig(max_cache_entries_per_key=2,
+                                overflow_policy=OverflowPolicy.DEGRADE_TAG)
+        func = CtsRetrieveFunction(cfg)
+        func._cache = _FakeMapState({
+            "c1": {"content": "a", "_cached_at_ms": 100},
+            "c2": {"content": "b", "_cached_at_ms": 200},
+            "c3": {"content": "c", "_cached_at_ms": 300},
+        })
+        evicted = func._enforce_cache_limit()
+        assert evicted == 0  # DEGRADE_TAG keeps all
+        assert len(func._cache.keys()) == 3
+
+
+# ============================================================================
+# Helpers — Fake ListState and ValueState for testing
+# ============================================================================
+
+class _FakeListState:
+    """Minimal ListState mock for unit tests."""
+    def __init__(self, data: list = None):
+        self._data = list(data) if data else []
+
+    def add(self, value):
+        self._data.append(value)
+
+    def get(self):
+        return iter(self._data)
+
+    def clear(self):
+        self._data.clear()
+
+
+class _FakeValueState:
+    """Minimal ValueState mock for unit tests."""
+    def __init__(self, initial=None):
+        self._value = initial
+
+    def value(self):
+        return self._value
+
+    def update(self, val):
+        self._value = val
+
+    def clear(self):
+        self._value = None
+
+
+# ============================================================================
 # Run
 # ============================================================================
 

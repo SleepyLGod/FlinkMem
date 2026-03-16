@@ -155,3 +155,67 @@ def cts_retrieve_cache_descriptor(
     desc.enable_time_to_live(build_ttl_config(ttl_seconds))
     return desc
 
+
+# ---------------------------------------------------------------------------
+# sem_agg descriptors
+# ---------------------------------------------------------------------------
+
+def sem_agg_buffer_descriptor(
+    ttl_seconds: int = 3600,
+) -> ListStateDescriptor:
+    """ListState descriptor for the sem_agg event buffer (summarization path).
+
+    Each element is a pickled event/snapshot dict awaiting summarization.
+    """
+    desc = ListStateDescriptor("sem_agg_buffer", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_agg_value_descriptor(
+    ttl_seconds: int = 3600,
+) -> ValueStateDescriptor:
+    """ValueState descriptor for the sem_agg accumulated aggregate.
+
+    Stores a pickled dict with running algebraic aggregate or latest summary.
+    """
+    desc = ValueStateDescriptor("sem_agg_value", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_agg_meta_descriptor(
+    ttl_seconds: int = 3600,
+) -> ValueStateDescriptor:
+    """ValueState descriptor for sem_agg metadata (counters, version)."""
+    desc = ValueStateDescriptor("sem_agg_meta", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+# ---------------------------------------------------------------------------
+# sem_topk descriptors
+# ---------------------------------------------------------------------------
+
+def sem_topk_candidates_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for the sem_topk candidate buffer.
+
+    Key: candidate_id (str), Value: pickled candidate record with score.
+    """
+    desc = MapStateDescriptor(
+        "sem_topk_candidates", Types.STRING(), Types.PICKLED_BYTE_ARRAY()
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_topk_snapshot_descriptor(
+    ttl_seconds: int = 3600,
+) -> ValueStateDescriptor:
+    """ValueState descriptor for the current top-k snapshot / frontier."""
+    desc = ValueStateDescriptor("sem_topk_snapshot", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
