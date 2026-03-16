@@ -179,6 +179,14 @@ on (
     "Does this episode belong to the same thematic storyline?"
 ) -- vector similarity evaluation
 
+-- Q6 (alternative conceptual form): semantic grouping with dynamic topic creation
+TOPIC_ASSIGNMENT = sem_group_by(
+    RECENT_MEMORIES.episode, TOPIC.centroid,
+    "Assign this episode to the most suitable thematic storyline; "
+    "if no existing topic matches, create a new topic"
+)
+-- equivalent intent: Q6 retrieval + topic-state upsert (topic_id/centroid/count/timestamp)
+
 -- Q7: Profile distillation: When a topic has accumulated enough memory segments, aggregate those segments from a topic with the existing user profile, in a joint table of segments and profile traits.
 sem_agg(
     HISTORY_SEGMENTS.episode,
@@ -192,14 +200,15 @@ sem_agg(
 
 ## Summary: Operator Inventory
 
-| Operator | Zep | Mem0 | EverMemOS | Total |
-|----------|-----|------|-----------|-------|
-| `sem_map` | Q1, Q3, Q4, Q7, Q8 | Q1, Q3, Q4, Q5, Q6, Q9 | Q2, Q3 | 13 |
-| `sem_join` | Q2, Q5, Q6 | Q8 | — | 4 |
-| `sem_filter` | — | — | Q1 | 1 |
-| `sem_agg` | — | — | Q7 | 1 |
-| `sem_extract` | — | — | Q4, Q5 | 2 |
-| `sem_sim_join` | — | Q2, Q7 | Q6 | 3 |
+| Operator | Zep | Mem0 | EverMemOS | Total | Remarks |         
+|----------|-----|------|-----------|-------|---------|
+| `sem_map` | Q1, Q3, Q4, Q7, Q8 | Q1, Q3, Q4, Q5, Q6, Q9 | Q2, Q3 | 13 | |
+| `sem_join` | Q2, Q5, Q6 | Q8 | — | 4 | |
+| `sem_filter` | — | — | Q1 | 1 | |
+| `sem_agg` | — | — | Q7 | 1 | |
+| `sem_extract` | — | — | Q4, Q5 | 2 | `sem_map` with structured output |
+| `sem_sim_join` | — | Q2, Q7 | Q6 | 3 | `sem_join` with vector index |
+| `sem_group_by` | — | — | Q6 (alt) | 1 | not relation-like operator |
 
 ---
 
