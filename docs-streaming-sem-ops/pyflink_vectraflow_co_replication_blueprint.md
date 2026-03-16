@@ -42,7 +42,8 @@ extend to continuous operators in CP style:
 - `sem_groupby`: semantic grouping over dynamic categories/intents/topics.
 - `cts_filter`: continuously updated filtering decisions.
 - `cts_topk`: continuously maintained semantic ranking.
-- continuous retrieval/RAG operators backed by evolving stream state.
+- `cts_retrieve`: continuously maintained retrieval over evolving memory/state.
+- continuous RAG as a composed workflow over the above operators.
 
 can treat three properties as non-optional:
 
@@ -229,7 +230,14 @@ this leads to the following clean phase split:
 | `sem_join` (retrieve-backed) | per-record semantic join against a finite retrieved candidate set | `V0.1` by default, `V0.2` if cached/stateful | async row-local path or keyed stateful path without a second stream | `flink-python/pyflink/datastream/async_data_stream.py`, `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
 | `sem_agg` | relation-level semantic aggregation | `V0.2` | `KeyedProcessFunction` + `ReducingState/AggregatingState` or `ListState` | `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/state.py` |
 | `sem_topk` (continuous) | continuously maintained ranking over a keyed stream | `V0.2` | `key_by(...).process(...)` + keyed state + timers | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
+| `sem_groupby` | semantic grouping into dynamic categories/topics/intents | `V0.2` | `key_by(...).process(...)` + keyed `MapState` + side-output async semantic classifier + keyed merge | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/async_data_stream.py` |
+| `cts_retrieve` | continuous retrieval over evolving keyed memory/state | `V0.2` | one-input retrieval/state path with keyed cache/index metadata + optional async rerank | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/async_data_stream.py` |
 | `sem_join` (true two-input) | two-input natural-language join across stream/state inputs | `V0.3` | `connect(...).process(...)` + `KeyedCoProcessFunction` + dual-side state | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
+
+`cts_retrieve` and `V0.1 sem_join` (retrieve-backed) intentionally coexist:
+
+- keep `V0.1` row-local retrieve-then-match for simple stateless workloads,
+- use `cts_retrieve` when retrieval behavior must depend on evolving keyed memory/cache/index state.
 
 do not introduce new Python function types in the first iteration. keep the existing lowering paths intact:
 
@@ -290,6 +298,25 @@ define completion as: stable execution under sustained load without backpressure
 7. watermark-aware handling (if event-time semantics are required).
 8. TTL/cleanup policy on state.
 9. hard state bounds and eviction policy from the beginning of the phase.
+10. `sem_groupby` track (required):
+   - dynamic semantic bucket assignment per key,
+   - bounded `MapState` group profiles/counters/last-update metadata,
+   - local candidate-group proposal + optional side-output async classifier + keyed merge update,
+   - explicit async merge-back topology:
+     `sem_groupby keyed emitter` -> side output -> `AsyncDataStream classifier` -> `connect/union + keyed merge`,
+   - explicit new-group creation threshold,
+   - no retroactive full reassignment in `V0.2`.
+11. `cts_retrieve` track (required):
+   - continuous retrieval over keyed memory/state,
+   - treated as the stateful evolution path of retrieval behavior from `V0.1`,
+   - both retrieval paths remain available in `V0.2`, chosen by statefulness need,
+   - bounded per-key retrieval metadata and cache/index hints,
+   - deterministic timeout/overflow handling and audit tags.
+12. continuous RAG workflow integration (required scenario, not a standalone runtime operator):
+   - memory-upsert path: `sem_window` -> `sem_groupby` -> `sem_agg` -> memory entries,
+   - retrieval path: request -> `cts_retrieve` -> optional `sem_topk` rerank,
+   - response path: `sem_map` answer synthesis over request + retrieved memory context,
+   - audit fields: `memory_version`, `retrieved_ids`, `prompt_version/config_version`.
 
 the intended code path in this phase is:
 
@@ -297,6 +324,14 @@ the intended code path in this phase is:
 - state access via `RuntimeContext.get_state/get_list_state/get_map_state/get_reducing_state/get_aggregating_state`.
 - treat this phase as the first explicit L4 + L5 interaction point whenever semantic aggregation
   needs downstream async summarization.
+- standardize a reusable async bridge pattern for stateful operators that require async merge-back:
+  side output -> `AsyncDataStream` -> keyed merge operator (for both `sem_groupby` and `sem_agg` paths).
+
+explicit non-goals in `V0.2`:
+
+- no new runtime lowering function type or edits to lowering internals.
+- no global cross-key semantic clustering for `sem_groupby`.
+- no true two-input semantic join for continuous RAG memory in this phase.
 
 define completion as: consistent results under out-of-order input and correct recovery after restart/checkpoint restore.
 
