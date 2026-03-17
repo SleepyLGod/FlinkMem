@@ -28,11 +28,17 @@ under the License.
 
 use the following base semantic operators as the common algebra:
 
-- `sem_map`: semantic extraction/classification/transformation.
+- `sem_map`: semantic extraction/classification/transformation under one public name, with both structured and free-form modes.
 - `sem_filter`: semantic predicate over text/event/document.
-- `sem_topk`: relevance/similarity ranking.
-- `sem_join`: semantic match/join across streams or stream-state.
+- `sem_search`: semantic retrieval/search over external or keyed memory.
+- `sem_topk`: stream-oriented semantic ranking with pluggable scorer backends.
+- `sem_lookup_join`: semantic match against a finite lookup/retrieval candidate set.
+- `sem_join`: reserved for the later true two-input semantic join across streams or stream-state.
 - `sem_agg`: semantic aggregation/summarization-style state reduction.
+
+supporting bounded/local variant:
+
+- `sem_local_topk`: row-local reranking over an already finite candidate set.
 
 ### 1.2 Continuous Semantic Operators (CP Emphasis)
 
@@ -41,8 +47,8 @@ extend to continuous operators in CP style:
 - `sem_window`: semantic computation over windowed state.
 - `sem_groupby`: semantic grouping over dynamic categories/intents/topics.
 - `cts_filter`: continuously updated filtering decisions.
-- `cts_topk`: continuously maintained semantic ranking.
-- `cts_retrieve`: continuously maintained retrieval over evolving memory/state.
+- `sem_topk`: continuously maintained semantic ranking.
+- `sem_search`: continuously maintained retrieval/search over evolving memory/state.
 - continuous RAG as a composed workflow over the above operators.
 
 can treat three properties as non-optional:
@@ -77,7 +83,7 @@ use these optimizations primarily to reduce expensive exact semantic checks and 
 | Paper Concept                                               | PyFlink Primitive                                                     | Feasibility |
 | ----------------------------------------------------------- | --------------------------------------------------------------------- | ----------- |
 | Async semantic call (`sem_map`, `sem_filter`)           | `AsyncDataStream.unordered_wait/ordered_wait` + `AsyncFunction`   | High        |
-| Stateful continuous semantics (`sem_window`, `cts_*`)   | `KeyedProcessFunction` + `ValueState/ListState/MapState` + timers | High        |
+| Stateful continuous semantics (`sem_window`, `sem_groupby`, `sem_search`, `sem_topk`, `sem_agg`)   | `KeyedProcessFunction` + `ValueState/ListState/MapState` + timers | High        |
 | Dynamic control/config updates                              | `BroadcastStream` + `KeyedBroadcastProcessFunction`               | High        |
 | Two-stream semantic join                                    | `KeyedCoProcessFunction` + dual-side state                          | High        |
 | Operator-level batching                                     | operator-local buffer + timer/size flush                              | High        |
@@ -207,6 +213,8 @@ make these boundaries explicit before implementation:
 8. the async path can use `RuntimeContext` during `open(...)`, but I do not treat `AsyncDataStream` as the default keyed-state path for retrieval caches or keyed semantic memory.
 9. `REVISE_OUTPUT` exists in the runtime protocol, but I do not assume it already provides CP-style continuous revision semantics.
 10. timer-triggered semantic summarization may require a two-stage topology; I do not assume I can place arbitrary async LLM I/O directly inside `on_timer(...)`.
+11. public semantic API naming and internal runtime naming do not have to match one-to-one during the transition; for example, public `sem_search` may initially map to an internal `cts_retrieve` implementation.
+12. external retrieval/search backend selection remains open in `V0.2+`; I do not assume one fixed vector/search component before the surrounding application architecture is clear.
 
 ## 5. Step-By-Step Implementation Plan
 
@@ -217,27 +225,27 @@ align operator phasing with the semantic operator model rather than only the ope
 - in LOTUS, `sem_map` and `sem_filter` are row-wise semantic transformations, so they fit the first async/operator-wrapper phase.
 - in LOTUS, `sem_agg` is a relation-level aggregation and `sem_topk` is an ordering operator; in a stream runtime these split into local and continuous variants.
 - in LOTUS, `sem_join` is a natural-language join predicate, but in PyFlink it can appear in two distinct execution shapes:
-  - `retrieve-backed sem_join`: each input event retrieves a finite set of candidate rows from a database or vector store and then performs semantic matching over that local candidate set.
+  - `sem_lookup_join`: each input event retrieves a finite set of candidate rows from a database or vector store and then performs semantic matching over that local candidate set.
   - `true two-input sem_join`: both sides are represented as stream/state inputs and require explicit two-input coordination.
 
 this leads to the following clean phase split:
 
 | operator | LOTUS semantic shape | first implementation phase | PyFlink primitive | source-code anchor |
 | --- | --- | --- | --- | --- |
-| `sem_map` | row-wise semantic projection/transformation | `V0.1` | `AsyncDataStream.unordered_wait/ordered_wait` + `AsyncFunction` | `flink-python/pyflink/datastream/async_data_stream.py`, `flink-python/pyflink/datastream/data_stream.py` |
+| `sem_map` | row-wise semantic projection/transformation | `V0.1` baseline, `V0.2+` dual-mode API | `AsyncDataStream.unordered_wait/ordered_wait` + `AsyncFunction` | `flink-python/pyflink/datastream/async_data_stream.py`, `flink-python/pyflink/datastream/data_stream.py` |
 | `sem_filter` | row-wise natural-language predicate | `V0.1` | `AsyncDataStream.unordered_wait/ordered_wait` + downstream `filter` or `process` | `flink-python/pyflink/datastream/async_data_stream.py`, `flink-python/pyflink/datastream/data_stream.py` |
-| `sem_topk` (local rerank) | ranking within a finite per-record candidate set | `V0.1` | same async row-local path as `sem_map` | `flink-python/pyflink/datastream/async_data_stream.py` |
-| `sem_join` (retrieve-backed) | per-record semantic join against a finite retrieved candidate set | `V0.1` by default, `V0.2` if cached/stateful | async row-local path or keyed stateful path without a second stream | `flink-python/pyflink/datastream/async_data_stream.py`, `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
+| `sem_local_topk` | ranking within a finite per-record candidate set | `V0.1` | same async row-local path as `sem_map` | `flink-python/pyflink/datastream/async_data_stream.py` |
+| `sem_lookup_join` | per-record semantic join against a finite retrieved candidate set | `V0.1` by default, `V0.2` if cached/stateful | async row-local path or keyed stateful path without a second stream | `flink-python/pyflink/datastream/async_data_stream.py`, `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
 | `sem_agg` | relation-level semantic aggregation | `V0.2` | `KeyedProcessFunction` + `ReducingState/AggregatingState` or `ListState` | `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/state.py` |
-| `sem_topk` (continuous) | continuously maintained ranking over a keyed stream | `V0.2` | `key_by(...).process(...)` + keyed state + timers | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
+| `sem_topk` | continuously maintained ranking over a keyed stream | `V0.2` foundation, `V0.2+` scorer-complete | `key_by(...).process(...)` + keyed state + timers | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
 | `sem_groupby` | semantic grouping into dynamic categories/topics/intents | `V0.2` | `key_by(...).process(...)` + keyed `MapState` + side-output async semantic classifier + keyed merge | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/async_data_stream.py` |
-| `cts_retrieve` | continuous retrieval over evolving keyed memory/state | `V0.2` | one-input retrieval/state path with keyed cache/index metadata + optional async rerank | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/async_data_stream.py` |
+| `sem_search` | continuous retrieval over evolving keyed memory/state | `V0.2` foundation, `V0.2+` public rename and backend abstraction | one-input retrieval/state path with keyed cache/index metadata + optional async rerank | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py`, `flink-python/pyflink/datastream/async_data_stream.py` |
 | `sem_join` (true two-input) | two-input natural-language join across stream/state inputs | `V0.3` | `connect(...).process(...)` + `KeyedCoProcessFunction` + dual-side state | `flink-python/pyflink/datastream/data_stream.py`, `flink-python/pyflink/datastream/functions.py` |
 
-`cts_retrieve` and `V0.1 sem_join` (retrieve-backed) intentionally coexist:
+`sem_search` and `V0.1 sem_lookup_join` intentionally coexist:
 
 - keep `V0.1` row-local retrieve-then-match for simple stateless workloads,
-- use `cts_retrieve` when retrieval behavior must depend on evolving keyed memory/cache/index state.
+- use `sem_search` when retrieval behavior must depend on evolving keyed memory/cache/index state.
 
 do not introduce new Python function types in the first iteration. keep the existing lowering paths intact:
 
@@ -247,7 +255,7 @@ do not introduce new Python function types in the first iteration. keep the exis
 
 for operator design, this means:
 
-- use `AsyncDataStream` for row-local semantic calls and retrieval-backed operators when the
+- use `AsyncDataStream` for row-local semantic calls and lookup-style retrieval-backed operators when the
   candidate set is finite per input record.
 - switch to `KeyedProcessFunction` once retrieval metadata, caches, or semantic memory must be
   maintained per key.
@@ -258,10 +266,10 @@ for operator design, this means:
 
 1. `sem_map` via `AsyncDataStream` + structured output schema.
 2. `sem_filter` via `AsyncDataStream` with confidence/reason fields.
-3. optional `local sem_topk` only for the case where each incoming record already carries a finite candidate set and the operator only reranks that local set.
-4. `retrieve-backed sem_join` where each incoming record retrieves a finite candidate set from an external database or vector store and performs semantic matching against that local set.
+3. optional `sem_local_topk` only for the case where each incoming record already carries a finite candidate set and the operator only reranks that local set.
+4. `sem_lookup_join` where each incoming record retrieves a finite candidate set from an external database or vector store and performs semantic matching against that local set.
 5. implement the first version as thin semantic wrappers over the existing async/process lowering path, without changing `_get_one_input_stream_operator` or introducing new function types.
-6. explicitly keep retrieval-backed `sem_join` on the one-input/async path in this phase; do not route it through `ConnectedStreams.process(...)`.
+6. explicitly keep `sem_lookup_join` on the one-input/async path in this phase; do not route it through `ConnectedStreams.process(...)`.
 7. explicitly exclude `thread` mode from this async baseline.
 8. timeout/retry/fallback policy.
 9. core metrics:
@@ -277,7 +285,7 @@ latency, retry policy, and target throughput.
 explicitly do not place the following into `V0.1`:
 
 - `sem_agg`, because it requires keyed state and an explicit aggregation scope.
-- continuous `sem_topk`, because it requires incremental state maintenance and timer-driven updates.
+- canonical stream `sem_topk`, because it requires incremental state maintenance and timer-driven updates.
 - true two-input `sem_join`, because it requires two-input coordination and dual-side state.
 
 define completion as: stable execution under sustained load without backpressure collapse and deterministic retry behavior.
@@ -289,10 +297,10 @@ define completion as: stable execution under sustained load without backpressure
    - use `ReducingState` / `AggregatingState` when the aggregation can be made algebraic,
    - for summarization-style aggregation, start with `ListState` + explicit aggregation logic and
      a timer-triggered work emission path to a downstream async summarizer.
-3. continuous `sem_topk` on top of keyed state:
+3. `sem_topk` on top of keyed state:
    - use `ListState/MapState/ValueState` for candidate buffering, current score frontier, and emitted top-k snapshot,
    - use timers for deferred recomputation, eviction, and bounded updates.
-4. optional cached or stateful retrieval-assisted variants of `sem_join` when retrieval metadata or reusable candidate caches must be maintained per key but no second stream is introduced.
+4. optional cached or stateful retrieval-assisted variants of `sem_lookup_join` when retrieval metadata or reusable candidate caches must be maintained per key but no second stream is introduced.
 5. `ListState` for context/events and `ValueState` for current semantic result.
 6. timer-driven emission/update policy.
 7. watermark-aware handling (if event-time semantics are required).
@@ -306,15 +314,16 @@ define completion as: stable execution under sustained load without backpressure
      `sem_groupby keyed emitter` -> side output -> `AsyncDataStream classifier` -> `connect/union + keyed merge`,
    - explicit new-group creation threshold,
    - no retroactive full reassignment in `V0.2`.
-11. `cts_retrieve` track (required):
+11. `sem_search` track (required):
    - continuous retrieval over keyed memory/state,
    - treated as the stateful evolution path of retrieval behavior from `V0.1`,
    - both retrieval paths remain available in `V0.2`, chosen by statefulness need,
    - bounded per-key retrieval metadata and cache/index hints,
-   - deterministic timeout/overflow handling and audit tags.
+   - deterministic timeout/overflow handling and audit tags,
+   - current internal implementation may still use the name `cts_retrieve` during transition.
 12. continuous RAG workflow integration (required scenario, not a standalone runtime operator):
    - memory-upsert path: `sem_window` -> `sem_groupby` -> `sem_agg` -> memory entries,
-   - retrieval path: request -> `cts_retrieve` -> optional `sem_topk` rerank,
+   - retrieval path: request -> `sem_search` -> optional `sem_topk` rerank,
    - response path: `sem_map` answer synthesis over request + retrieved memory context,
    - audit fields: `memory_version`, `retrieved_ids`, `prompt_version/config_version`.
 
@@ -332,8 +341,44 @@ explicit non-goals in `V0.2`:
 - no new runtime lowering function type or edits to lowering internals.
 - no global cross-key semantic clustering for `sem_groupby`.
 - no true two-input semantic join for continuous RAG memory in this phase.
+- no forced commitment to one external vector/search backend in this phase.
 
 define completion as: consistent results under out-of-order input and correct recovery after restart/checkpoint restore.
+
+### Phase V0.2+ - Public API Alignment And Scorer Completion
+
+1. rename public operator surface:
+   - `sem_join_retrieve` -> `sem_lookup_join`,
+   - `cts_retrieve` -> public `sem_search`,
+   - bounded local `sem_topk` -> `sem_local_topk`,
+   - keyed continuous `sem_topk` remains the canonical `sem_topk`.
+2. extend `sem_map` under one public operator name with two modes:
+   - structured mode with schema validation,
+   - free-form mode without mandatory schema.
+3. complete `sem_topk` semantic scoring support with pluggable scorer backends:
+   - `llm`,
+   - `embedding`,
+   - `external_score`.
+4. do not assume retrieved candidates always arrive with a meaningful score; `sem_topk` must be
+   able to score or rerank candidates itself when required.
+5. introduce a unified semantic-criterion layer (`SemanticSpec`-style contract) so that prompt,
+   predicate, scoring criterion, schema, threshold, and backend selection are expressed in one
+   place rather than separately per operator.
+6. keep typed per-operator config dataclasses, but add a unified top-level runtime configuration
+   entry point for user-facing setup and external file loading.
+7. formalize the external search backend as an explicit TODO:
+   - keep backend selection open,
+   - provide a pluggable retrieval backend abstraction,
+   - do not lock to one vector/search component yet.
+8. clean up package/file/class naming so that public semantics are primary and implementation style
+   is reflected by package boundaries rather than suffix drift.
+9. explicitly keep the current `KeyedProcessFunction`-based semantic window path as default and do
+   not switch to native `WindowFunction`/`ProcessWindowFunction` wrappers until the operator API is
+   stable.
+
+define completion as: a consistent public semantic API, working scorer-complete `sem_topk`,
+pluggable `sem_search`/`sem_lookup_join` backend boundaries, and a clean operator/config naming
+story before true two-input join work begins.
 
 ### Phase V0.3a - True Two-Input Semantic Join
 
