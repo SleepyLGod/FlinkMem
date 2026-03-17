@@ -56,6 +56,7 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     resolve_timer_category,
     clear_timer_registration,
 )
+from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ class SemTopKFunction(KeyedProcessFunction):
         self._candidates: Optional[MapState] = None
         self._snapshot: Optional[ValueState] = None
         self._meta: Optional[ValueState] = None
+        self._metrics: Optional[StatefulOperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -110,6 +112,9 @@ class SemTopKFunction(KeyedProcessFunction):
         desc = ValueStateDescriptor("sem_topk_meta", Types.PICKLED_BYTE_ARRAY())
         desc.enable_time_to_live(build_ttl_config(ttl))
         self._meta = runtime_context.get_state(desc)
+        self._metrics = StatefulOperatorMetrics.from_runtime_context(
+            runtime_context, "sem_topk",
+        )
         logger.info(
             "SemTopKFunction opened (k=%d, max_candidates=%d)",
             self._config.k, self._config.max_candidates,
@@ -119,6 +124,8 @@ class SemTopKFunction(KeyedProcessFunction):
 
     def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
         now_ms = int(time.time() * 1000)
+        if self._metrics:
+            self._metrics.record_event_processed()
 
         if not isinstance(value, dict):
             return
@@ -137,14 +144,17 @@ class SemTopKFunction(KeyedProcessFunction):
 
         meta["update_count"] += 1
 
-        # Upsert candidate
-        cid = value.get("candidate_id", "")
-        if not cid:
-            self._meta.update(meta)
-            return
-
-        value["_updated_ms"] = now_ms
-        self._candidates.put(cid, value)
+        # Accept retrieval envelope (from cts_retrieve) — expand candidates
+        if "candidates" in value and isinstance(value["candidates"], list):
+            from pyflink.semantic_runtime.stateful.event_model import (
+                retrieve_to_topk_items,
+            )
+            items = retrieve_to_topk_items(value)
+            for item in items:
+                self._upsert_candidate(item, now_ms)
+        else:
+            # Single candidate upsert
+            self._upsert_candidate(value, now_ms)
 
         # Enforce candidate buffer limit
         self._enforce_candidate_limit()
@@ -152,11 +162,21 @@ class SemTopKFunction(KeyedProcessFunction):
         # Recompute top-k and possibly emit
         yield from self._recompute_and_emit(meta, now_ms)
 
+    def _upsert_candidate(self, value: Dict[str, Any], now_ms: int) -> None:
+        """Insert or update a single candidate in the MapState."""
+        cid = value.get("candidate_id", "")
+        if not cid:
+            return
+        value["_updated_ms"] = now_ms
+        self._candidates.put(cid, value)
+
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
         """Timer-driven top-k recomputation."""
         meta = self._meta.value()
         if meta is None:
             return
+        if self._metrics:
+            self._metrics.record_timer_fire()
 
         category = resolve_timer_category(meta, timestamp)
         if category != TimerCategory.RECOMPUTE:
@@ -179,6 +199,8 @@ class SemTopKFunction(KeyedProcessFunction):
         self, meta: Dict[str, Any], now_ms: int, force_emit: bool = False,
     ):
         """Recompute top-k from candidate pool and emit if changed."""
+        if self._metrics:
+            self._metrics.record_recompute()
         score_field = self._config.score_field
         k = self._config.k
 

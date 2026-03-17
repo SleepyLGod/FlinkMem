@@ -126,6 +126,144 @@ class WindowSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Contract adapters — bridge between operator output shapes
+# ---------------------------------------------------------------------------
+
+def is_window_snapshot(d: Dict[str, Any]) -> bool:
+    """Return True if *d* looks like a serialised WindowSnapshot."""
+    return (
+        isinstance(d, dict)
+        and "window_id" in d
+        and "events" in d
+        and "trigger_reason" in d
+    )
+
+
+def window_snapshot_to_semantic_events(
+    snap: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Convert a WindowSnapshot dict into a list of SemanticEvent dicts.
+
+    Each original event stored in the snapshot is unwrapped.  If the
+    stored events are already SemanticEvent-shaped they are returned
+    as-is with ``window_id`` injected into ``metadata``.  Otherwise a
+    minimal SemanticEvent is synthesised with the event text as
+    ``payload``.
+
+    This is the **Subflow A adapter** that sits between ``sem_window``
+    output and ``sem_groupby`` / ``sem_agg`` input.
+    """
+    events = snap.get("events", [])
+    window_id = snap.get("window_id", "")
+    key = snap.get("key", "")
+    close_time_ms = snap.get("close_time_ms", 0)
+
+    result: List[Dict[str, Any]] = []
+    for idx, evt in enumerate(events):
+        if isinstance(evt, dict) and "payload" in evt and "seq_id" in evt:
+            # Already SemanticEvent-shaped — inject window provenance
+            out = dict(evt)
+            out.setdefault("metadata", {})
+            out["metadata"]["window_id"] = window_id
+            out["metadata"]["window_trigger"] = snap.get("trigger_reason", "")
+        else:
+            # Raw event — wrap into SemanticEvent shape
+            out = {
+                "key": key,
+                "payload": str(evt) if not isinstance(evt, dict)
+                           else evt.get("payload", str(evt)),
+                "seq_id": idx,
+                "event_time_ms": close_time_ms or None,
+                "metadata": {
+                    "window_id": window_id,
+                    "window_trigger": snap.get("trigger_reason", ""),
+                },
+                "candidates": [],
+                "boundary_flags": {},
+            }
+        result.append(out)
+    return result
+
+
+def window_snapshot_to_summary_event(
+    snap: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert a WindowSnapshot dict into a single summary SemanticEvent dict.
+
+    The ``payload`` is a concatenation of all event payloads in the window,
+    which is suitable for downstream aggregation operators that expect one
+    event per window rather than one event per original message.
+    """
+    events = snap.get("events", [])
+    key = snap.get("key", "")
+    window_id = snap.get("window_id", "")
+
+    payloads = []
+    for evt in events:
+        if isinstance(evt, dict):
+            payloads.append(evt.get("payload", str(evt)))
+        else:
+            payloads.append(str(evt))
+
+    return {
+        "key": key,
+        "payload": "\n".join(payloads),
+        "seq_id": snap.get("event_count", 0),
+        "event_time_ms": snap.get("close_time_ms") or None,
+        "metadata": {
+            "window_id": window_id,
+            "window_trigger": snap.get("trigger_reason", ""),
+            "source_event_count": len(events),
+        },
+        "candidates": [],
+        "boundary_flags": {},
+    }
+
+
+def retrieve_to_topk_items(
+    retrieve_output: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Expand a ``cts_retrieve`` output into individual candidate dicts
+    suitable for ``sem_topk``'s ``process_element``.
+
+    Each candidate dict gets a ``candidate_id`` field (required by
+    ``SemTopKFunction``) and inherits ``key`` and ``query_seq_id``
+    from the retrieval envelope.
+    """
+    candidates = retrieve_output.get("candidates", [])
+    key = retrieve_output.get("key", "")
+    query_seq_id = retrieve_output.get("query_seq_id", 0)
+
+    result: List[Dict[str, Any]] = []
+    for cand in candidates:
+        out = dict(cand)
+        # Ensure candidate_id exists
+        if "candidate_id" not in out:
+            out["candidate_id"] = out.get("id", f"{key}_{len(result)}")
+        out["key"] = key
+        out["query_seq_id"] = query_seq_id
+        result.append(out)
+    return result
+
+
+def topk_to_answer_context(
+    topk_output: Dict[str, Any],
+    query_payload: str = "",
+) -> Dict[str, Any]:
+    """Normalise ``sem_topk`` output into the shape ``AnswerSynthesiser``
+    expects: ``retrieved_context`` list + ``query`` string.
+    """
+    items = topk_output.get("top_items", topk_output.get("topk", []))
+    return {
+        "key": topk_output.get("key", ""),
+        "query": query_payload or topk_output.get("query", ""),
+        "retrieved_context": items,
+        "total_candidates": topk_output.get("total_candidates", len(items)),
+        "retrieval_changed": topk_output.get("changed", True),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Key selector helpers
 # ---------------------------------------------------------------------------
 

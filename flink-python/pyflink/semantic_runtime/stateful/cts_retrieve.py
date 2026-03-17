@@ -71,6 +71,7 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     resolve_timer_category,
     clear_timer_registration,
 )
+from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         self._config = config or CtsRetrieveConfig()
         self._cache: Optional[MapState] = None
         self._meta: Optional[ValueState] = None
+        self._metrics: Optional[StatefulOperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -123,6 +125,9 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         desc = ValueStateDescriptor("cts_retrieve_meta", Types.PICKLED_BYTE_ARRAY())
         desc.enable_time_to_live(build_ttl_config(ttl))
         self._meta = runtime_context.get_state(desc)
+        self._metrics = StatefulOperatorMetrics.from_runtime_context(
+            runtime_context, "cts_retrieve",
+        )
         logger.info(
             "CtsRetrieveFunction opened (max_candidates=%d, cache_limit=%d)",
             self._config.max_candidates_per_request,
@@ -138,6 +143,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         ``AsyncWorkItem`` dicts for external store fallback.
         """
         now_ms = int(time.time() * 1000)
+        if self._metrics:
+            self._metrics.record_event_processed()
 
         # Detect async merge-back result (from external store)
         if isinstance(value, dict) and value.get("task_type") == "retrieve":
@@ -200,6 +207,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
                     "max_candidates": self._config.max_candidates_per_request,
                 },
             )
+            if self._metrics:
+                self._metrics.record_async_emit()
             yield ASYNC_WORK_TAG, work.to_dict()
 
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
@@ -207,6 +216,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         meta = self._meta.value()
         if meta is None:
             return
+        if self._metrics:
+            self._metrics.record_timer_fire()
 
         category = resolve_timer_category(meta, timestamp)
         if category != TimerCategory.EVICT:
@@ -215,6 +226,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         clear_timer_registration(meta, TimerCategory.EVICT)
         evicted = self._evict_cache(meta)
         if evicted > 0:
+            if self._metrics:
+                self._metrics.record_eviction(evicted)
             logger.info("Evicted %d stale cache entries for key=%s",
                         evicted, meta.get("key", "?"))
 

@@ -140,6 +140,13 @@ class ContinuousRAGConfig:
     async_timeout_ms: int = 30_000
     async_capacity: int = 20
 
+    # Async bridge workers (None = side outputs are discarded with warning)
+    # These should be AsyncFunction instances that process AsyncWorkItem dicts
+    # and return AsyncResult dicts.
+    classify_async_fn: Optional[Any] = None    # For sem_groupby side output
+    summarize_async_fn: Optional[Any] = None   # For sem_agg side output
+    retrieve_async_fn: Optional[Any] = None    # For cts_retrieve side output
+
     # Audit
     workflow_version: str = "v0.2.0"
     config_version: str = "default"
@@ -205,7 +212,10 @@ class _AnswerSynthesiser(KeyedProcessFunction):
 
         now_ms = int(time.time() * 1000)
         query = value.get("query", value.get("payload", ""))
-        context_items = value.get("retrieved_context", value.get("topk", []))
+        context_items = value.get(
+            "retrieved_context",
+            value.get("topk", value.get("candidates", [])),
+        )
 
         # Format context
         if isinstance(context_items, list):
@@ -248,8 +258,71 @@ class _AnswerSynthesiser(KeyedProcessFunction):
 
 
 # ============================================================================
+# Async merge functions — lightweight passthrough + async result forwarding
+# ============================================================================
+
+class _AsyncMergeFunction(KeyedProcessFunction):
+    """Generic merge function for async bridge.
+
+    Receives the union of an operator's main output and async results.
+    Main output events are passed through.  Async results (identified by
+    ``task_type``) are forwarded with the task_type preserved so the
+    downstream operator can detect and handle them in its process_element.
+    """
+
+    def __init__(self, expected_task_types: Optional[List[str]] = None):
+        self._expected_task_types = set(expected_task_types or [])
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        if not isinstance(value, dict):
+            yield value
+            return
+
+        task_type = value.get("task_type", "")
+
+        if task_type and task_type in self._expected_task_types:
+            # Async result — forward with task_type intact for downstream merge-back
+            yield value
+        else:
+            # Regular main output — pass through
+            yield value
+
+
+# ============================================================================
 # Subflow builders — individually testable composition functions
 # ============================================================================
+
+def _wire_async_bridge_if_configured(
+    operator_ds: DataStream,
+    async_fn,
+    merge_task_types: List[str],
+    config: ContinuousRAGConfig,
+) -> DataStream:
+    """Wire async bridge on an operator's output if an async function is provided.
+
+    If ``async_fn`` is None, logs a warning about unhandled side outputs
+    and returns the operator output as-is.
+    """
+    if async_fn is None:
+        # Side outputs will be silently discarded by Flink if not captured.
+        # Log warning for observability.
+        logger.warning(
+            "Async bridge not configured (no async_fn for task_types=%s). "
+            "Side-output async work items will be discarded.",
+            merge_task_types,
+        )
+        return operator_ds
+
+    return build_async_bridge(
+        main_ds=operator_ds,
+        async_fn=async_fn,
+        merge_fn=_AsyncMergeFunction(merge_task_types),
+        key_selector=config.key_selector,
+        timeout_ms=config.async_timeout_ms,
+        capacity=config.async_capacity,
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+
 
 def build_memory_subflow(
     memory_ds: DataStream,
@@ -257,7 +330,7 @@ def build_memory_subflow(
 ) -> DataStream:
     """Subflow A: memory build pipeline.
 
-    ``memory_events → key_by → sem_window → sem_groupby → sem_agg``
+    ``memory_events → key_by → sem_window → sem_groupby (+ async bridge) → sem_agg (+ async bridge)``
 
     Parameters
     ----------
@@ -280,15 +353,25 @@ def build_memory_subflow(
     )
 
     # Step 2: Semantic grouping (re-key on window output)
-    grouped = windowed.key_by(config.key_selector).process(
+    grouped_raw = windowed.key_by(config.key_selector).process(
         SemGroupbyFunction(config.groupby_config),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
+    # Wire async bridge for sem_groupby classify side outputs
+    grouped = _wire_async_bridge_if_configured(
+        grouped_raw, config.classify_async_fn, ["classify"], config,
+    )
+
     # Step 3: Semantic aggregation (re-key on group output)
-    aggregated = grouped.key_by(config.key_selector).process(
+    aggregated_raw = grouped.key_by(config.key_selector).process(
         SemAggFunction(config.agg_config),
         output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+
+    # Wire async bridge for sem_agg summarize side outputs
+    aggregated = _wire_async_bridge_if_configured(
+        aggregated_raw, config.summarize_async_fn, ["summarize"], config,
     )
 
     return aggregated
@@ -300,7 +383,7 @@ def build_retrieval_subflow(
 ) -> DataStream:
     """Subflow B: query/retrieval pipeline.
 
-    ``query_requests → key_by → cts_retrieve → optional sem_topk``
+    ``query_requests → key_by → cts_retrieve (+ async bridge) → optional sem_topk``
 
     Parameters
     ----------
@@ -317,9 +400,14 @@ def build_retrieval_subflow(
     keyed = query_ds.key_by(config.key_selector)
 
     # Step 1: Continuous retrieval
-    retrieved = keyed.process(
+    retrieved_raw = keyed.process(
         CtsRetrieveFunction(config.retrieve_config),
         output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+
+    # Wire async bridge for cts_retrieve external store fallback
+    retrieved = _wire_async_bridge_if_configured(
+        retrieved_raw, config.retrieve_async_fn, ["retrieve"], config,
     )
 
     # Step 2: Optional top-k reranking

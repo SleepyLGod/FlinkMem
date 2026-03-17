@@ -52,7 +52,11 @@ from pyflink.semantic_runtime.stateful.state_descriptors import (
     sem_agg_value_descriptor,
     sem_agg_meta_descriptor,
 )
-from pyflink.semantic_runtime.stateful.event_model import SemanticEvent
+from pyflink.semantic_runtime.stateful.event_model import (
+    SemanticEvent,
+    is_window_snapshot,
+    window_snapshot_to_semantic_events,
+)
 from pyflink.semantic_runtime.stateful.async_bridge import (
     ASYNC_WORK_TAG,
     AsyncWorkItem,
@@ -64,6 +68,7 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     resolve_timer_category,
     clear_timer_registration,
 )
+from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +113,7 @@ class SemAggFunction(KeyedProcessFunction):
         self._buffer: Optional[ListState] = None
         self._agg_value: Optional[ValueState] = None
         self._meta: Optional[ValueState] = None
+        self._metrics: Optional[StatefulOperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -122,6 +128,9 @@ class SemAggFunction(KeyedProcessFunction):
         self._meta = runtime_context.get_state(
             sem_agg_meta_descriptor(ttl)
         )
+        self._metrics = StatefulOperatorMetrics.from_runtime_context(
+            runtime_context, "sem_agg",
+        )
         logger.info(
             "SemAggFunction opened (mode=%s, max_buffer=%d)",
             self._config.mode, self._config.max_buffer_events,
@@ -131,12 +140,25 @@ class SemAggFunction(KeyedProcessFunction):
 
     def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
         now_ms = int(time.time() * 1000)
+        if self._metrics:
+            self._metrics.record_event_processed()
 
         # Detect async summarize result merge-back
         if isinstance(value, dict) and value.get("task_type") == "summarize":
             yield from self._handle_summarize_result(value, now_ms)
             return
 
+        # Detect WindowSnapshot input → expand into individual events
+        if isinstance(value, dict) and is_window_snapshot(value):
+            for sub_event_dict in window_snapshot_to_semantic_events(value):
+                yield from self._process_single_event(sub_event_dict, ctx, now_ms)
+            return
+
+        # Single event path
+        yield from self._process_single_event(value, ctx, now_ms)
+
+    def _process_single_event(self, value, ctx, now_ms: int):
+        """Process a single SemanticEvent-shaped dict."""
         # Parse event
         if isinstance(value, dict):
             event = SemanticEvent.from_dict(value)
@@ -173,6 +195,8 @@ class SemAggFunction(KeyedProcessFunction):
         meta = self._meta.value()
         if meta is None:
             return
+        if self._metrics:
+            self._metrics.record_timer_fire()
 
         category = resolve_timer_category(meta, timestamp)
         if category != TimerCategory.FLUSH:
@@ -270,6 +294,8 @@ class SemAggFunction(KeyedProcessFunction):
                 "current_version": meta.get("version", 0),
             },
         )
+        if self._metrics:
+            self._metrics.record_async_emit()
         yield ASYNC_WORK_TAG, work.to_dict()
 
     def _handle_summarize_result(

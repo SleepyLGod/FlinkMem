@@ -66,6 +66,7 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     resolve_timer_category,
     clear_timer_registration,
 )
+from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ class SemWindowFunction(KeyedProcessFunction):
         # State handles — initialised in open()
         self._event_buffer: Optional[ListState] = None
         self._window_meta: Optional[ValueState] = None
+        self._metrics: Optional[StatefulOperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -125,6 +127,9 @@ class SemWindowFunction(KeyedProcessFunction):
         )
         self._window_meta = runtime_context.get_state(
             sem_window_meta_descriptor(ttl)
+        )
+        self._metrics = StatefulOperatorMetrics.from_runtime_context(
+            runtime_context, "sem_window",
         )
         logger.info(
             "SemWindowFunction opened (max_events=%d, timeout_ms=%d, boundary=%s)",
@@ -157,6 +162,8 @@ class SemWindowFunction(KeyedProcessFunction):
             event_dict = event.to_dict()
 
         now_ms = int(time.time() * 1000)
+        if self._metrics:
+            self._metrics.record_event_processed()
 
         # --- ensure window is open ---
         meta = self._window_meta.value()
@@ -191,6 +198,8 @@ class SemWindowFunction(KeyedProcessFunction):
         # --- evaluate boundary triggers ---
         trigger_reason = self._check_triggers(event, meta)
         if trigger_reason:
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
             yield from self._emit_snapshot(meta, trigger_reason, now_ms)
 
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
@@ -202,6 +211,9 @@ class SemWindowFunction(KeyedProcessFunction):
         meta = self._window_meta.value()
         if meta is None:
             return  # window already closed/emitted
+
+        if self._metrics:
+            self._metrics.record_timer_fire()
 
         # Resolve which timer category fired
         category = resolve_timer_category(meta, timestamp)

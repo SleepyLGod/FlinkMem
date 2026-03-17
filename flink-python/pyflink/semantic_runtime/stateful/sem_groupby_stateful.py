@@ -55,7 +55,11 @@ from pyflink.semantic_runtime.stateful.state_descriptors import (
     sem_window_meta_descriptor,
     build_ttl_config,
 )
-from pyflink.semantic_runtime.stateful.event_model import SemanticEvent
+from pyflink.semantic_runtime.stateful.event_model import (
+    SemanticEvent,
+    is_window_snapshot,
+    window_snapshot_to_semantic_events,
+)
 from pyflink.semantic_runtime.stateful.async_bridge import (
     ASYNC_WORK_TAG,
     AsyncWorkItem,
@@ -67,6 +71,7 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     resolve_timer_category,
     clear_timer_registration,
 )
+from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +125,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._config = config or SemGroupbyConfig()
         self._group_profiles: Optional[MapState] = None
         self._meta: Optional[ValueState] = None
+        self._metrics: Optional[StatefulOperatorMetrics] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -134,6 +140,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
         desc = ValueStateDescriptor("sem_groupby_meta", Types.PICKLED_BYTE_ARRAY())
         desc.enable_time_to_live(build_ttl_config(ttl))
         self._meta = runtime_context.get_state(desc)
+        self._metrics = StatefulOperatorMetrics.from_runtime_context(
+            runtime_context, "sem_groupby",
+        )
         logger.info(
             "SemGroupbyFunction opened (max_groups=%d, threshold=%.2f)",
             self._config.max_groups_per_key,
@@ -149,12 +158,25 @@ class SemGroupbyFunction(KeyedProcessFunction):
         ``AsyncWorkItem`` dicts for ambiguous assignments.
         """
         now_ms = int(time.time() * 1000)
+        if self._metrics:
+            self._metrics.record_event_processed()
 
         # Detect async merge-back result
         if isinstance(value, dict) and value.get("task_type") == "classify":
             yield from self._handle_async_result(value, now_ms)
             return
 
+        # Detect WindowSnapshot input → expand into individual events
+        if isinstance(value, dict) and is_window_snapshot(value):
+            for sub_event_dict in window_snapshot_to_semantic_events(value):
+                yield from self._process_single_event(sub_event_dict, ctx, now_ms)
+            return
+
+        # Single event path
+        yield from self._process_single_event(value, ctx, now_ms)
+
+    def _process_single_event(self, value, ctx, now_ms: int):
+        """Process a single SemanticEvent-shaped dict."""
         # Parse as SemanticEvent
         if isinstance(value, dict):
             event = SemanticEvent.from_dict(value)
@@ -203,6 +225,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 key=event.key, task_type="classify",
                 payload={"event": event_dict, "tentative_group": best_group_id},
             )
+            if self._metrics:
+                self._metrics.record_async_emit()
             yield ASYNC_WORK_TAG, work.to_dict()
         else:
             # Low confidence → create new group or emit async
@@ -222,6 +246,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
                     key=event.key, task_type="classify",
                     payload={"event": event_dict, "tentative_group": None},
                 )
+                if self._metrics:
+                    self._metrics.record_async_emit()
                 yield ASYNC_WORK_TAG, work.to_dict()
 
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
@@ -229,6 +255,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
         meta = self._meta.value()
         if meta is None:
             return
+        if self._metrics:
+            self._metrics.record_timer_fire()
 
         category = resolve_timer_category(meta, timestamp)
         if category != TimerCategory.EVICT:
@@ -237,6 +265,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
         clear_timer_registration(meta, TimerCategory.EVICT)
         evicted = self._evict_stale_groups(meta)
         if evicted > 0:
+            if self._metrics:
+                self._metrics.record_eviction(evicted)
             logger.info("Evicted %d stale groups for key=%s", evicted, meta.get("key", "?"))
 
         # Re-register eviction timer
