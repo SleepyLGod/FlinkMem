@@ -627,36 +627,44 @@ from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
     SemTopKConfig,
     SemTopKFunction,
 )
+from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec, TopKScopePolicy
 
 class TestSemTopKConfig:
     def test_defaults(self):
         cfg = SemTopKConfig()
-        assert cfg.k == 10
         assert cfg.max_candidates == 100
         assert cfg.emission_policy == "delta"
-        assert cfg.scorer_backend == "external_score"
         assert cfg.score_field == "score"
+        assert cfg.ttl_seconds == 3600
 
-    def test_scorer_backend_llm(self):
-        cfg = SemTopKConfig(scorer_backend="llm")
-        assert cfg.scorer_backend == "llm"
+    def test_query_spec_defaults(self):
+        qs = TopKQuerySpec()
+        assert qs.k == 10
+        assert qs.query_version == 1
+        assert qs.ranking_method == "pointwise"
+        assert qs.scope_policy.ttl_seconds is None
 
-    def test_scorer_backend_embedding(self):
-        cfg = SemTopKConfig(scorer_backend="embedding")
-        assert cfg.scorer_backend == "embedding"
+    def test_query_spec_simple(self):
+        qs = TopKQuerySpec.simple("rank by relevance", k=5, backend="llm",
+                                  ttl_seconds=600, max_candidates=50)
+        assert qs.k == 5
+        assert qs.semantic.backend == "llm"
+        assert qs.scope_policy.ttl_seconds == 600
+        assert qs.scope_policy.max_candidates == 50
 
-    def test_scorer_backend_invalid(self):
+    def test_query_spec_invalid_ranking_method(self):
         import pytest
-        with pytest.raises(ValueError, match="Invalid scorer_backend"):
-            SemTopKConfig(scorer_backend="invalid")
+        with pytest.raises(ValueError, match="Invalid ranking_method"):
+            TopKQuerySpec(ranking_method="bogus")
 
 
 class TestSemTopKRecompute:
     """Test top-k recomputation logic (no Flink runtime)."""
 
     def _make_func(self, k=3, max_cand=10, policy="delta"):
-        cfg = SemTopKConfig(k=k, max_candidates=max_cand, emission_policy=policy)
-        func = SemTopKFunction(cfg)
+        cfg = SemTopKConfig(max_candidates=max_cand, emission_policy=policy)
+        qs = TopKQuerySpec(k=k)
+        func = SemTopKFunction(cfg, query_spec=qs)
         func._candidates = _FakeMapState()
         func._snapshot = _FakeValueState()
         func._meta = _FakeValueState()
@@ -717,96 +725,165 @@ class TestSemTopKRecompute:
         assert len(func._candidates.keys()) == 3
 
 
-class TestSemTopKScorerBackendRouting:
-    """Test scorer backend routing in _ingest_candidate."""
+class TestSemTopKPureStateMachine:
+    """Test the pure state machine: upsert + versioning (no scorer routing)."""
 
-    def _make_func(self, backend="external_score", k=3, max_cand=10):
-        cfg = SemTopKConfig(k=k, max_candidates=max_cand, scorer_backend=backend)
-        func = SemTopKFunction(cfg)
+    def _make_func(self, k=3, max_cand=10, **qs_kwargs):
+        cfg = SemTopKConfig(max_candidates=max_cand, emission_policy="snapshot",
+                            recompute_interval_ms=0)
+        qs = TopKQuerySpec(k=k, **qs_kwargs)
+        func = SemTopKFunction(cfg, query_spec=qs)
         func._candidates = _FakeMapState()
         func._snapshot = _FakeValueState()
         func._meta = _FakeValueState()
         func._metrics = None
         return func
 
-    def test_external_score_upserts_directly(self):
-        func = self._make_func(backend="external_score")
-        meta = {"key": "k", "last_query": "q1"}
+    def test_upsert_attaches_versioning_metadata(self):
+        func = self._make_func()
         item = {"candidate_id": "c1", "score": 0.9, "text": "hello"}
-        results = list(func._ingest_candidate(item, meta, 1000))
-        # No side-output for external_score
-        assert len(results) == 0
-        assert func._candidates.get("c1") is not None
-        assert func._candidates.get("c1")["score"] == 0.9
+        func._upsert_candidate(item, 1000)
+        stored = func._candidates.get("c1")
+        assert stored is not None
+        assert stored["score"] == 0.9
+        assert stored["_updated_ms"] == 1000
+        assert stored["_score_version"] == 1
+        assert stored["_query_version"] == 1
+        assert stored["_score_backend"] == "external_score"  # default from TopKQuerySpec
 
-    def test_llm_backend_emits_side_output_for_unscored(self):
-        func = self._make_func(backend="llm")
-        meta = {"key": "k", "last_query": "q1"}
-        item = {"candidate_id": "c1", "text": "hello"}
-        results = list(func._ingest_candidate(item, meta, 1000))
-        # Should emit side-output work item
-        assert len(results) == 1
-        tag, work_dict = results[0]
-        assert tag.tag_id == "async_work_items"
-        assert work_dict["task_type"] == "score_llm"
-        assert work_dict["payload"]["candidate"]["candidate_id"] == "c1"
-
-    def test_llm_backend_upserts_when_scored(self):
-        func = self._make_func(backend="llm")
-        meta = {"key": "k", "last_query": "q1"}
-        item = {"candidate_id": "c1", "score": 0.8, "text": "hello"}
-        results = list(func._ingest_candidate(item, meta, 1000))
-        assert len(results) == 0  # No side-output needed
-        assert func._candidates.get("c1")["score"] == 0.8
-
-    def test_embedding_backend_emits_side_output(self):
-        func = self._make_func(backend="embedding")
-        meta = {"key": "k", "last_query": "q1"}
-        item = {"candidate_id": "c1", "text": "hello"}
-        results = list(func._ingest_candidate(item, meta, 1000))
-        assert len(results) == 1
-        tag, work_dict = results[0]
-        assert work_dict["task_type"] == "score_embedding"
-
-
-class TestSemTopKScorerMergeBack:
-    """Test _handle_scorer_result merge-back."""
-
-    def _make_func(self, backend="llm", k=3):
-        cfg = SemTopKConfig(k=k, max_candidates=10, scorer_backend=backend,
-                            emission_policy="snapshot")
-        func = SemTopKFunction(cfg)
-        func._candidates = _FakeMapState()
-        func._snapshot = _FakeValueState()
-        func._meta = _FakeValueState({"key": "k", "update_count": 1})
-        func._metrics = None
-        return func
-
-    def test_successful_scorer_result_upserts_candidate(self):
+    def test_upsert_preserves_existing_versioning(self):
         func = self._make_func()
-        result = {
-            "task_type": "score_llm",
-            "success": True,
-            "result": {
-                "candidate": {"candidate_id": "c1", "score": 0.95, "text": "hello"},
-            },
+        item = {
+            "candidate_id": "c1", "score": 0.9,
+            "_score_version": 3, "_query_version": 2,
+            "_score_backend": "llm",
         }
-        results = list(func._handle_scorer_result(result, 1000))
-        assert func._candidates.get("c1") is not None
-        assert func._candidates.get("c1")["score"] == 0.95
-        # Should recompute and emit
-        assert len(results) > 0
+        func._upsert_candidate(item, 2000)
+        stored = func._candidates.get("c1")
+        assert stored["_score_version"] == 3
+        assert stored["_query_version"] == 2
+        assert stored["_score_backend"] == "llm"
 
-    def test_failed_scorer_result_is_skipped(self):
+    def test_upsert_skips_no_candidate_id(self):
         func = self._make_func()
-        result = {
-            "task_type": "score_llm",
-            "success": False,
-            "error": "timeout",
-        }
-        results = list(func._handle_scorer_result(result, 1000))
-        assert len(results) == 0
+        accepted = func._upsert_candidate({"score": 0.5}, 1000)
+        assert accepted is False
         assert len(func._candidates.keys()) == 0
+
+    def test_upsert_rejects_unscored_candidate(self):
+        func = self._make_func()
+        accepted = func._upsert_candidate({"candidate_id": "c1"}, 1000)
+        assert accepted is False
+        assert len(func._candidates.keys()) == 0
+
+    def test_query_spec_k_drives_topk(self):
+        """k comes from TopKQuerySpec, not SemTopKConfig."""
+        cfg = SemTopKConfig(max_candidates=20)
+        qs = TopKQuerySpec(k=2)
+        func = SemTopKFunction(cfg, query_spec=qs)
+        func._candidates = _FakeMapState({
+            "c1": {"candidate_id": "c1", "score": 0.9},
+            "c2": {"candidate_id": "c2", "score": 0.5},
+            "c3": {"candidate_id": "c3", "score": 0.7},
+        })
+        func._snapshot = _FakeValueState()
+        func._meta = _FakeValueState({"key": "k", "update_count": 3})
+        results = list(func._recompute_and_emit(
+            {"key": "k", "update_count": 3}, 1000))
+        assert len(results) == 1
+        assert results[0]["top_ids"] == ["c1", "c3"]
+
+    def test_stale_query_version_excluded_from_frontier(self):
+        """Candidates scored under an old query_version are excluded."""
+        func = self._make_func(k=2, max_cand=20, query_version=2)
+        func._candidates = _FakeMapState({
+            "c1": {"candidate_id": "c1", "score": 0.9, "_query_version": 2},
+            "c2": {"candidate_id": "c2", "score": 0.8, "_query_version": 1},  # stale
+            "c3": {"candidate_id": "c3", "score": 0.7, "_query_version": 2},
+        })
+        func._meta = _FakeValueState({"key": "k", "update_count": 3})
+        results = list(func._recompute_and_emit(
+            {"key": "k", "update_count": 3}, 1000))
+        assert len(results) == 1
+        assert results[0]["top_ids"] == ["c1", "c3"]
+        assert results[0]["stale_candidates"] == 1
+        assert results[0]["total_candidates"] == 2  # only eligible
+
+    def test_stale_candidates_remain_in_state(self):
+        """Stale candidates are not deleted, just excluded from ranking."""
+        func = self._make_func(k=2, max_cand=20, query_version=2)
+        func._candidates = _FakeMapState({
+            "c1": {"candidate_id": "c1", "score": 0.9, "_query_version": 1},
+        })
+        func._meta = _FakeValueState({"key": "k", "update_count": 1})
+        list(func._recompute_and_emit({"key": "k", "update_count": 1}, 1000))
+        # c1 is stale but should still be in state
+        assert func._candidates.get("c1") is not None
+
+    def test_scope_policy_overrides_kernel_max_candidates(self):
+        """TopKScopePolicy.max_candidates overrides SemTopKConfig.max_candidates."""
+        cfg = SemTopKConfig(max_candidates=100)
+        qs = TopKQuerySpec(k=2, scope_policy=TopKScopePolicy(max_candidates=3))
+        func = SemTopKFunction(cfg, query_spec=qs)
+        assert func._resolved_max_candidates == 3
+
+    def test_scope_policy_fallback_to_kernel_config(self):
+        """When scope_policy.max_candidates is None, fall back to kernel config."""
+        cfg = SemTopKConfig(max_candidates=50)
+        qs = TopKQuerySpec(k=2, scope_policy=TopKScopePolicy())
+        func = SemTopKFunction(cfg, query_spec=qs)
+        assert func._resolved_max_candidates == 50
+
+    def test_scope_policy_ttl_overrides_kernel(self):
+        """TopKScopePolicy.ttl_seconds overrides SemTopKConfig.ttl_seconds."""
+        cfg = SemTopKConfig(ttl_seconds=3600)
+        qs = TopKQuerySpec(k=2, scope_policy=TopKScopePolicy(ttl_seconds=600))
+        func = SemTopKFunction(cfg, query_spec=qs)
+        assert func._resolved_ttl_seconds == 600
+
+    def test_process_element_rejects_envelope(self):
+        """Kernel no longer expands retrieval envelopes — flat dict only."""
+        func = self._make_func()
+        envelope = {"candidates": [
+            {"candidate_id": "c1", "score": 0.9},
+            {"candidate_id": "c2", "score": 0.5},
+        ]}
+        # process_element should treat envelope as a single candidate;
+        # since it has no candidate_id, nothing is upserted.
+        results = list(func.process_element(envelope, _FakeContext("k")))
+        assert len(func._candidates.keys()) == 0
+        assert results == []
+
+    def test_process_element_rejects_unscored_candidate_without_emission(self):
+        func = self._make_func()
+        results = list(func.process_element(
+            {"candidate_id": "c1", "query": "q", "query_seq_id": 7},
+            _FakeContext("k"),
+        ))
+        assert len(func._candidates.keys()) == 0
+        assert results == []
+
+    def test_process_element_propagates_query_fields_to_snapshot(self):
+        func = self._make_func(k=1)
+        results = list(func.process_element(
+            {
+                "candidate_id": "c1",
+                "score": 0.95,
+                "query": "best weather days",
+                "query_seq_id": 42,
+                "source": "async_score",
+                "degraded": True,
+                "error": "partial_score_timeout",
+            },
+            _FakeContext("k"),
+        ))
+        assert len(results) == 1
+        out = results[0]
+        assert out["query"] == "best weather days"
+        assert out["query_seq_id"] == 42
+        assert out["source"] == "async_score"
+        assert out["degraded"] is True
+        assert out["error"] == "partial_score_timeout"
 
 
 # ============================================================================
@@ -1072,11 +1149,13 @@ class TestContinuousRAGConfig:
     def test_custom_configs(self):
         cfg = ContinuousRAGConfig(
             window_config=SemWindowConfig(max_window_events=10),
-            topk_config=SemTopKConfig(k=5),
+            topk_config=SemTopKConfig(max_candidates=50),
+            topk_query_spec=TopKQuerySpec(k=5),
             workflow_version="v0.2.1",
         )
         assert cfg.window_config.max_window_events == 10
-        assert cfg.topk_config.k == 5
+        assert cfg.topk_query_spec.k == 5
+        assert cfg.topk_config.max_candidates == 50
         assert cfg.workflow_version == "v0.2.1"
 
 
@@ -1716,8 +1795,8 @@ class TestTopKUpdateConsistency:
 
     def test_topk_recompute_stable_ordering(self):
         """Top-K recompute should produce stable ordering for same data."""
-        cfg = SemTopKConfig(k=2, max_candidates=10, emission_policy="snapshot")
-        func = SemTopKFunction(cfg)
+        cfg = SemTopKConfig(max_candidates=10, emission_policy="snapshot")
+        func = SemTopKFunction(cfg, query_spec=TopKQuerySpec(k=2))
         func._candidates = _FakeMapState({
             "c1": {"score": 0.9, "content": "best", "_inserted_ms": 100},
             "c2": {"score": 0.5, "content": "mid", "_inserted_ms": 200},
@@ -1738,8 +1817,8 @@ class TestTopKUpdateConsistency:
 
     def test_topk_delta_no_emission_on_same_data(self):
         """Delta policy should not emit when top-k hasn't changed."""
-        cfg = SemTopKConfig(k=2, emission_policy="delta")
-        func = SemTopKFunction(cfg)
+        cfg = SemTopKConfig(emission_policy="delta")
+        func = SemTopKFunction(cfg, query_spec=TopKQuerySpec(k=2))
         candidates = {
             "c1": {"score": 0.9, "content": "best", "_inserted_ms": 100},
             "c2": {"score": 0.5, "content": "mid", "_inserted_ms": 200},
@@ -1983,4 +2062,3 @@ class TestEndToEndRAGConsistency:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

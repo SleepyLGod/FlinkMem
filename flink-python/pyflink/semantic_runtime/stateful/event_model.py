@@ -273,6 +273,11 @@ def retrieve_to_topk_items(
     candidates = retrieve_output.get("candidates", [])
     key = retrieve_output.get("key", "")
     query_seq_id = retrieve_output.get("query_seq_id", 0)
+    # Envelope-level metadata to propagate to each expanded candidate
+    source = retrieve_output.get("source", "")
+    query = retrieve_output.get("query", "")
+    degraded = retrieve_output.get("degraded", False)
+    error = retrieve_output.get("error", "")
 
     result: List[Dict[str, Any]] = []
     for cand in candidates:
@@ -282,6 +287,10 @@ def retrieve_to_topk_items(
             out["candidate_id"] = out.get("id", f"{key}_{len(result)}")
         out["key"] = key
         out["query_seq_id"] = query_seq_id
+        out.setdefault("source", source)
+        out.setdefault("query", query)
+        out.setdefault("degraded", degraded)
+        out.setdefault("error", error)
         result.append(out)
     return result
 

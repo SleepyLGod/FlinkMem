@@ -17,6 +17,10 @@
 
 """Continuous Prompts (CP) replication on PyFlink."""
 
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec  # noqa: F401
+from pyflink.semantic_runtime.semantic_spec import (  # noqa: F401
+    SemanticSpec,
+    TopKScopePolicy,
+    TopKQuerySpec,
+)
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig  # noqa: F401
 

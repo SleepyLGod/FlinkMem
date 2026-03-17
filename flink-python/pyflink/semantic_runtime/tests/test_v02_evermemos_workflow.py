@@ -36,6 +36,7 @@ from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
     _ClassifyAsyncMergeFunction,
     _GroupbyToAggEnvelope,
     _MissingAsyncFallbackMapper,
+    _RetrievalEnvelopeExpander,
     _RetrievalToAnswerEnvelope,
     _RetrieveAsyncMergeFunction,
     _SummarizeAsyncMergeFunction,
@@ -44,6 +45,7 @@ from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig, Ct
 from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig, SemGroupbyFunction
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
 from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig, SemWindowFunction
 
 
@@ -584,8 +586,9 @@ def _build_configs():
         new_group_creation_threshold=0.1,
     )
     retrieve_cfg = CtsRetrieveConfig(max_candidates_per_request=4, max_cache_entries_per_key=32)
-    topk_cfg = SemTopKConfig(k=2, max_candidates=16, recompute_interval_ms=0, emission_policy="snapshot")
-    return window_cfg, groupby_cfg, retrieve_cfg, topk_cfg
+    topk_cfg = SemTopKConfig(max_candidates=16, recompute_interval_ms=0, emission_policy="snapshot")
+    topk_qs = TopKQuerySpec(k=2)
+    return window_cfg, groupby_cfg, retrieve_cfg, topk_cfg, topk_qs
 
 
 def _build_retrieval_corpus(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -653,7 +656,7 @@ def _run_memory_path(
     summarize_async_fn: Optional[AsyncFunction],
 ) -> List[Dict[str, Any]]:
     key = "user_001"
-    window_cfg, groupby_cfg, _, _ = _build_configs()
+    window_cfg, groupby_cfg, _, _, _ = _build_configs()
     agg_cfg = SemAggConfig(mode=agg_mode, max_buffer_events=2, flush_interval_ms=0)
 
     sem_window = SemWindowFunction(window_cfg)
@@ -733,14 +736,15 @@ def _run_retrieval_path(
     retrieve_async_fn: Optional[AsyncFunction],
 ) -> List[Dict[str, Any]]:
     key = "user_001"
-    _, _, retrieve_cfg, topk_cfg = _build_configs()
+    _, _, retrieve_cfg, topk_cfg, topk_qs = _build_configs()
 
     retrieve = CtsRetrieveFunction(retrieve_cfg)
     retrieve._cache = _FakeMapState()
     retrieve._meta = _FakeValueState(None)
 
     retrieve_merge = _RetrieveAsyncMergeFunction()
-    topk = SemTopKFunction(topk_cfg)
+    expander = _RetrievalEnvelopeExpander()
+    topk = SemTopKFunction(topk_cfg, query_spec=topk_qs)
     topk._candidates = _FakeMapState()
     topk._snapshot = _FakeValueState(None)
     topk._meta = _FakeValueState(None)
@@ -748,6 +752,7 @@ def _run_retrieval_path(
 
     retrieve_ctx = _FakeContext(key)
     retrieve_merge_ctx = _FakeContext(key)
+    expander_ctx = _FakeContext(key)
     topk_ctx = _FakeContext(key)
     normalize_ctx = _FakeContext(key)
 
@@ -770,12 +775,20 @@ def _run_retrieval_path(
         key,
     )
 
-    topk_rows: List[Dict[str, Any]] = []
+    # Expand retrieval envelopes into flat candidates before feeding to topk
+    expanded_candidates: List[Dict[str, Any]] = []
     for row in merged_retrieve:
+        expanded_candidates.extend(list(expander.process_element(row, expander_ctx)))
+
+    scored_candidate_rows = [row for row in expanded_candidates if "candidate_id" in row]
+    passthrough_rows = [row for row in expanded_candidates if "candidate_id" not in row]
+
+    topk_rows: List[Dict[str, Any]] = []
+    for row in scored_candidate_rows:
         topk_rows.extend(list(topk.process_element(row, topk_ctx)))
 
     normalized: List[Dict[str, Any]] = []
-    for row in topk_rows:
+    for row in passthrough_rows + topk_rows:
         normalized.extend(list(normalize.process_element(row, normalize_ctx)))
     return normalized
 
@@ -991,8 +1004,10 @@ def test_v02_workflow_lotus_inspired_contract_and_counts():
     # Hard gate: deterministic counts on same replay input
     assert len(answer_rows) == len(answer_rows_again)
 
-    # Hard gate: no silent drop on query chain
-    assert len(retrieval_rows) == query_count
+    # Hard gate: no silent drop on query chain.
+    # With envelope expansion, topk emits per-candidate-update (not per-envelope),
+    # so we get >= query_count rows.  The key invariant is no silent drop.
+    assert len(retrieval_rows) >= query_count
     assert len(answer_rows) == len(retrieval_rows)
 
     # Retrieval envelope normalization

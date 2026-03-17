@@ -18,30 +18,24 @@
 """
 sem_topk — continuous keyed semantic top-k with delta emissions.
 
-Maintains a per-key candidate buffer and a current top-k frontier.
-Recomputes top-k on new evidence or timer trigger.  Emits only when
-the frontier changes (delta policy) or on every update (snapshot policy).
+Pure state-machine kernel: maintains a per-key candidate buffer and a
+current top-k frontier.  Recomputes top-k on new evidence or timer
+trigger.  Emits only when the frontier changes (delta policy) or on
+every update (snapshot policy).
 
-Scorer backends
-~~~~~~~~~~~~~~~
-``scorer_backend`` in :class:`SemTopKConfig` selects how candidate scores
-are obtained:
-
-- ``"external_score"`` (default): candidates already carry a numeric score
-  field.  No async work is needed — the operator reads the score directly.
-- ``"llm"``: the operator emits unscored candidates as side-output work
-  items via the async bridge.  An LLM-based async worker scores them and
-  the merge function feeds scored candidates back.
-- ``"embedding"``: same async bridge path as ``llm``, but the async worker
-  uses an embedding-based similarity scorer instead.
+**This operator only consumes already-scored candidates.**  Scoring
+orchestration (LLM, embedding, external) is handled upstream by the
+pipeline builder (``build_sem_topk_pipeline``).
 
 State model:
   - ``MapState[candidate_id -> candidate_record]`` for the candidate pool.
+    Each record carries versioning metadata:
+    ``score_version``, ``query_version``, ``score_backend``, ``_updated_ms``.
   - ``ValueState[snapshot]`` for the current top-k frontier.
 
 Guardrails:
   - ``max_candidates``: hard cap on candidate buffer size.
-  - ``k``: number of top items to maintain.
+  - ``k`` (via :class:`TopKQuerySpec`): number of top items to maintain.
   - TTL via ``StateTtlConfig``.
   - Overflow policy on candidate buffer.
 """
@@ -70,10 +64,7 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
-from pyflink.semantic_runtime.stateful.async_bridge import (
-    ASYNC_WORK_TAG,
-    AsyncWorkItem,
-)
+from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec, TopKScopePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -82,37 +73,36 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-VALID_SCORER_BACKENDS = {"external_score", "llm", "embedding"}
-
 
 @dataclass
 class SemTopKConfig:
-    """Configuration for the continuous top-k operator.
+    """Kernel-level configuration for the continuous top-k operator.
+
+    This holds execution-level parameters for the state machine.
+    Query-level parameters (``k``, ``query_version``, ``ranking_method``,
+    ``scope_policy``) live in :class:`TopKQuerySpec`.
 
     Parameters
     ----------
-    scorer_backend : str
-        ``"external_score"`` (default) — use the score field already present
-        on each candidate record (no async I/O).
-        ``"llm"`` — emit unscored candidates as side-output for LLM scoring
-        via the async bridge.
-        ``"embedding"`` — same async bridge path but for embedding scoring.
+    max_candidates : int
+        Hard cap on the candidate pool size.
+    recompute_interval_ms : int
+        Timer-driven recompute interval in milliseconds.
+    ttl_seconds : int
+        Time-to-live for Flink state entries.
+    overflow_policy : OverflowPolicy
+        What to do when the candidate pool exceeds ``max_candidates``.
+    emission_policy : str
+        ``"delta"`` (emit only on change) or ``"snapshot"`` (emit every update).
+    score_field : str
+        Name of the score field in candidate records.
     """
-    k: int = 10
     max_candidates: int = 100
     recompute_interval_ms: int = 10_000  # timer-driven recompute
     ttl_seconds: int = 3600
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     emission_policy: str = "delta"       # "delta" | "snapshot"
     score_field: str = "score"           # field name in candidate record
-    scorer_backend: str = "external_score"  # "external_score" | "llm" | "embedding"
-
-    def __post_init__(self):
-        if self.scorer_backend not in VALID_SCORER_BACKENDS:
-            raise ValueError(
-                f"Invalid scorer_backend={self.scorer_backend!r}. "
-                f"Must be one of {VALID_SCORER_BACKENDS}."
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -120,25 +110,58 @@ class SemTopKConfig:
 # ---------------------------------------------------------------------------
 
 class SemTopKFunction(KeyedProcessFunction):
-    """Keyed continuous top-k state machine.
+    """Keyed continuous top-k state machine (pure kernel).
 
-    Input: candidate records as dicts with at least ``candidate_id`` and
-    a score field (default ``"score"``).
+    Consumes **already-scored** candidate records and maintains the top-k
+    frontier per key.  Scoring orchestration (LLM / embedding / external)
+    is the responsibility of the upstream pipeline builder, not this operator.
 
-    Output: top-k snapshot dicts emitted on change (delta) or every update.
+    Input
+    -----
+    Candidate dicts with at least ``candidate_id`` and a score field
+    (default ``"score"``).  Each candidate may also carry versioning
+    metadata (``score_version``, ``query_version``, ``score_backend``).
+
+    Output
+    ------
+    Top-k snapshot dicts emitted on change (delta) or every update
+    (snapshot policy).
     """
 
-    def __init__(self, config: Optional[SemTopKConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[SemTopKConfig] = None,
+        query_spec: Optional[TopKQuerySpec] = None,
+    ) -> None:
         self._config = config or SemTopKConfig()
+        self._query_spec = query_spec or TopKQuerySpec()
         self._candidates: Optional[MapState] = None
         self._snapshot: Optional[ValueState] = None
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
 
+    # -- resolved config (scope_policy > kernel config) ----------------------
+
+    @property
+    def _resolved_max_candidates(self) -> int:
+        """``TopKScopePolicy.max_candidates`` wins; fall back to kernel config."""
+        sp = self._query_spec.scope_policy
+        if sp.max_candidates is not None:
+            return sp.max_candidates
+        return self._config.max_candidates
+
+    @property
+    def _resolved_ttl_seconds(self) -> int:
+        """``TopKScopePolicy.ttl_seconds`` wins; fall back to kernel config."""
+        sp = self._query_spec.scope_policy
+        if sp.ttl_seconds is not None:
+            return sp.ttl_seconds
+        return self._config.ttl_seconds
+
     # -- lifecycle -----------------------------------------------------------
 
     def open(self, runtime_context: RuntimeContext) -> None:
-        ttl = self._config.ttl_seconds
+        ttl = self._resolved_ttl_seconds
         self._candidates = runtime_context.get_map_state(
             sem_topk_candidates_descriptor(ttl)
         )
@@ -154,8 +177,9 @@ class SemTopKFunction(KeyedProcessFunction):
             runtime_context, "sem_topk",
         )
         logger.info(
-            "SemTopKFunction opened (k=%d, max_candidates=%d)",
-            self._config.k, self._config.max_candidates,
+            "SemTopKFunction opened (k=%d, max_candidates=%d, ttl=%d)",
+            self._query_spec.k, self._resolved_max_candidates,
+            self._resolved_ttl_seconds,
         )
 
     # -- core ----------------------------------------------------------------
@@ -166,11 +190,6 @@ class SemTopKFunction(KeyedProcessFunction):
             self._metrics.record_event_processed()
 
         if not isinstance(value, dict):
-            return
-
-        # ── Handle async scorer merge-back ────────────────────────────
-        if value.get("task_type") in ("score_llm", "score_embedding"):
-            yield from self._handle_scorer_result(value, now_ms)
             return
 
         meta = self._meta.value() or {
@@ -192,24 +211,22 @@ class SemTopKFunction(KeyedProcessFunction):
 
         meta["update_count"] += 1
 
-        # Accept retrieval envelope (from cts_retrieve) — expand candidates
-        if "candidates" in value and isinstance(value["candidates"], list):
-            from pyflink.semantic_runtime.stateful.event_model import (
-                retrieve_to_topk_items,
-            )
-            items = retrieve_to_topk_items(value)
-            meta["last_query"] = str(value.get("query", meta.get("last_query", "")))
-            meta["last_query_seq_id"] = int(
-                value.get("query_seq_id", meta.get("last_query_seq_id", 0))
-            )
-            meta["last_source"] = str(value.get("source", meta.get("last_source", "")))
-            meta["last_degraded"] = bool(value.get("degraded", False))
-            meta["last_error"] = str(value.get("error", ""))
-            for item in items:
-                yield from self._ingest_candidate(item, meta, now_ms)
-        else:
-            # Single candidate upsert
-            yield from self._ingest_candidate(value, meta, now_ms)
+        # Propagate query + envelope metadata from the flat candidate into
+        # meta so downstream snapshot emissions retain the query context and
+        # degraded/source markers from upstream retrieval/scoring stages.
+        meta["last_query"] = value.get("query", meta.get("last_query", ""))
+        meta["last_query_seq_id"] = int(
+            value.get("query_seq_id", meta.get("last_query_seq_id", 0))
+        )
+        meta["last_source"] = value.get("source", meta.get("last_source", ""))
+        meta["last_degraded"] = value.get("degraded", False)
+        meta["last_error"] = value.get("error", "")
+
+        # Pure kernel: only accepts flat scored candidate dicts.
+        # Retrieval envelope expansion ({"candidates": [...]}) must be done
+        # upstream by _RetrievalEnvelopeExpander or equivalent adapter.
+        if not self._upsert_candidate(value, now_ms):
+            return
 
         # Enforce candidate buffer limit
         self._enforce_candidate_limit()
@@ -217,78 +234,30 @@ class SemTopKFunction(KeyedProcessFunction):
         # Recompute top-k and possibly emit
         yield from self._recompute_and_emit(meta, now_ms)
 
-    # -- scorer backend routing -----------------------------------------------
+    # -- candidate management ------------------------------------------------
 
-    def _ingest_candidate(
-        self, item: Dict[str, Any], meta: Dict[str, Any], now_ms: int,
-    ):
-        """Route a single candidate through the configured scorer backend.
+    def _upsert_candidate(self, value: Dict[str, Any], now_ms: int) -> bool:
+        """Insert or update a single scored candidate in the MapState.
 
-        - ``external_score``: upsert directly (score already present).
-        - ``llm`` / ``embedding``: if the candidate lacks a score, emit a
-          side-output work item for async scoring; otherwise upsert directly.
+        Attaches versioning metadata alongside the candidate record:
+        ``_updated_ms``, ``_score_version``, ``_query_version``,
+        ``_score_backend``.
+
+        Returns ``True`` when the candidate is accepted into the kernel and
+        ``False`` when it is rejected (missing ``candidate_id`` or score).
         """
-        backend = self._config.scorer_backend
-        score_field = self._config.score_field
-
-        if backend == "external_score":
-            self._upsert_candidate(item, now_ms)
-            return
-
-        # llm / embedding: check if score is already present
-        has_score = (
-            score_field in item
-            and item[score_field] is not None
-            and item[score_field] != 0.0
-        )
-        if has_score:
-            self._upsert_candidate(item, now_ms)
-            return
-
-        # No score → emit async scoring request via side output
-        task_type = f"score_{backend}"  # "score_llm" or "score_embedding"
-        work = AsyncWorkItem(
-            key=meta.get("key", ""),
-            task_type=task_type,
-            payload={
-                "candidate": item,
-                "query": meta.get("last_query", ""),
-                "scorer_backend": backend,
-            },
-        )
-        if self._metrics:
-            self._metrics.record_async_emit()
-        # Yield side-output; the caller wires ASYNC_WORK_TAG in the topology
-        yield ASYNC_WORK_TAG, work.to_dict()
-
-    def _handle_scorer_result(
-        self, value: Dict[str, Any], now_ms: int,
-    ):
-        """Process a merge-back result from an async scorer (llm/embedding)."""
-        meta = self._meta.value()
-        if meta is None:
-            return
-
-        if not value.get("success", False):
-            logger.warning(
-                "sem_topk async scorer failed: %s", value.get("error", "unknown")
-            )
-            return
-
-        result = value.get("result", {})
-        candidate = result.get("candidate", {})
-        if candidate and candidate.get("candidate_id"):
-            self._upsert_candidate(candidate, now_ms)
-            self._enforce_candidate_limit()
-            yield from self._recompute_and_emit(meta, now_ms)
-
-    def _upsert_candidate(self, value: Dict[str, Any], now_ms: int) -> None:
-        """Insert or update a single candidate in the MapState."""
         cid = value.get("candidate_id", "")
         if not cid:
-            return
+            return False
+        if self._config.score_field not in value or value[self._config.score_field] is None:
+            return False
+        # Attach versioning metadata
         value["_updated_ms"] = now_ms
+        value.setdefault("_score_version", 1)
+        value.setdefault("_query_version", self._query_spec.query_version)
+        value.setdefault("_score_backend", self._query_spec.semantic.backend)
         self._candidates.put(cid, value)
+        return True
 
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
         """Timer-driven top-k recomputation."""
@@ -318,17 +287,31 @@ class SemTopKFunction(KeyedProcessFunction):
     def _recompute_and_emit(
         self, meta: Dict[str, Any], now_ms: int, force_emit: bool = False,
     ):
-        """Recompute top-k from candidate pool and emit if changed."""
+        """Recompute top-k from candidate pool and emit if changed.
+
+        Only candidates whose ``_query_version`` matches the current
+        ``TopKQuerySpec.query_version`` participate in the frontier.
+        Stale candidates remain in state (they may be re-scored later)
+        but are excluded from ranking.
+        """
         if self._metrics:
             self._metrics.record_recompute()
         score_field = self._config.score_field
-        k = self._config.k
+        k = self._query_spec.k
+        current_qv = self._query_spec.query_version
 
-        # Collect all candidates with scores
+        # Collect eligible candidates (query_version match + has score)
         scored = []
+        stale_count = 0
         for cid in self._candidates.keys():
             record = self._candidates.get(cid)
             if record is None:
+                continue
+            # Query-version staleness filter: skip candidates scored
+            # under an older query version.
+            record_qv = record.get("_query_version")
+            if record_qv is not None and record_qv != current_qv:
+                stale_count += 1
                 continue
             score = record.get(score_field, 0.0)
             scored.append((cid, score, record))
@@ -348,6 +331,7 @@ class SemTopKFunction(KeyedProcessFunction):
             "top_ids": new_topk_ids,
             "top_records": [rec for _, _, rec in scored[:k]],
             "total_candidates": len(scored),
+            "stale_candidates": stale_count,
             "version": meta.get("update_count", 0),
             "timestamp_ms": now_ms,
         }
@@ -365,6 +349,7 @@ class SemTopKFunction(KeyedProcessFunction):
                 "query_seq_id": meta.get("last_query_seq_id", 0),
                 "source": meta.get("last_source", ""),
                 "total_candidates": len(scored),
+                "stale_candidates": stale_count,
                 "version": new_snapshot["version"],
                 "changed": changed,
                 "emission_policy": self._config.emission_policy,
@@ -374,7 +359,11 @@ class SemTopKFunction(KeyedProcessFunction):
             }
 
     def _enforce_candidate_limit(self) -> int:
-        """Enforce max_candidates limit per overflow_policy. Returns evicted count."""
+        """Enforce max_candidates limit per overflow_policy. Returns evicted count.
+
+        Uses ``_resolved_max_candidates`` (scope_policy > kernel config).
+        """
+        max_cand = self._resolved_max_candidates
         entries = []
         for cid in self._candidates.keys():
             record = self._candidates.get(cid)
@@ -382,14 +371,14 @@ class SemTopKFunction(KeyedProcessFunction):
                 entries.append((cid, record.get("_updated_ms", 0),
                                 record.get(self._config.score_field, 0.0)))
 
-        if len(entries) <= self._config.max_candidates:
+        if len(entries) <= max_cand:
             return 0
 
         policy = self._config.overflow_policy
         if policy == OverflowPolicy.DEGRADE_TAG:
             return 0
 
-        to_evict = len(entries) - self._config.max_candidates
+        to_evict = len(entries) - max_cand
         if policy == OverflowPolicy.DROP_NEWEST:
             entries.sort(key=lambda x: x[1], reverse=True)  # newest first
         else:

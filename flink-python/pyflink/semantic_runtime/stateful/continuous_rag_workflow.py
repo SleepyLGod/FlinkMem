@@ -70,6 +70,7 @@ from pyflink.semantic_runtime.stateful.event_model import (
     SemanticEvent,
     group_assignment_to_semantic_event,
     retrieve_to_answer_context,
+    retrieve_to_topk_items,
     topk_to_answer_context,
     simple_key_selector,
 )
@@ -91,7 +92,12 @@ from pyflink.semantic_runtime.stateful.cts_retrieve import (
 )
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
     SemTopKConfig,
-    SemTopKFunction,
+)
+from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.llm_client import LLMClientConfig
+from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
+from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
+    build_sem_topk_pipeline,
 )
 from pyflink.semantic_runtime.stateful.async_bridge import (
     ASYNC_WORK_TAG,
@@ -128,6 +134,9 @@ class ContinuousRAGConfig:
     # Subflow B configs
     retrieve_config: CtsRetrieveConfig = field(default_factory=CtsRetrieveConfig)
     topk_config: Optional[SemTopKConfig] = None  # None = skip rerank
+    topk_query_spec: Optional[TopKQuerySpec] = None  # query-level params (k, version, …)
+    topk_llm_config: Optional[LLMClientConfig] = None
+    topk_embedding_config: Optional[EmbeddingBackendConfig] = None
 
     # Subflow C configs
     answer_prompt_template: str = (
@@ -429,6 +438,34 @@ class _RetrievalToAnswerEnvelope(KeyedProcessFunction):
         yield out
 
 
+class _RetrievalEnvelopeExpander(KeyedProcessFunction):
+    """Expand retrieval envelopes into flat scored candidate dicts.
+
+    This adapter sits between ``cts_retrieve`` (which emits
+    ``{"candidates": [...], "query": ..., ...}``) and ``SemTopKFunction``
+    (which only accepts individual scored candidate dicts).
+
+    For inputs that are already flat candidate dicts (no ``"candidates"``
+    key), they are yielded through unchanged.
+    """
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        if not isinstance(value, dict):
+            return
+        if "candidates" in value and isinstance(value["candidates"], list):
+            items = retrieve_to_topk_items(value)
+            if items:
+                for item in items:
+                    yield item
+            else:
+                # Empty candidates (e.g. degraded fallback) — pass through
+                # so downstream sees degraded/error flags.
+                yield value
+        else:
+            # Already a flat candidate dict — pass through
+            yield value
+
+
 class _MissingAsyncFallbackMapper:
     """Convert dropped async work items into explicit degraded records."""
 
@@ -630,11 +667,24 @@ def build_retrieval_subflow(
 
     # Step 2: Optional top-k reranking
     if config.topk_config is not None:
-        reranked = retrieved.key_by(config.key_selector).process(
-            SemTopKFunction(config.topk_config),
+        # Expand retrieval envelopes into flat candidate dicts, then let the
+        # top-k pipeline builder orchestrate optional async scoring + the pure
+        # SemTopKFunction kernel.
+        expanded = retrieved.key_by(config.key_selector).process(
+            _RetrievalEnvelopeExpander(),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
-        normalized = reranked.key_by(config.key_selector).process(
+        reranked_or_passthrough = build_sem_topk_pipeline(
+            expanded,
+            key_selector=config.key_selector,
+            topk_config=config.topk_config,
+            query_spec=config.topk_query_spec or TopKQuerySpec(),
+            llm_config=config.topk_llm_config,
+            embedding_config=config.topk_embedding_config,
+            async_timeout_ms=config.async_timeout_ms,
+            async_capacity=config.async_capacity,
+        )
+        normalized = reranked_or_passthrough.key_by(config.key_selector).process(
             _RetrievalToAnswerEnvelope(),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )

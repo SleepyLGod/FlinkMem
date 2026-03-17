@@ -34,7 +34,9 @@ from pyflink.semantic_runtime.stateful.cts_retrieve import (  # noqa: F401
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import (  # noqa: F401
     SemTopKFunction, SemTopKConfig,
 )
+from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (  # noqa: F401
+    build_sem_topk_pipeline,
+)
 from pyflink.semantic_runtime.stateful.external_search_backend import (  # noqa: F401
     ExternalSearchBackend, SearchResult,
 )
-

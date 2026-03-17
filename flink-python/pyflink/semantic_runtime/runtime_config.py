@@ -31,8 +31,8 @@ Usage::
         },
     })
 
-    # Access typed operator configs:
-    topk_cfg = cfg.get_operator_config("sem_topk")
+    # Access raw operator config dicts:
+    topk_raw = cfg.get_operator_raw("sem_topk")
 """
 
 from __future__ import annotations
