@@ -19,6 +19,8 @@ under the License.
 
 # V0.1 Implementation Report — Baseline Async Semantic Operators
 
+**Made by Claude Code**
+
 **Status**: ✅ Complete
 **Date**: 2026-03-14
 **PyFlink Version**: 2.2.0
@@ -35,12 +37,12 @@ Java↔Python Worker channel (Py4J + loopback).
 
 ### Operators Implemented
 
-| Operator | Class | Description |
-|----------|-------|-------------|
-| `sem_map` | `SemMapFunction` | 1:1 semantic transformation — LLM returns structured JSON |
-| `sem_filter` | `SemFilterFunction` | 1:1 semantic filtering — LLM returns `{decision, confidence, reason}` |
-| `sem_topk` | `SemTopKFunction` | Local top-k reranking — LLM reranks candidate list |
-| `sem_join_retrieve` | `SemJoinRetrieveFunction` | Retrieve-backed semantic join — async retrieval + LLM matching |
+| Operator              | Class                       | Description                                                              |
+| --------------------- | --------------------------- | ------------------------------------------------------------------------ |
+| `sem_map`           | `SemMapFunction`          | 1:1 semantic transformation — LLM returns structured JSON               |
+| `sem_filter`        | `SemFilterFunction`       | 1:1 semantic filtering — LLM returns `{decision, confidence, reason}` |
+| `sem_topk`          | `SemTopKFunction`         | Local top-k reranking — LLM reranks candidate list                      |
+| `sem_join_retrieve` | `SemJoinRetrieveFunction` | Retrieve-backed semantic join — async retrieval + LLM matching          |
 
 ---
 
@@ -90,9 +92,9 @@ operators for distribution).  Heavy objects like `LLMClient` instances are creat
 
 Two retry layers exist with **disjoint** error class ownership to avoid multiplicative retries:
 
-| Layer | Owner | Error Classes Retried | Config |
-|-------|-------|-----------------------|--------|
-| Layer 1 | LLM Client | `429`, `503`, connection timeout, network errors | `LLMClientConfig.max_retries`, `retry_base_delay_s` |
+| Layer   | Owner                        | Error Classes Retried                                                                      | Config                                                             |
+| ------- | ---------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Layer 1 | LLM Client                   | `429`, `503`, connection timeout, network errors                                       | `LLMClientConfig.max_retries`, `retry_base_delay_s`            |
 | Layer 2 | Flink `AsyncRetryStrategy` | `flink_timeout`, `json_parse_error`, `schema_validation_error`, `retrieve_timeout` | `create_flink_retry_strategy(max_attempts, backoff_time_millis)` |
 
 **Invariant**: `LLM_CLIENT_OWNED_ERRORS ∩ FLINK_RETRYABLE_ERRORS = ∅` (enforced by unit test).
@@ -171,16 +173,17 @@ flink-python/pyflink/semantic_runtime/
 
 ### 5.1 Operator Smoke Tests
 
-| Operator | Input Records | Output | Status |
-|----------|---------------|--------|--------|
-| `sem_map` | 2 | 2/2 ✅ | Structured JSON output |
-| `sem_filter` | 3 | 3/3 ✅ | decision/confidence/reason |
-| `sem_topk` | 2 | 2/2 ✅ | top_k correctly truncated to k=2 |
-| `sem_join_retrieve` | 2 | 2/2 ✅ | candidate_count=3, truncated=false |
+| Operator              | Input Records | Output | Status                             |
+| --------------------- | ------------- | ------ | ---------------------------------- |
+| `sem_map`           | 2             | 2/2    | Structured JSON output             |
+| `sem_filter`        | 3             | 3/3    | decision/confidence/reason         |
+| `sem_topk`          | 2             | 2/2    | top_k correctly truncated to k=2   |
+| `sem_join_retrieve` | 2             | 2/2    | candidate_count=3, truncated=false |
 
 ### 5.2 Retry Unit Tests
 
 9/9 predicate and strategy tests passed, including:
+
 - Normal results → no retry
 - `flink_timeout` / `json_parse_error` / `schema_validation_error` → retry (Layer 2)
 - `llm_call_error` → no retry (Layer 1 already exhausted)
@@ -188,13 +191,13 @@ flink-python/pyflink/semantic_runtime/
 
 ### 5.3 E2E Integration Tests
 
-| Test | Records | Degraded | p95 Latency | Status |
-|------|---------|----------|-------------|--------|
-| Normal pipeline | 3 | 0 (0%) | ~50ms | ✅ PASSED |
-| Timeout pipeline | 2 | 2 (100%) | N/A | ✅ PASSED |
-| Error pipeline | 3 | 3 (100%) | N/A | ✅ PASSED |
-| Retry pipeline | 2 | 0 (0%) after retry | ~50ms | ✅ PASSED |
-| Backpressure (500 records) | 500 | 0 (0%) | ~2009ms | ✅ PASSED |
+| Test                       | Records | Degraded           | p95 Latency | Status |
+| -------------------------- | ------- | ------------------ | ----------- | ------ |
+| Normal pipeline            | 3       | 0 (0%)             | ~50ms       | PASSED |
+| Timeout pipeline           | 2       | 2 (100%)           | N/A         | PASSED |
+| Error pipeline             | 3       | 3 (100%)           | N/A         | PASSED |
+| Retry pipeline             | 2       | 0 (0%) after retry | ~50ms       | PASSED |
+| Backpressure (500 records) | 500     | 0 (0%)             | ~2009ms     | PASSED |
 
 ### 5.4 Backpressure SLO (500 records, 2s mock latency, capacity=10)
 
@@ -218,22 +221,22 @@ throughput (theoretical max = capacity/latency = 10/2 = 5 rec/s).
 
 ## 6. Git Evidence
 
-| Commit | Message | Key Changes |
-|--------|---------|-------------|
-| `9f3a325fe4b` | `[build] Update .gitignore + isolation env script` | `.gitignore`, `mac_enter_isolated_env.sh` |
-| `a91d84e1a5f` | `[doc] Add implementation plan` | `V0_1_IMPLEMENTATION_PLAN.md`, blueprint, sem_queries docs |
-| `2753a9d3257` | `[feat] Add initial LLM client + operator wrappers` | `llm_client.py`, `cp/__init__.py`, `operators/__init__.py` |
-| `ad6177a8c5d` | `[feat] Add semantic operators` | `sem_filter.py`, `sem_topk.py`, `sem_join_retrieve.py`, `_common.py` |
-| `44a2618e56a` | `[feat] Integrate metrics + retry strategy` | `metrics.py`, `retry.py`, operator metrics integration |
+| Commit          | Message                                               | Key Changes                                                                  |
+| --------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `9f3a325fe4b` | `[build] Update .gitignore + isolation env script`  | `.gitignore`, `mac_enter_isolated_env.sh`                                |
+| `a91d84e1a5f` | `[doc] Add implementation plan`                     | `V0_1_IMPLEMENTATION_PLAN.md`, blueprint, sem_queries docs                 |
+| `2753a9d3257` | `[feat] Add initial LLM client + operator wrappers` | `llm_client.py`, `cp/__init__.py`, `operators/__init__.py`             |
+| `ad6177a8c5d` | `[feat] Add semantic operators`                     | `sem_filter.py`, `sem_topk.py`, `sem_join_retrieve.py`, `_common.py` |
+| `44a2618e56a` | `[feat] Integrate metrics + retry strategy`         | `metrics.py`, `retry.py`, operator metrics integration                   |
 
 ---
 
 ## 7. What's Excluded (→ V0.2+)
 
-| Feature | Reason | Target |
-|---------|--------|--------|
-| `sem_agg` | Requires keyed state + aggregation scope | V0.2 |
-| Continuous `sem_topk` | Requires incremental state + timer-driven updates | V0.2 |
-| Two-input `sem_join` | Requires two-input coordination + dual-side state | V0.3a |
-| Batching / fusion | Requires batching layer + prompt fusion | V0.3b |
-| Dynamic broadcast control | Requires broadcast state + control stream | V0.4 |
+| Feature                   | Reason                                            | Target |
+| ------------------------- | ------------------------------------------------- | ------ |
+| `sem_agg`               | Requires keyed state + aggregation scope          | V0.2   |
+| Continuous `sem_topk`   | Requires incremental state + timer-driven updates | V0.2   |
+| Two-input `sem_join`    | Requires two-input coordination + dual-side state | V0.3a  |
+| Batching / fusion         | Requires batching layer + prompt fusion           | V0.3b  |
+| Dynamic broadcast control | Requires broadcast state + control stream         | V0.4   |
