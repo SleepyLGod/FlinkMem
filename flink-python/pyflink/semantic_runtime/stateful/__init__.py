@@ -17,3 +17,24 @@
 
 """V0.2 stateful semantic operators — keyed process functions, state machines, and timers."""
 
+from pyflink.semantic_runtime.stateful.semantic_window import (  # noqa: F401
+    SemWindowFunction, SemWindowConfig,
+)
+from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (  # noqa: F401
+    SemGroupbyFunction, SemGroupbyConfig,
+)
+from pyflink.semantic_runtime.stateful.sem_agg_stateful import (  # noqa: F401
+    SemAggFunction, SemAggConfig,
+)
+from pyflink.semantic_runtime.stateful.cts_retrieve import (  # noqa: F401
+    CtsRetrieveFunction, CtsRetrieveConfig,
+    # V0.2+ public aliases
+    SemSearchFunction, SemSearchConfig,
+)
+from pyflink.semantic_runtime.stateful.sem_topk_continuous import (  # noqa: F401
+    SemTopKFunction, SemTopKConfig,
+)
+from pyflink.semantic_runtime.stateful.external_search_backend import (  # noqa: F401
+    ExternalSearchBackend, SearchResult,
+)
+

@@ -16,7 +16,10 @@
 # under the License.
 
 """
-cts_retrieve — continuous stateful retrieval over keyed state.
+sem_search (cts_retrieve) — continuous stateful retrieval over keyed state.
+
+Public name: ``sem_search``.  Internal name: ``cts_retrieve`` (kept for
+backward compatibility during transition).
 
 Input: keyed ``SemanticEvent`` dicts (query/request records).
 
@@ -39,9 +42,9 @@ Guardrails:
   - Strict retrieval timeout budget via async bridge.
   - Deterministic overflow / degrade tagging.
 
-Relationship to V0.1 ``sem_join_retrieve``:
-  - ``cts_retrieve`` is the stateful evolution (keyed cache, continuous).
-  - ``sem_join_retrieve`` remains valid for stateless / simple workloads.
+Relationship to V0.1 ``sem_lookup_join`` (formerly ``sem_join_retrieve``):
+  - ``sem_search`` is the stateful evolution (keyed cache, continuous).
+  - ``sem_lookup_join`` remains valid for stateless / simple workloads.
 """
 
 from __future__ import annotations
@@ -350,3 +353,11 @@ class CtsRetrieveFunction(KeyedProcessFunction):
     def _evict_cache(self, meta: Dict[str, Any]) -> int:
         """Timer-driven eviction of oldest cache entries beyond limit."""
         return self._enforce_cache_limit()
+
+
+# ── Public aliases (V0.2+) ─────────────────────────────────────────────────
+# The canonical public name is ``sem_search``.  Internal code may still
+# reference ``CtsRetrieveFunction`` / ``CtsRetrieveConfig`` during
+# the transition period.
+SemSearchConfig = CtsRetrieveConfig
+SemSearchFunction = CtsRetrieveFunction

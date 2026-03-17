@@ -17,3 +17,20 @@
 
 """Semantic operator wrappers for V0.1 async baseline."""
 
+from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction  # noqa: F401
+from pyflink.semantic_runtime.operators.sem_map import SemMapFunction  # noqa: F401
+from pyflink.semantic_runtime.operators.sem_join_retrieve import (  # noqa: F401
+    SemLookupJoinFunction,
+    SemLookupJoinConfig,
+    # deprecated aliases
+    SemJoinRetrieveFunction,
+    SemJoinRetrieveConfig,
+    CandidateRetriever,
+    MockCandidateRetriever,
+)
+from pyflink.semantic_runtime.operators.sem_topk import (  # noqa: F401
+    SemLocalTopKFunction,
+    # deprecated alias — V0.1 local variant
+    SemTopKFunction,
+)
+

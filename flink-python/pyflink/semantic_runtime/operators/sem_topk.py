@@ -16,13 +16,19 @@
 # under the License.
 
 """
-sem_topk — local (row-level) LLM-based reranking of a candidate list.
+sem_local_topk — local (row-level) LLM-based reranking of a candidate list.
 
 The input record is expected to be a JSON string carrying a ``candidates``
 list.  The LLM reranks these candidates and returns the top-k.
 
-This is the **local** V0.1 variant (no keyed state).  A continuous,
-incremental ``sem_topk`` using ``KeyedProcessFunction`` is deferred to V0.2.
+This is the **local** V0.1 variant (no keyed state).  The continuous,
+stateful ``sem_topk`` lives in ``stateful/sem_topk_continuous.py``.
+
+.. deprecated::
+    The class ``SemTopKFunction`` in this module is a deprecated alias for
+    ``SemLocalTopKFunction``.  Use ``SemLocalTopKFunction`` for the local
+    variant, and ``stateful.sem_topk_continuous.SemTopKFunction`` for the
+    canonical stream/stateful variant.
 """
 
 from __future__ import annotations
@@ -40,8 +46,8 @@ from pyflink.semantic_runtime.operators._common import attach_metrics, make_degr
 logger = logging.getLogger(__name__)
 
 
-class SemTopKFunction(AsyncFunction):
-    """Async local semantic top-k reranker.
+class SemLocalTopKFunction(AsyncFunction):
+    """Async local semantic top-k reranker (V0.1, row-level, no keyed state).
 
     Parameters
     ----------
@@ -74,8 +80,8 @@ class SemTopKFunction(AsyncFunction):
 
     def open(self, runtime_context: RuntimeContext) -> None:
         self._client = create_llm_client(self._llm_config)
-        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_topk")
-        logger.info("SemTopKFunction opened (backend=%s, k=%d)",
+        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_local_topk")
+        logger.info("SemLocalTopKFunction opened (backend=%s, k=%d)",
                      self._llm_config.backend, self._k)
 
     def close(self) -> None:
@@ -148,4 +154,11 @@ class SemTopKFunction(AsyncFunction):
         if self._op_metrics:
             self._op_metrics.record_timeout()
         return [make_degraded_json(value, "flink_timeout")]
+
+
+# ── Deprecated alias ────────────────────────────────────────────────────────
+# V0.2+: the canonical ``sem_topk`` name now belongs to the stateful/continuous
+# variant in ``stateful.sem_topk_continuous``.  The local variant should be
+# imported as ``SemLocalTopKFunction``.
+SemTopKFunction = SemLocalTopKFunction
 

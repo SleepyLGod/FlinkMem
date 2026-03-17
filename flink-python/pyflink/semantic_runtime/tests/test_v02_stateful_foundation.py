@@ -634,6 +634,21 @@ class TestSemTopKConfig:
         assert cfg.k == 10
         assert cfg.max_candidates == 100
         assert cfg.emission_policy == "delta"
+        assert cfg.scorer_backend == "external_score"
+        assert cfg.score_field == "score"
+
+    def test_scorer_backend_llm(self):
+        cfg = SemTopKConfig(scorer_backend="llm")
+        assert cfg.scorer_backend == "llm"
+
+    def test_scorer_backend_embedding(self):
+        cfg = SemTopKConfig(scorer_backend="embedding")
+        assert cfg.scorer_backend == "embedding"
+
+    def test_scorer_backend_invalid(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid scorer_backend"):
+            SemTopKConfig(scorer_backend="invalid")
 
 
 class TestSemTopKRecompute:
@@ -700,6 +715,217 @@ class TestSemTopKRecompute:
         evicted = func._enforce_candidate_limit()
         assert evicted == 2
         assert len(func._candidates.keys()) == 3
+
+
+class TestSemTopKScorerBackendRouting:
+    """Test scorer backend routing in _ingest_candidate."""
+
+    def _make_func(self, backend="external_score", k=3, max_cand=10):
+        cfg = SemTopKConfig(k=k, max_candidates=max_cand, scorer_backend=backend)
+        func = SemTopKFunction(cfg)
+        func._candidates = _FakeMapState()
+        func._snapshot = _FakeValueState()
+        func._meta = _FakeValueState()
+        func._metrics = None
+        return func
+
+    def test_external_score_upserts_directly(self):
+        func = self._make_func(backend="external_score")
+        meta = {"key": "k", "last_query": "q1"}
+        item = {"candidate_id": "c1", "score": 0.9, "text": "hello"}
+        results = list(func._ingest_candidate(item, meta, 1000))
+        # No side-output for external_score
+        assert len(results) == 0
+        assert func._candidates.get("c1") is not None
+        assert func._candidates.get("c1")["score"] == 0.9
+
+    def test_llm_backend_emits_side_output_for_unscored(self):
+        func = self._make_func(backend="llm")
+        meta = {"key": "k", "last_query": "q1"}
+        item = {"candidate_id": "c1", "text": "hello"}
+        results = list(func._ingest_candidate(item, meta, 1000))
+        # Should emit side-output work item
+        assert len(results) == 1
+        tag, work_dict = results[0]
+        assert tag.tag_id == "async_work_items"
+        assert work_dict["task_type"] == "score_llm"
+        assert work_dict["payload"]["candidate"]["candidate_id"] == "c1"
+
+    def test_llm_backend_upserts_when_scored(self):
+        func = self._make_func(backend="llm")
+        meta = {"key": "k", "last_query": "q1"}
+        item = {"candidate_id": "c1", "score": 0.8, "text": "hello"}
+        results = list(func._ingest_candidate(item, meta, 1000))
+        assert len(results) == 0  # No side-output needed
+        assert func._candidates.get("c1")["score"] == 0.8
+
+    def test_embedding_backend_emits_side_output(self):
+        func = self._make_func(backend="embedding")
+        meta = {"key": "k", "last_query": "q1"}
+        item = {"candidate_id": "c1", "text": "hello"}
+        results = list(func._ingest_candidate(item, meta, 1000))
+        assert len(results) == 1
+        tag, work_dict = results[0]
+        assert work_dict["task_type"] == "score_embedding"
+
+
+class TestSemTopKScorerMergeBack:
+    """Test _handle_scorer_result merge-back."""
+
+    def _make_func(self, backend="llm", k=3):
+        cfg = SemTopKConfig(k=k, max_candidates=10, scorer_backend=backend,
+                            emission_policy="snapshot")
+        func = SemTopKFunction(cfg)
+        func._candidates = _FakeMapState()
+        func._snapshot = _FakeValueState()
+        func._meta = _FakeValueState({"key": "k", "update_count": 1})
+        func._metrics = None
+        return func
+
+    def test_successful_scorer_result_upserts_candidate(self):
+        func = self._make_func()
+        result = {
+            "task_type": "score_llm",
+            "success": True,
+            "result": {
+                "candidate": {"candidate_id": "c1", "score": 0.95, "text": "hello"},
+            },
+        }
+        results = list(func._handle_scorer_result(result, 1000))
+        assert func._candidates.get("c1") is not None
+        assert func._candidates.get("c1")["score"] == 0.95
+        # Should recompute and emit
+        assert len(results) > 0
+
+    def test_failed_scorer_result_is_skipped(self):
+        func = self._make_func()
+        result = {
+            "task_type": "score_llm",
+            "success": False,
+            "error": "timeout",
+        }
+        results = list(func._handle_scorer_result(result, 1000))
+        assert len(results) == 0
+        assert len(func._candidates.keys()) == 0
+
+
+# ============================================================================
+# SemanticSpec & RuntimeConfig Tests
+# ============================================================================
+
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.runtime_config import RuntimeConfig, DefaultsConfig
+
+
+class TestSemanticSpec:
+    def test_defaults(self):
+        spec = SemanticSpec()
+        assert spec.backend == "llm"
+        assert spec.output_mode == "json"
+        assert spec.instruction == ""
+        assert spec.schema is None
+        assert spec.threshold is None
+
+    def test_for_sem_map(self):
+        spec = SemanticSpec.for_sem_map(
+            "Extract sentiment", output_schema={"sentiment": str}
+        )
+        assert spec.instruction == "Extract sentiment"
+        assert spec.backend == "llm"
+        assert spec.output_mode == "json"
+        assert spec.schema == {"sentiment": str}
+
+    def test_for_sem_map_text_mode(self):
+        spec = SemanticSpec.for_sem_map("Summarize", return_mode="text")
+        assert spec.output_mode == "text"
+        assert spec.schema is None
+
+    def test_for_sem_topk(self):
+        spec = SemanticSpec.for_sem_topk(
+            "Rerank by relevance", scorer_backend="llm", threshold=0.5
+        )
+        assert spec.instruction == "Rerank by relevance"
+        assert spec.backend == "llm"
+        assert spec.output_mode == "score"
+        assert spec.threshold == 0.5
+
+    def test_invalid_backend(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid backend"):
+            SemanticSpec(backend="nonexistent")
+
+    def test_invalid_output_mode(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid output_mode"):
+            SemanticSpec(output_mode="unknown")
+
+    def test_roundtrip(self):
+        spec = SemanticSpec(instruction="test", backend="embedding", output_mode="score")
+        d = spec.to_dict()
+        spec2 = SemanticSpec.from_dict(d)
+        assert spec2.instruction == "test"
+        assert spec2.backend == "embedding"
+        assert spec2.output_mode == "score"
+
+
+class TestRuntimeConfig:
+    def test_defaults(self):
+        cfg = RuntimeConfig()
+        assert cfg.defaults.ttl_seconds == 3600
+        assert cfg.llm.backend == "mock"
+        assert cfg.operators == {}
+
+    def test_from_dict(self):
+        cfg = RuntimeConfig.from_dict({
+            "defaults": {"ttl_seconds": 7200},
+            "llm": {"backend": "openai", "model": "gpt-4"},
+            "operators": {
+                "sem_topk": {"k": 5, "scorer_backend": "llm"},
+            },
+        })
+        assert cfg.defaults.ttl_seconds == 7200
+        assert cfg.llm.backend == "openai"
+        assert cfg.llm.model == "gpt-4"
+        assert cfg.operators["sem_topk"]["k"] == 5
+
+    def test_get_operator_raw_merges_defaults(self):
+        cfg = RuntimeConfig.from_dict({
+            "defaults": {"ttl_seconds": 600},
+            "operators": {"sem_topk": {"k": 3}},
+        })
+        raw = cfg.get_operator_raw("sem_topk")
+        assert raw["ttl_seconds"] == 600
+        assert raw["k"] == 3
+
+    def test_get_operator_raw_missing(self):
+        cfg = RuntimeConfig()
+        raw = cfg.get_operator_raw("nonexistent")
+        assert raw["ttl_seconds"] == 3600  # from defaults
+
+
+# ============================================================================
+# External Search Backend Tests
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.external_search_backend import (
+    ExternalSearchBackend, SearchResult,
+)
+
+
+class TestSearchResult:
+    def test_to_dict(self):
+        r = SearchResult(candidate_id="c1", text="hello", score=0.9)
+        d = r.to_dict()
+        assert d["candidate_id"] == "c1"
+        assert d["text"] == "hello"
+        assert d["score"] == 0.9
+
+
+class TestExternalSearchBackendInterface:
+    def test_is_abstract(self):
+        import pytest
+        with pytest.raises(TypeError):
+            ExternalSearchBackend()
 
 
 # ============================================================================

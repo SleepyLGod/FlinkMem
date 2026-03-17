@@ -18,8 +18,16 @@
 """
 sem_map — row-wise semantic extraction / classification / transformation.
 
-Maps each input record to a structured output by calling an LLM with a
-prompt template and parsing the response against an expected JSON schema.
+Supports two modes under one operator:
+
+1. **Structured mode** (``output_schema`` provided):
+   Maps each input record to a structured JSON output by calling an LLM,
+   then validates the response against the expected schema.
+
+2. **Free-form mode** (``output_schema=None``, ``return_mode="text"``):
+   Maps each input record to a free-form text output (rewriting,
+   summarisation, normalisation, answer synthesis, etc.).  The raw LLM
+   text is returned in a stable envelope without JSON parsing/validation.
 
 Design notes
 ------------
@@ -51,30 +59,38 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class SemMapFunction(AsyncFunction):
-    """Async semantic map operator.
+    """Async semantic map operator (structured + free-form dual-mode).
 
     Parameters
     ----------
     prompt_template : str
         A Python format-string with a ``{input}`` placeholder.
         Example: ``"Extract the sentiment from: {input}"``
-    output_schema : dict[str, type]
+    output_schema : dict[str, type] | None
         Expected keys and their Python types in the parsed LLM response.
-        Example: ``{"sentiment": str, "confidence": float}``
+        When ``None``, free-form mode is used (no JSON parsing/validation).
     llm_config : LLMClientConfig
         Picklable LLM backend configuration.
+    return_mode : str
+        ``"json"`` (default) for structured mode, ``"text"`` for free-form.
+        When ``output_schema`` is ``None``, ``return_mode`` is implicitly
+        ``"text"`` regardless of the provided value.
     """
 
     def __init__(
         self,
         prompt_template: str,
-        output_schema: Dict[str, type],
+        output_schema: Optional[Dict[str, type]],
         llm_config: LLMClientConfig,
+        *,
+        return_mode: str = "json",
     ) -> None:
         # Everything here must be picklable.
         self._prompt_template = prompt_template
         self._output_schema = output_schema
         self._llm_config = llm_config
+        # Resolve effective return mode
+        self._return_mode = "text" if output_schema is None else return_mode
         # Initialised in open().
         self._client: Optional[LLMClient] = None
         self._op_metrics: Optional[OperatorMetrics] = None
@@ -111,6 +127,17 @@ class SemMapFunction(AsyncFunction):
             om.record_call(metrics.latency_ms, metrics.input_tokens,
                            metrics.output_tokens, metrics.attempts)
 
+        # ── Free-form text mode ────────────────────────────────────────
+        if self._return_mode == "text":
+            envelope = {
+                "input": value,
+                "text": text.strip() if text else "",
+                "_mode": "text",
+                "_latency_ms": metrics.latency_ms if metrics else None,
+            }
+            return [json.dumps(envelope)]
+
+        # ── Structured JSON mode ───────────────────────────────────────
         # Parse JSON response
         try:
             parsed = json.loads(text)

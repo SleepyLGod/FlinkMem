@@ -22,6 +22,19 @@ Maintains a per-key candidate buffer and a current top-k frontier.
 Recomputes top-k on new evidence or timer trigger.  Emits only when
 the frontier changes (delta policy) or on every update (snapshot policy).
 
+Scorer backends
+~~~~~~~~~~~~~~~
+``scorer_backend`` in :class:`SemTopKConfig` selects how candidate scores
+are obtained:
+
+- ``"external_score"`` (default): candidates already carry a numeric score
+  field.  No async work is needed — the operator reads the score directly.
+- ``"llm"``: the operator emits unscored candidates as side-output work
+  items via the async bridge.  An LLM-based async worker scores them and
+  the merge function feeds scored candidates back.
+- ``"embedding"``: same async bridge path as ``llm``, but the async worker
+  uses an embedding-based similarity scorer instead.
+
 State model:
   - ``MapState[candidate_id -> candidate_record]`` for the candidate pool.
   - ``ValueState[snapshot]`` for the current top-k frontier.
@@ -57,6 +70,10 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.stateful.async_bridge import (
+    ASYNC_WORK_TAG,
+    AsyncWorkItem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +82,22 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
+VALID_SCORER_BACKENDS = {"external_score", "llm", "embedding"}
+
+
 @dataclass
 class SemTopKConfig:
-    """Configuration for the continuous top-k operator."""
+    """Configuration for the continuous top-k operator.
+
+    Parameters
+    ----------
+    scorer_backend : str
+        ``"external_score"`` (default) — use the score field already present
+        on each candidate record (no async I/O).
+        ``"llm"`` — emit unscored candidates as side-output for LLM scoring
+        via the async bridge.
+        ``"embedding"`` — same async bridge path but for embedding scoring.
+    """
     k: int = 10
     max_candidates: int = 100
     recompute_interval_ms: int = 10_000  # timer-driven recompute
@@ -75,6 +105,14 @@ class SemTopKConfig:
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     emission_policy: str = "delta"       # "delta" | "snapshot"
     score_field: str = "score"           # field name in candidate record
+    scorer_backend: str = "external_score"  # "external_score" | "llm" | "embedding"
+
+    def __post_init__(self):
+        if self.scorer_backend not in VALID_SCORER_BACKENDS:
+            raise ValueError(
+                f"Invalid scorer_backend={self.scorer_backend!r}. "
+                f"Must be one of {VALID_SCORER_BACKENDS}."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +168,11 @@ class SemTopKFunction(KeyedProcessFunction):
         if not isinstance(value, dict):
             return
 
+        # ── Handle async scorer merge-back ────────────────────────────
+        if value.get("task_type") in ("score_llm", "score_embedding"):
+            yield from self._handle_scorer_result(value, now_ms)
+            return
+
         meta = self._meta.value() or {
             "key": str(ctx.get_current_key()),
             "update_count": 0,
@@ -163,16 +206,81 @@ class SemTopKFunction(KeyedProcessFunction):
             meta["last_degraded"] = bool(value.get("degraded", False))
             meta["last_error"] = str(value.get("error", ""))
             for item in items:
-                self._upsert_candidate(item, now_ms)
+                yield from self._ingest_candidate(item, meta, now_ms)
         else:
             # Single candidate upsert
-            self._upsert_candidate(value, now_ms)
+            yield from self._ingest_candidate(value, meta, now_ms)
 
         # Enforce candidate buffer limit
         self._enforce_candidate_limit()
 
         # Recompute top-k and possibly emit
         yield from self._recompute_and_emit(meta, now_ms)
+
+    # -- scorer backend routing -----------------------------------------------
+
+    def _ingest_candidate(
+        self, item: Dict[str, Any], meta: Dict[str, Any], now_ms: int,
+    ):
+        """Route a single candidate through the configured scorer backend.
+
+        - ``external_score``: upsert directly (score already present).
+        - ``llm`` / ``embedding``: if the candidate lacks a score, emit a
+          side-output work item for async scoring; otherwise upsert directly.
+        """
+        backend = self._config.scorer_backend
+        score_field = self._config.score_field
+
+        if backend == "external_score":
+            self._upsert_candidate(item, now_ms)
+            return
+
+        # llm / embedding: check if score is already present
+        has_score = (
+            score_field in item
+            and item[score_field] is not None
+            and item[score_field] != 0.0
+        )
+        if has_score:
+            self._upsert_candidate(item, now_ms)
+            return
+
+        # No score → emit async scoring request via side output
+        task_type = f"score_{backend}"  # "score_llm" or "score_embedding"
+        work = AsyncWorkItem(
+            key=meta.get("key", ""),
+            task_type=task_type,
+            payload={
+                "candidate": item,
+                "query": meta.get("last_query", ""),
+                "scorer_backend": backend,
+            },
+        )
+        if self._metrics:
+            self._metrics.record_async_emit()
+        # Yield side-output; the caller wires ASYNC_WORK_TAG in the topology
+        yield ASYNC_WORK_TAG, work.to_dict()
+
+    def _handle_scorer_result(
+        self, value: Dict[str, Any], now_ms: int,
+    ):
+        """Process a merge-back result from an async scorer (llm/embedding)."""
+        meta = self._meta.value()
+        if meta is None:
+            return
+
+        if not value.get("success", False):
+            logger.warning(
+                "sem_topk async scorer failed: %s", value.get("error", "unknown")
+            )
+            return
+
+        result = value.get("result", {})
+        candidate = result.get("candidate", {})
+        if candidate and candidate.get("candidate_id"):
+            self._upsert_candidate(candidate, now_ms)
+            self._enforce_candidate_limit()
+            yield from self._recompute_and_emit(meta, now_ms)
 
     def _upsert_candidate(self, value: Dict[str, Any], now_ms: int) -> None:
         """Insert or update a single candidate in the MapState."""

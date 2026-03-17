@@ -16,7 +16,7 @@
 # under the License.
 
 """
-sem_join_retrieve — retrieve-backed semantic join (V0.1 local variant).
+sem_lookup_join — retrieve-backed semantic lookup join (V0.1 local variant).
 
 For each input record the operator:
 1. Calls an external retriever (vector store / DB) to fetch candidate records.
@@ -28,6 +28,10 @@ Hard bounds enforced at this layer:
 - Overflow policy: ``truncate`` with explicit metric tag.
 
 True two-input ``sem_join`` (dual-side state) is deferred to V0.3a.
+
+.. deprecated::
+    ``SemJoinRetrieveFunction`` and ``SemJoinRetrieveConfig`` are deprecated
+    aliases.  Use ``SemLookupJoinFunction`` and ``SemLookupJoinConfig``.
 """
 
 from __future__ import annotations
@@ -79,8 +83,8 @@ class MockCandidateRetriever(CandidateRetriever):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SemJoinRetrieveConfig:
-    """Picklable configuration for SemJoinRetrieveFunction."""
+class SemLookupJoinConfig:
+    """Picklable configuration for SemLookupJoinFunction."""
     max_candidates_per_record: int = 20
     retrieve_timeout_ms: float = 5000.0
     # mock-specific
@@ -89,11 +93,11 @@ class SemJoinRetrieveConfig:
 
 
 # ---------------------------------------------------------------------------
-# SemJoinRetrieveFunction
+# SemLookupJoinFunction
 # ---------------------------------------------------------------------------
 
-class SemJoinRetrieveFunction(AsyncFunction):
-    """Async retrieve-backed semantic join operator.
+class SemLookupJoinFunction(AsyncFunction):
+    """Async retrieve-backed semantic lookup join operator.
 
     Parameters
     ----------
@@ -101,7 +105,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
         Format-string with ``{input}`` and ``{candidates}`` placeholders.
     llm_config : LLMClientConfig
         Picklable LLM backend configuration.
-    join_config : SemJoinRetrieveConfig
+    join_config : SemLookupJoinConfig
         Retrieval bounds and retriever settings.
     """
 
@@ -109,7 +113,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
         self,
         prompt_template: str,
         llm_config: LLMClientConfig,
-        join_config: SemJoinRetrieveConfig,
+        join_config: SemLookupJoinConfig,
     ) -> None:
         self._prompt_template = prompt_template
         self._llm_config = llm_config
@@ -120,7 +124,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
 
     def open(self, runtime_context: RuntimeContext) -> None:
         self._client = create_llm_client(self._llm_config)
-        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_join_retrieve")
+        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_lookup_join")
         cfg = self._join_config
         # V0.1: only mock retriever; real implementations plugged in later.
         if cfg.mock_candidates is not None:
@@ -128,7 +132,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
                 cfg.mock_candidates, cfg.mock_retrieve_delay_s)
         else:
             self._retriever = MockCandidateRetriever([], 0.0)
-        logger.info("SemJoinRetrieveFunction opened (max_cand=%d, timeout=%dms)",
+        logger.info("SemLookupJoinFunction opened (max_cand=%d, timeout=%dms)",
                      cfg.max_candidates_per_record, cfg.retrieve_timeout_ms)
 
     def close(self) -> None:
@@ -154,12 +158,12 @@ class SemJoinRetrieveFunction(AsyncFunction):
                 timeout=cfg.retrieve_timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError:
-            logger.warning("sem_join_retrieve: retrieval timed out for %s", value)
+            logger.warning("sem_lookup_join: retrieval timed out for %s", value)
             if om:
                 om.record_timeout()
             return [make_degraded_json(value, "retrieve_timeout")]
         except Exception as e:
-            logger.warning("sem_join_retrieve: retrieval error: %s", e)
+            logger.warning("sem_lookup_join: retrieval error: %s", e)
             if om:
                 om.record_error()
             return [make_degraded_json(value, f"retrieve_error: {e}")]
@@ -168,7 +172,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
         if len(candidates) > cfg.max_candidates_per_record:
             candidates = candidates[: cfg.max_candidates_per_record]
             truncated = True
-            logger.info("sem_join_retrieve: truncated to %d candidates",
+            logger.info("sem_lookup_join: truncated to %d candidates",
                         cfg.max_candidates_per_record)
 
         # 3. LLM semantic matching
@@ -180,7 +184,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
         try:
             text, metrics = await self._client.call(prompt)
         except Exception as e:
-            logger.warning("LLM call failed for sem_join_retrieve: %s", e)
+            logger.warning("LLM call failed for sem_lookup_join: %s", e)
             if om:
                 om.record_error()
             return [make_degraded_json(value, f"llm_call_error: {e}")]
@@ -193,7 +197,7 @@ class SemJoinRetrieveFunction(AsyncFunction):
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("sem_join_retrieve JSON parse failed: %s", e)
+            logger.warning("sem_lookup_join JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
             return [make_degraded_json(value, f"json_parse_error: {e}")]
@@ -213,3 +217,10 @@ class SemJoinRetrieveFunction(AsyncFunction):
             self._op_metrics.record_timeout()
         return [make_degraded_json(value, "flink_timeout")]
 
+
+
+# ── Deprecated aliases ──────────────────────────────────────────────────────
+# V0.2+: ``sem_join_retrieve`` is renamed to ``sem_lookup_join``.  The old
+# names remain importable during the transition period.
+SemJoinRetrieveConfig = SemLookupJoinConfig
+SemJoinRetrieveFunction = SemLookupJoinFunction
