@@ -803,6 +803,205 @@ class _FakeValueState:
 
 
 # ============================================================================
+# Continuous RAG Workflow Tests
+# ============================================================================
+
+from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
+    ContinuousRAGConfig,
+    _StreamRouter,
+    _AnswerSynthesiser,
+    validate_rag_config,
+    MEMORY_EVENT_TAG,
+    QUERY_REQUEST_TAG,
+)
+
+
+class _FakeContext:
+    """Minimal mock for KeyedProcessFunction.Context."""
+
+    def __init__(self, key="test_key"):
+        self._key = key
+
+    def get_current_key(self):
+        return self._key
+
+    def timer_service(self):
+        return None
+
+    def output(self, tag, value):
+        pass
+
+
+class TestContinuousRAGConfig:
+    def test_defaults(self):
+        cfg = ContinuousRAGConfig()
+        assert cfg.workflow_version == "v0.2.0"
+        assert cfg.topk_config is None
+        assert cfg.async_timeout_ms == 30_000
+        assert isinstance(cfg.window_config, SemWindowConfig)
+        assert isinstance(cfg.groupby_config, SemGroupbyConfig)
+        assert isinstance(cfg.agg_config, SemAggConfig)
+        assert isinstance(cfg.retrieve_config, CtsRetrieveConfig)
+
+    def test_custom_configs(self):
+        cfg = ContinuousRAGConfig(
+            window_config=SemWindowConfig(max_window_events=10),
+            topk_config=SemTopKConfig(k=5),
+            workflow_version="v0.2.1",
+        )
+        assert cfg.window_config.max_window_events == 10
+        assert cfg.topk_config.k == 5
+        assert cfg.workflow_version == "v0.2.1"
+
+
+class TestStreamRouter:
+    """Test the stream router that splits events by stream_type."""
+
+    def _route(self, event_dict):
+        router = _StreamRouter()
+        results = list(router.process_element(event_dict, _FakeContext()))
+        return results
+
+    def test_memory_event_routed(self):
+        results = self._route({"key": "k1", "stream_type": "memory_event", "payload": "hello"})
+        assert len(results) == 1
+        tag, value = results[0]
+        assert tag == MEMORY_EVENT_TAG
+        assert value["payload"] == "hello"
+
+    def test_query_request_routed(self):
+        results = self._route({"key": "k1", "stream_type": "query_request", "query": "what?"})
+        assert len(results) == 1
+        tag, value = results[0]
+        assert tag == QUERY_REQUEST_TAG
+        assert value["query"] == "what?"
+
+    def test_unknown_type_defaults_to_memory(self):
+        results = self._route({"key": "k1", "stream_type": "unknown", "payload": "x"})
+        assert len(results) == 1
+        tag, _ = results[0]
+        assert tag == MEMORY_EVENT_TAG
+
+    def test_missing_type_defaults_to_memory(self):
+        results = self._route({"key": "k1", "payload": "x"})
+        assert len(results) == 1
+        tag, _ = results[0]
+        assert tag == MEMORY_EVENT_TAG
+
+    def test_non_dict_dropped(self):
+        router = _StreamRouter()
+        results = list(router.process_element("not_a_dict", _FakeContext()))
+        assert len(results) == 0
+
+
+class TestAnswerSynthesiser:
+    """Test the answer synthesiser that builds prompts with audit fields."""
+
+    def _synthesise(self, value_dict, template=None):
+        template = template or "Context:\n{context}\n\nQuery:\n{query}\n\nAnswer:"
+        syn = _AnswerSynthesiser(
+            prompt_template=template,
+            workflow_version="v0.2.0",
+            config_version="test_v1",
+        )
+        results = list(syn.process_element(value_dict, _FakeContext("k1")))
+        return results
+
+    def test_basic_synthesis(self):
+        results = self._synthesise({
+            "key": "k1",
+            "query": "What is Flink?",
+            "retrieved_context": [
+                {"candidate_id": "c1", "payload": "Flink is a stream processor"},
+                {"candidate_id": "c2", "payload": "Flink supports stateful ops"},
+            ],
+        })
+        assert len(results) == 1
+        out = results[0]
+        assert out["stream_type"] == "answer_request"
+        assert "Flink is a stream processor" in out["prompt"]
+        assert "What is Flink?" in out["prompt"]
+        assert out["retrieved_ids"] == ["c1", "c2"]
+        assert out["workflow_version"] == "v0.2.0"
+        assert out["config_version"] == "test_v1"
+
+    def test_empty_context(self):
+        results = self._synthesise({
+            "key": "k1",
+            "query": "test?",
+            "retrieved_context": [],
+        })
+        assert len(results) == 1
+        assert results[0]["retrieved_ids"] == []
+
+    def test_topk_format(self):
+        """Should also work with topk output format."""
+        results = self._synthesise({
+            "key": "k1",
+            "payload": "What about X?",
+            "topk": [
+                {"candidate_id": "t1", "content": "X is interesting"},
+            ],
+            "version": 42,
+            "total_candidates": 100,
+            "changed": True,
+        })
+        assert len(results) == 1
+        out = results[0]
+        assert out["retrieved_ids"] == ["t1"]
+        assert out["memory_version"] == 42
+        assert out["total_candidates"] == 100
+        assert out["retrieval_changed"] is True
+
+    def test_non_dict_dropped(self):
+        syn = _AnswerSynthesiser(prompt_template="{context}\n{query}")
+        results = list(syn.process_element("not_a_dict", _FakeContext()))
+        assert len(results) == 0
+
+
+class TestValidateRAGConfig:
+    """Test workflow config validation."""
+
+    def test_valid_defaults(self):
+        cfg = ContinuousRAGConfig()
+        warnings = validate_rag_config(cfg)
+        assert len(warnings) == 0
+
+    def test_window_exceeds_agg_buffer(self):
+        cfg = ContinuousRAGConfig(
+            window_config=SemWindowConfig(max_window_events=200),
+            agg_config=SemAggConfig(max_buffer_events=50),
+        )
+        warnings = validate_rag_config(cfg)
+        assert any("window max_events" in w for w in warnings)
+
+    def test_retrieve_exceeds_topk(self):
+        cfg = ContinuousRAGConfig(
+            retrieve_config=CtsRetrieveConfig(max_candidates_per_request=50),
+            topk_config=SemTopKConfig(max_candidates=10),
+        )
+        warnings = validate_rag_config(cfg)
+        assert any("retrieve max_candidates_per_request" in w for w in warnings)
+
+    def test_ttl_spread_warning(self):
+        cfg = ContinuousRAGConfig(
+            window_config=SemWindowConfig(ttl_seconds=100),
+            agg_config=SemAggConfig(ttl_seconds=100),
+            groupby_config=SemGroupbyConfig(ttl_seconds=100),
+            retrieve_config=CtsRetrieveConfig(ttl_seconds=10000),
+        )
+        warnings = validate_rag_config(cfg)
+        assert any("TTL spread" in w for w in warnings)
+
+    def test_summarize_no_flush_warning(self):
+        cfg = ContinuousRAGConfig(
+            agg_config=SemAggConfig(mode="summarize", flush_interval_ms=0),
+        )
+        warnings = validate_rag_config(cfg)
+        assert any("flush_interval_ms" in w for w in warnings)
+
+
+# ============================================================================
 # Run
 # ============================================================================
 
