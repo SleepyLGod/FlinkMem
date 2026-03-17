@@ -68,6 +68,9 @@ from pyflink.datastream.functions import (
 
 from pyflink.semantic_runtime.stateful.event_model import (
     SemanticEvent,
+    group_assignment_to_semantic_event,
+    retrieve_to_answer_context,
+    topk_to_answer_context,
     simple_key_selector,
 )
 from pyflink.semantic_runtime.stateful.semantic_window import (
@@ -247,45 +250,239 @@ class _AnswerSynthesiser(KeyedProcessFunction):
             "query": query,
             "context_str": context_str,
             "retrieved_ids": retrieved_ids,
-            "memory_version": value.get("version", 0),
+            "memory_version": value.get("memory_version", value.get("version", 0)),
             "workflow_version": self._workflow_version,
             "config_version": self._config_version,
             "timestamp_ms": now_ms,
             # Carry forward upstream audit fields
-            "total_candidates": value.get("total_candidates", 0),
-            "retrieval_changed": value.get("changed", False),
+            "total_candidates": value.get(
+                "total_candidates",
+                value.get("candidate_count", 0),
+            ),
+            "retrieval_changed": value.get(
+                "retrieval_changed",
+                value.get("changed", False),
+            ),
+            "source": value.get("source", ""),
+            "degraded": value.get("degraded", False),
+            "error": value.get("error", ""),
         }
 
 
 # ============================================================================
-# Async merge functions — lightweight passthrough + async result forwarding
+# Async merge functions — stage-aware merge-back behavior
 # ============================================================================
 
-class _AsyncMergeFunction(KeyedProcessFunction):
-    """Generic merge function for async bridge.
-
-    Receives the union of an operator's main output and async results.
-    Main output events are passed through.  Async results (identified by
-    ``task_type``) are forwarded with the task_type preserved so the
-    downstream operator can detect and handle them in its process_element.
-    """
-
-    def __init__(self, expected_task_types: Optional[List[str]] = None):
-        self._expected_task_types = set(expected_task_types or [])
+class _ClassifyAsyncMergeFunction(KeyedProcessFunction):
+    """Merge classify async results into normalized group assignment envelopes."""
 
     def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
         if not isinstance(value, dict):
+            return
+        if value.get("task_type") != "classify":
             yield value
             return
 
-        task_type = value.get("task_type", "")
+        if not value.get("success", False):
+            yield {
+                "key": value.get("key", str(ctx.get_current_key())),
+                "group_id": "__unclassified__",
+                "confidence": 0.0,
+                "source": "async_classify_failed",
+                "event_seq_id": 0,
+                "payload": "",
+                "_degraded": True,
+                "_error": value.get("error", "classify_async_failed"),
+                "metadata": {"async_task_type": "classify"},
+            }
+            return
 
-        if task_type and task_type in self._expected_task_types:
-            # Async result — forward with task_type intact for downstream merge-back
+        result = value.get("result", {})
+        yield {
+            "key": value.get("key", str(ctx.get_current_key())),
+            "group_id": result.get("group_id", "__unclassified__"),
+            "confidence": float(result.get("confidence", 0.0)),
+            "source": "async_classify",
+            "event_seq_id": int(result.get("event_seq_id", 0)),
+            "payload": result.get("payload", ""),
+            "request_id": value.get("request_id", ""),
+            "metadata": {"async_task_type": "classify", "async_success": True},
+        }
+
+
+class _SummarizeAsyncMergeFunction(KeyedProcessFunction):
+    """Merge summarize async results into sem_agg-like envelopes."""
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        if not isinstance(value, dict):
+            return
+        if value.get("task_type") != "summarize":
             yield value
-        else:
-            # Regular main output — pass through
+            return
+
+        now_ms = int(time.time() * 1000)
+        if not value.get("success", False):
+            yield {
+                "key": value.get("key", str(ctx.get_current_key())),
+                "aggregate": None,
+                "version": 0,
+                "mode": "summarize_async_failed",
+                "event_count": 0,
+                "timestamp_ms": now_ms,
+                "_degraded": True,
+                "_error": value.get("error", "summarize_async_failed"),
+            }
+            return
+
+        result = value.get("result", {})
+        summary = result.get("summary", "")
+        version = int(result.get("version", 0))
+        yield {
+            "key": value.get("key", str(ctx.get_current_key())),
+            "aggregate": {
+                "summary": summary,
+                "version": version,
+                "updated_ms": now_ms,
+                "source": "async_summary",
+            },
+            "version": version,
+            "mode": "summarize_async",
+            "event_count": int(result.get("event_count", 0)),
+            "timestamp_ms": now_ms,
+        }
+
+
+class _RetrieveAsyncMergeFunction(KeyedProcessFunction):
+    """Merge retrieve async results into normalized retrieval envelopes."""
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        if not isinstance(value, dict):
+            return
+        if value.get("task_type") != "retrieve":
             yield value
+            return
+
+        now_ms = int(time.time() * 1000)
+        payload = value.get("payload", {})
+        if not value.get("success", False):
+            yield {
+                "key": value.get("key", str(ctx.get_current_key())),
+                "query": payload.get("query", ""),
+                "query_seq_id": int(payload.get("event_seq_id", 0)),
+                "candidates": [],
+                "candidate_count": 0,
+                "source": "async_retrieve_failed",
+                "degraded": True,
+                "error": value.get("error", "retrieve_async_failed"),
+                "timestamp_ms": now_ms,
+            }
+            return
+
+        result = value.get("result", {})
+        candidates = result.get("candidates", [])
+        yield {
+            "key": value.get("key", str(ctx.get_current_key())),
+            "query": result.get("query", payload.get("query", "")),
+            "query_seq_id": int(result.get("event_seq_id", payload.get("event_seq_id", 0))),
+            "candidates": candidates,
+            "candidate_count": len(candidates),
+            "source": "async_retrieve",
+            "degraded": False,
+            "timestamp_ms": now_ms,
+        }
+
+
+class _GroupbyToAggEnvelope(KeyedProcessFunction):
+    """Normalize sem_groupby outputs into SemanticEvent envelopes for sem_agg."""
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        if not isinstance(value, dict):
+            return
+        if {"key", "payload", "seq_id"}.issubset(value.keys()):
+            yield value
+            return
+        yield group_assignment_to_semantic_event(value)
+
+
+class _RetrievalToAnswerEnvelope(KeyedProcessFunction):
+    """Normalize retrieval/top-k outputs into answer-input envelopes."""
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        if not isinstance(value, dict):
+            return
+        if "retrieved_context" in value:
+            yield value
+            return
+
+        if "topk" in value or "top_items" in value:
+            out = topk_to_answer_context(value, query_payload=value.get("query", ""))
+            out["memory_version"] = value.get("version", 0)
+            out["degraded"] = value.get("degraded", False)
+            out["error"] = value.get("error", "")
+            yield out
+            return
+
+        out = retrieve_to_answer_context(value)
+        out["memory_version"] = value.get("version", 0)
+        out["degraded"] = value.get("degraded", False)
+        out["error"] = value.get("error", "")
+        yield out
+
+
+class _MissingAsyncFallbackMapper:
+    """Convert dropped async work items into explicit degraded records."""
+
+    def __init__(self, stage_name: str):
+        self._stage_name = stage_name
+
+    def __call__(self, value):
+        if not isinstance(value, dict):
+            return {
+                "stage": self._stage_name,
+                "degraded": True,
+                "error": f"async_{self._stage_name}_missing_worker",
+            }
+
+        if self._stage_name == "classify":
+            payload = value.get("payload", {})
+            event = payload.get("event", {})
+            return {
+                "key": value.get("key", ""),
+                "group_id": payload.get("tentative_group", "__unclassified__"),
+                "confidence": 0.0,
+                "source": "async_classify_missing_worker",
+                "event_seq_id": event.get("seq_id", 0),
+                "payload": event.get("payload", ""),
+                "_degraded": True,
+                "_error": "async_classify_missing_worker",
+                "metadata": {"async_task_type": "classify"},
+            }
+
+        if self._stage_name == "summarize":
+            payload = value.get("payload", {})
+            return {
+                "key": value.get("key", ""),
+                "aggregate": None,
+                "version": int(payload.get("current_version", 0)),
+                "mode": "summarize_missing_worker",
+                "event_count": int(payload.get("event_count", 0)),
+                "timestamp_ms": int(time.time() * 1000),
+                "_degraded": True,
+                "_error": "async_summarize_missing_worker",
+            }
+
+        payload = value.get("payload", {})
+        return {
+            "key": value.get("key", ""),
+            "query": payload.get("query", ""),
+            "query_seq_id": int(payload.get("event_seq_id", 0)),
+            "candidates": [],
+            "candidate_count": 0,
+            "source": "async_retrieve_missing_worker",
+            "degraded": True,
+            "error": "async_retrieve_missing_worker",
+            "timestamp_ms": int(time.time() * 1000),
+        }
 
 
 # ============================================================================
@@ -295,28 +492,32 @@ class _AsyncMergeFunction(KeyedProcessFunction):
 def _wire_async_bridge_if_configured(
     operator_ds: DataStream,
     async_fn,
-    merge_task_types: List[str],
+    merge_fn: KeyedProcessFunction,
+    stage_name: str,
     config: ContinuousRAGConfig,
 ) -> DataStream:
     """Wire async bridge on an operator's output if an async function is provided.
 
     If ``async_fn`` is None, logs a warning about unhandled side outputs
-    and returns the operator output as-is.
+    and emits degraded records from async work items.
     """
     if async_fn is None:
-        # Side outputs will be silently discarded by Flink if not captured.
-        # Log warning for observability.
         logger.warning(
-            "Async bridge not configured (no async_fn for task_types=%s). "
-            "Side-output async work items will be discarded.",
-            merge_task_types,
+            "Async bridge not configured for stage '%s'. "
+            "Work items will be converted to degraded fallback records.",
+            stage_name,
         )
-        return operator_ds
+        side_ds = operator_ds.get_side_output(ASYNC_WORK_TAG)
+        fallback_ds = side_ds.map(
+            _MissingAsyncFallbackMapper(stage_name),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+        return operator_ds.union(fallback_ds)
 
     return build_async_bridge(
         main_ds=operator_ds,
         async_fn=async_fn,
-        merge_fn=_AsyncMergeFunction(merge_task_types),
+        merge_fn=merge_fn,
         key_selector=config.key_selector,
         timeout_ms=config.async_timeout_ms,
         capacity=config.async_capacity,
@@ -360,18 +561,31 @@ def build_memory_subflow(
 
     # Wire async bridge for sem_groupby classify side outputs
     grouped = _wire_async_bridge_if_configured(
-        grouped_raw, config.classify_async_fn, ["classify"], config,
+        grouped_raw,
+        config.classify_async_fn,
+        _ClassifyAsyncMergeFunction(),
+        "classify",
+        config,
+    )
+
+    grouped_for_agg = grouped.key_by(config.key_selector).process(
+        _GroupbyToAggEnvelope(),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
     # Step 3: Semantic aggregation (re-key on group output)
-    aggregated_raw = grouped.key_by(config.key_selector).process(
+    aggregated_raw = grouped_for_agg.key_by(config.key_selector).process(
         SemAggFunction(config.agg_config),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
     # Wire async bridge for sem_agg summarize side outputs
     aggregated = _wire_async_bridge_if_configured(
-        aggregated_raw, config.summarize_async_fn, ["summarize"], config,
+        aggregated_raw,
+        config.summarize_async_fn,
+        _SummarizeAsyncMergeFunction(),
+        "summarize",
+        config,
     )
 
     return aggregated
@@ -407,7 +621,11 @@ def build_retrieval_subflow(
 
     # Wire async bridge for cts_retrieve external store fallback
     retrieved = _wire_async_bridge_if_configured(
-        retrieved_raw, config.retrieve_async_fn, ["retrieve"], config,
+        retrieved_raw,
+        config.retrieve_async_fn,
+        _RetrieveAsyncMergeFunction(),
+        "retrieve",
+        config,
     )
 
     # Step 2: Optional top-k reranking
@@ -416,9 +634,17 @@ def build_retrieval_subflow(
             SemTopKFunction(config.topk_config),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
-        return reranked
+        normalized = reranked.key_by(config.key_selector).process(
+            _RetrievalToAnswerEnvelope(),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+        return normalized
 
-    return retrieved
+    normalized = retrieved.key_by(config.key_selector).process(
+        _RetrievalToAnswerEnvelope(),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    return normalized
 
 
 def build_answer_subflow(
@@ -571,4 +797,3 @@ def validate_rag_config(config: ContinuousRAGConfig) -> List[str]:
         )
 
     return warnings
-

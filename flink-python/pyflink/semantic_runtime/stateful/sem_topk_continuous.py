@@ -133,6 +133,11 @@ class SemTopKFunction(KeyedProcessFunction):
         meta = self._meta.value() or {
             "key": str(ctx.get_current_key()),
             "update_count": 0,
+            "last_query": "",
+            "last_query_seq_id": 0,
+            "last_source": "",
+            "last_degraded": False,
+            "last_error": "",
         }
 
         # Register recompute timer on first element
@@ -150,6 +155,13 @@ class SemTopKFunction(KeyedProcessFunction):
                 retrieve_to_topk_items,
             )
             items = retrieve_to_topk_items(value)
+            meta["last_query"] = str(value.get("query", meta.get("last_query", "")))
+            meta["last_query_seq_id"] = int(
+                value.get("query_seq_id", meta.get("last_query_seq_id", 0))
+            )
+            meta["last_source"] = str(value.get("source", meta.get("last_source", "")))
+            meta["last_degraded"] = bool(value.get("degraded", False))
+            meta["last_error"] = str(value.get("error", ""))
             for item in items:
                 self._upsert_candidate(item, now_ms)
         else:
@@ -241,10 +253,15 @@ class SemTopKFunction(KeyedProcessFunction):
                 "key": meta.get("key", ""),
                 "topk": new_snapshot["top_records"],
                 "top_ids": new_topk_ids,
+                "query": meta.get("last_query", ""),
+                "query_seq_id": meta.get("last_query_seq_id", 0),
+                "source": meta.get("last_source", ""),
                 "total_candidates": len(scored),
                 "version": new_snapshot["version"],
                 "changed": changed,
                 "emission_policy": self._config.emission_policy,
+                "degraded": bool(meta.get("last_degraded", False)),
+                "error": str(meta.get("last_error", "")),
                 "timestamp_ms": now_ms,
             }
 
@@ -274,4 +291,3 @@ class SemTopKFunction(KeyedProcessFunction):
         for i in range(to_evict):
             self._candidates.remove(entries[i][0])
         return to_evict
-

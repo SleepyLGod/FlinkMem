@@ -187,6 +187,7 @@ class CtsRetrieveFunction(KeyedProcessFunction):
             truncated = local_candidates[:self._config.max_candidates_per_request]
             yield {
                 "key": event.key,
+                "query": event.payload,
                 "query_seq_id": event.seq_id,
                 "candidates": truncated,
                 "candidate_count": len(truncated),
@@ -275,6 +276,7 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         if not result_dict.get("success", False):
             yield {
                 "key": result_dict.get("key", ""),
+                "query": result_dict.get("payload", {}).get("query", ""),
                 "query_seq_id": result_dict.get("payload", {}).get("event_seq_id", 0),
                 "candidates": [],
                 "candidate_count": 0,
@@ -300,6 +302,10 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         truncated = candidates[:self._config.max_candidates_per_request]
         yield {
             "key": result_dict.get("key", ""),
+            "query": result_dict.get("result", {}).get(
+                "query",
+                result_dict.get("payload", {}).get("query", ""),
+            ),
             "query_seq_id": result_dict.get("payload", {}).get("event_seq_id", 0),
             "candidates": truncated,
             "candidate_count": len(truncated),
@@ -344,4 +350,3 @@ class CtsRetrieveFunction(KeyedProcessFunction):
     def _evict_cache(self, meta: Dict[str, Any]) -> int:
         """Timer-driven eviction of oldest cache entries beyond limit."""
         return self._enforce_cache_limit()
-

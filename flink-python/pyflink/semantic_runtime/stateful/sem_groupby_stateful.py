@@ -209,6 +209,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 "key": event.key, "group_id": best_group_id,
                 "confidence": confidence, "source": "local",
                 "event_seq_id": event.seq_id,
+                "payload": event.payload,
+                "event_time_ms": event.event_time_ms,
+                "metadata": dict(event.metadata),
+                "boundary_flags": dict(event.boundary_flags),
             }
         elif confidence >= self._config.new_group_creation_threshold and best_group_id:
             # Medium confidence → assign but also emit for async verification
@@ -219,6 +223,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 "key": event.key, "group_id": best_group_id,
                 "confidence": confidence, "source": "tentative",
                 "event_seq_id": event.seq_id,
+                "payload": event.payload,
+                "event_time_ms": event.event_time_ms,
+                "metadata": dict(event.metadata),
+                "boundary_flags": dict(event.boundary_flags),
             }
             # Emit side-output async classification request
             work = AsyncWorkItem(
@@ -238,6 +246,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
                     "key": event.key, "group_id": new_group_id,
                     "confidence": 0.0, "source": "new_group",
                     "event_seq_id": event.seq_id,
+                    "payload": event.payload,
+                    "event_time_ms": event.event_time_ms,
+                    "metadata": dict(event.metadata),
+                    "boundary_flags": dict(event.boundary_flags),
                 }
             else:
                 # At group limit → emit async for best-effort classification
@@ -386,4 +398,3 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if count <= self._config.max_groups_per_key:
             return 0
         return self._evict_n_oldest(count - self._config.max_groups_per_key)
-

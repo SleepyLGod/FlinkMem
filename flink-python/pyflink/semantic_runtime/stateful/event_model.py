@@ -220,6 +220,46 @@ def window_snapshot_to_summary_event(
     }
 
 
+def group_assignment_to_semantic_event(
+    assignment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Normalize a sem_groupby assignment into a SemanticEvent dict.
+
+    This adapter is used between ``sem_groupby`` and ``sem_agg`` so the
+    aggregation stage always receives a stable event envelope with required
+    SemanticEvent fields.
+    """
+    key = assignment.get("key", "")
+    seq_id = int(assignment.get("event_seq_id", assignment.get("seq_id", 0)))
+    group_id = assignment.get("group_id", "")
+    source = assignment.get("source", "")
+    confidence = assignment.get("confidence", 0.0)
+    payload = assignment.get(
+        "payload",
+        f"group_assignment group={group_id} source={source} confidence={confidence}",
+    )
+
+    metadata = dict(assignment.get("metadata", {}))
+    metadata.update(
+        {
+            "group_id": group_id,
+            "group_source": source,
+            "group_confidence": confidence,
+            "group_request_id": assignment.get("request_id", ""),
+        }
+    )
+
+    return {
+        "key": key,
+        "payload": str(payload),
+        "seq_id": seq_id,
+        "event_time_ms": assignment.get("event_time_ms"),
+        "metadata": metadata,
+        "candidates": assignment.get("candidates", []),
+        "boundary_flags": assignment.get("boundary_flags", {}),
+    }
+
+
 def retrieve_to_topk_items(
     retrieve_output: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -246,6 +286,22 @@ def retrieve_to_topk_items(
     return result
 
 
+def retrieve_to_answer_context(
+    retrieve_output: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Normalize cts_retrieve output for answer synthesis path."""
+    items = retrieve_output.get("candidates", [])
+    return {
+        "key": retrieve_output.get("key", ""),
+        "query": retrieve_output.get("query", ""),
+        "query_seq_id": retrieve_output.get("query_seq_id", 0),
+        "retrieved_context": items,
+        "total_candidates": retrieve_output.get("candidate_count", len(items)),
+        "retrieval_changed": True,
+        "source": retrieve_output.get("source", ""),
+    }
+
+
 def topk_to_answer_context(
     topk_output: Dict[str, Any],
     query_payload: str = "",
@@ -257,9 +313,11 @@ def topk_to_answer_context(
     return {
         "key": topk_output.get("key", ""),
         "query": query_payload or topk_output.get("query", ""),
+        "query_seq_id": topk_output.get("query_seq_id", 0),
         "retrieved_context": items,
         "total_candidates": topk_output.get("total_candidates", len(items)),
         "retrieval_changed": topk_output.get("changed", True),
+        "source": topk_output.get("source", ""),
     }
 
 
@@ -277,4 +335,3 @@ def composite_key_selector(*fields: str):
     def _select(event_dict: Dict[str, Any]) -> str:
         return "|".join(str(event_dict.get(f, "")) for f in fields)
     return _select
-
