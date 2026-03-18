@@ -23,6 +23,9 @@ from pyflink.semantic_runtime.stateful.semantic_window import (  # noqa: F401
 from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (  # noqa: F401
     SemGroupbyFunction, SemGroupbyConfig,
 )
+from pyflink.semantic_runtime.stateful.sem_groupby_window import (  # noqa: F401
+    WindowOwnedSemGroupbyFunction,
+)
 from pyflink.semantic_runtime.stateful.sem_agg_stateful import (  # noqa: F401
     SemAggFunction, SemAggConfig,
 )
@@ -36,6 +39,11 @@ from pyflink.semantic_runtime.stateful.sem_topk_continuous import (  # noqa: F40
 )
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (  # noqa: F401
     build_sem_topk_pipeline,
+)
+from pyflink.semantic_runtime.stateful.sem_groupby_pipeline import (  # noqa: F401
+    build_sem_groupby_operator,
+    resolve_groupby_execution_plan,
+    GroupbyExecutionPlan,
 )
 from pyflink.semantic_runtime.stateful.external_search_backend import (  # noqa: F401
     ExternalSearchBackend, SearchResult, MockSearchBackend, FaissSearchBackend,

@@ -49,7 +49,7 @@ from pyflink.semantic_runtime.stateful.external_search_backend import (
     MockSearchBackend,
     SearchBackendAsyncFn,
 )
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec, TopKQuerySpec, TriggerPolicy
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
     _BoundedPoolExternalScoreRerankerWorker,
 )
@@ -661,6 +661,8 @@ def _run_memory_path(
     agg_mode: str,
     classify_async_fn: Optional[AsyncFunction],
     summarize_async_fn: Optional[AsyncFunction],
+    *,
+    groupby_query_spec: Optional[GroupbyQuerySpec] = None,
 ) -> List[Dict[str, Any]]:
     key = "user_001"
     window_cfg, groupby_cfg, _, _, _ = _build_configs()
@@ -670,7 +672,7 @@ def _run_memory_path(
     sem_window._event_buffer = _FakeListState()
     sem_window._window_meta = _FakeValueState(None)
 
-    sem_groupby = SemGroupbyFunction(groupby_cfg)
+    sem_groupby = SemGroupbyFunction(groupby_cfg, query_spec=groupby_query_spec)
     sem_groupby._group_profiles = _FakeMapState()
     sem_groupby._meta = _FakeValueState(None)
 
@@ -1166,6 +1168,30 @@ def test_v02_workflow_summarize_and_missing_async_fallback():
     assert any(r.get("degraded") is True for r in retrieval_rows_missing)
     assert any(r.get("error") == "async_retrieve_missing_worker" for r in retrieval_rows_missing)
     assert any(r.get("mode") == "summarize_missing_worker" for r in memory_rows_missing)
+
+
+def test_v02_workflow_groupby_llm_refine_window_owned_scope_close():
+    events = _build_use_case_events()
+    classify_fn = _DeterministicClassifyAsyncFn()
+    groupby_qs = GroupbyQuerySpec.simple(
+        "Group memory events by topic",
+        backend="llm",
+        assignment_method="llm_refine",
+    )
+    groupby_qs.execution_path = "window_owned"
+    groupby_qs.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
+
+    memory_rows = _run_memory_path(
+        events,
+        agg_mode="algebraic",
+        classify_async_fn=classify_fn,
+        summarize_async_fn=None,
+        groupby_query_spec=groupby_qs,
+    )
+
+    assert memory_rows
+    assert any("project" in str(row.get("aggregate", "")).lower() for row in memory_rows)
+    assert any("travel" in str(row.get("aggregate", "")).lower() for row in memory_rows)
 
 
 def _close_workers(*workers: Optional[AsyncFunction]) -> None:

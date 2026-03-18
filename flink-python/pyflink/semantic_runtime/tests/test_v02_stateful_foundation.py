@@ -537,6 +537,17 @@ class _FakeMapState:
         return len(self._data) == 0
 
 
+def _split_outputs(items):
+    main = []
+    side = []
+    for item in items:
+        if isinstance(item, tuple) and len(item) == 2:
+            side.append(item[1])
+        else:
+            main.append(item)
+    return main, side
+
+
 # ============================================================================
 # SemAgg Logic Tests
 # ============================================================================
@@ -1182,6 +1193,13 @@ from pyflink.semantic_runtime.semantic_spec import (
     JoinScopePolicy,
 )
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig, DefaultsConfig
+from pyflink.semantic_runtime.stateful.sem_groupby_pipeline import (
+    build_sem_groupby_operator,
+    resolve_groupby_execution_plan,
+)
+from pyflink.semantic_runtime.stateful.sem_groupby_window import (
+    WindowOwnedSemGroupbyFunction,
+)
 
 
 class TestSemanticSpec:
@@ -1284,6 +1302,7 @@ class TestGroupbyQuerySpec:
         spec = GroupbyQuerySpec()
         assert spec.semantic.output_mode == "label"
         assert spec.assignment_method == "llm"
+        assert spec.execution_path == "auto"
         assert spec.query_version == 1
         assert spec.trigger_policy.mode == "on_event"
 
@@ -1297,6 +1316,7 @@ class TestGroupbyQuerySpec:
         )
         assert spec.semantic.backend == "embedding"
         assert spec.assignment_method == "embedding"
+        assert spec.execution_path == "auto"
         assert spec.scope_policy.ttl_seconds == 600
         assert spec.scope_policy.max_groups_per_key == 20
 
@@ -1304,6 +1324,11 @@ class TestGroupbyQuerySpec:
         import pytest
         with pytest.raises(ValueError, match="Invalid assignment_method"):
             GroupbyQuerySpec(assignment_method="bogus")
+
+    def test_invalid_execution_path(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid execution_path"):
+            GroupbyQuerySpec(execution_path="bogus")
 
     def test_roundtrip(self):
         spec = GroupbyQuerySpec(
@@ -1315,7 +1340,9 @@ class TestGroupbyQuerySpec:
             query_id="g1",
             query_version=2,
             assignment_method="llm_refine",
+            execution_path="operator_owned",
             trigger_policy=TriggerPolicy(mode="periodic", interval_ms=2000),
+            maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=5000),
             scope_policy=GroupbyScopePolicy(ttl_seconds=1200, max_groups_per_key=12),
             new_group_threshold=0.25,
             assign_threshold=0.8,
@@ -1324,9 +1351,501 @@ class TestGroupbyQuerySpec:
         assert restored.query_id == "g1"
         assert restored.query_version == 2
         assert restored.assignment_method == "llm_refine"
+        assert restored.execution_path == "operator_owned"
         assert restored.trigger_policy.mode == "periodic"
+        assert restored.maintenance_trigger_policy.mode == "periodic"
         assert restored.scope_policy.max_groups_per_key == 12
         assert restored.assign_threshold == 0.8
+
+    def test_runtime_resolution_overrides_config(self):
+        cfg = SemGroupbyConfig(
+            max_groups_per_key=50,
+            confidence_threshold=0.95,
+            ttl_seconds=3600,
+            new_group_creation_threshold=0.1,
+        )
+        spec = GroupbyQuerySpec(
+            scope_policy=GroupbyScopePolicy(ttl_seconds=600, max_groups_per_key=12),
+            assign_threshold=0.8,
+            new_group_threshold=0.25,
+        )
+        func = SemGroupbyFunction(cfg, spec)
+        assert func._resolved_ttl_seconds == 600
+        assert func._resolved_max_groups_per_key == 12
+        assert func._resolved_assign_threshold == 0.8
+        assert func._resolved_new_group_threshold == 0.25
+
+    def test_runtime_assign_threshold_used_by_process_path(self):
+        cfg = SemGroupbyConfig(
+            max_groups_per_key=10,
+            confidence_threshold=0.95,
+            new_group_creation_threshold=0.1,
+        )
+        spec = GroupbyQuerySpec(
+            assign_threshold=0.4,
+            new_group_threshold=0.2,
+        )
+        func = SemGroupbyFunction(cfg, spec)
+        func._group_profiles = _FakeMapState({
+            "g1": _new_group_profile("g1", "alpha beta", 100),
+        })
+        func._meta = _FakeValueState({"total_assigned": 1, "key": "k"})
+
+        results = list(func.process_element(
+            SemanticEvent(key="k", payload="alpha", seq_id=1).to_dict(),
+            _FakeContext("k"),
+        ))
+        assert len(results) == 1
+        assert results[0]["group_id"] == "g1"
+        assert results[0]["source"] == "local"
+
+    def test_embedding_assignment_method_uses_encoder_in_operator_owned_path(self):
+        class _StubEncoder:
+            def similarity(self, left: str, right: str) -> float:
+                return 0.9 if "beta" in right else 0.1
+
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(assignment_method="embedding"),
+        )
+        func._encoder = _StubEncoder()
+        func._group_profiles = _FakeMapState({
+            "g1": _new_group_profile("g1", "alpha topic", 100),
+            "g2": _new_group_profile("g2", "beta topic", 100),
+        })
+        gid, score = func._local_assign(SemanticEvent(key="k", payload="anything", seq_id=1))
+        assert gid == "g2"
+        assert score == 0.9
+
+    def test_execution_plan_auto_resolves_operator_owned(self):
+        plan = resolve_groupby_execution_plan(GroupbyQuerySpec())
+        assert plan.execution_path == "operator_owned"
+
+    def test_execution_plan_auto_window_snapshot_resolves_window_owned(self):
+        plan = resolve_groupby_execution_plan(
+            GroupbyQuerySpec(),
+            input_kind="window_snapshot",
+        )
+        assert plan.execution_path == "window_owned"
+
+    def test_builder_window_owned_returns_bounded_runtime(self):
+        op = build_sem_groupby_operator(
+            SemGroupbyConfig(),
+            GroupbyQuerySpec(execution_path="window_owned"),
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, WindowOwnedSemGroupbyFunction)
+
+    def test_builder_operator_owned_rejects_non_on_event_trigger(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="only .*on_event"):
+            build_sem_groupby_operator(
+                SemGroupbyConfig(),
+                GroupbyQuerySpec(
+                    execution_path="operator_owned",
+                    trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
+                ),
+            )
+
+    def test_builder_operator_owned_rejects_non_periodic_maintenance(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='periodic'"):
+            build_sem_groupby_operator(
+                SemGroupbyConfig(),
+                GroupbyQuerySpec(
+                    execution_path="operator_owned",
+                    maintenance_trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=1000),
+                ),
+            )
+
+    def test_builder_window_owned_requires_window_snapshot_input(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="window_snapshot"):
+            build_sem_groupby_operator(
+                SemGroupbyConfig(),
+                GroupbyQuerySpec(execution_path="window_owned"),
+                input_kind="event_stream",
+            )
+
+    def test_builder_window_owned_rejects_maintenance_trigger(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='on_scope_close'"):
+            build_sem_groupby_operator(
+                SemGroupbyConfig(),
+                GroupbyQuerySpec(
+                    execution_path="window_owned",
+                    maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
+                ),
+                input_kind="window_snapshot",
+            )
+
+    def test_builder_window_owned_accepts_on_scope_close_maintenance(self):
+        op = build_sem_groupby_operator(
+            SemGroupbyConfig(),
+            GroupbyQuerySpec(
+                execution_path="window_owned",
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            ),
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, WindowOwnedSemGroupbyFunction)
+
+    def test_window_owned_groups_within_snapshot(self):
+        func = WindowOwnedSemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="rule",
+                assign_threshold=0.5,
+                new_group_threshold=0.2,
+            ),
+        )
+        snapshot = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "count",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "alpha project budget", "seq_id": 1, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "alpha project timeline", "seq_id": 2, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "travel hotel booking", "seq_id": 3, "metadata": {}, "boundary_flags": {}},
+            ],
+        }
+        outs = list(func.process_element(snapshot, _FakeContext("k")))
+        main, side = _split_outputs(outs)
+        assert len(main) == 3
+        assert len(side) == 0
+        first_gid = main[0]["group_id"]
+        assert main[0]["source"] == "new_group"
+        assert main[1]["group_id"] == first_gid
+        assert main[2]["group_id"] != first_gid
+
+    def test_window_owned_embedding_assignment_uses_encoder(self):
+        class _StubEncoder:
+            def similarity(self, left: str, right: str) -> float:
+                return 0.9 if "beta" in right else 0.1
+
+        func = WindowOwnedSemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(assignment_method="embedding"),
+        )
+        func._encoder = _StubEncoder()
+        gid, score = func._local_assign(
+            {
+                "g1": _new_group_profile("g1", "alpha topic", 100),
+                "g2": _new_group_profile("g2", "beta topic", 100),
+            },
+            SemanticEvent(key="k", payload="anything", seq_id=1),
+        )
+        assert gid == "g2"
+        assert score == 0.9
+
+    def test_window_owned_does_not_reuse_groups_across_snapshots(self):
+        func = WindowOwnedSemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(assign_threshold=0.5, new_group_threshold=0.2),
+        )
+        snapshot1 = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "count",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "alpha project budget", "seq_id": 1, "metadata": {}, "boundary_flags": {}},
+            ],
+        }
+        snapshot2 = {
+            "key": "k",
+            "window_id": "w2",
+            "trigger_reason": "count",
+            "close_time_ms": 2000,
+            "events": [
+                {"key": "k", "payload": "alpha project update", "seq_id": 2, "metadata": {}, "boundary_flags": {}},
+            ],
+        }
+        out1 = list(func.process_element(snapshot1, _FakeContext("k")))
+        out2 = list(func.process_element(snapshot2, _FakeContext("k")))
+        main1, _ = _split_outputs(out1)
+        main2, _ = _split_outputs(out2)
+        assert main1[0]["source"] == "new_group"
+        assert main2[0]["source"] == "new_group"
+
+    def test_window_owned_on_scope_close_maintenance_merges_similar_groups(self):
+        func = WindowOwnedSemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="rule",
+                assign_threshold=0.85,
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            ),
+        )
+        snapshot = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "close",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "alpha budget planning", "seq_id": 1, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "alpha budget roadmap", "seq_id": 2, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "travel hotel booking", "seq_id": 3, "metadata": {}, "boundary_flags": {}},
+            ],
+        }
+        outs = list(func.process_element(snapshot, _FakeContext("k")))
+        main, _side = _split_outputs(outs)
+        group_ids = [row["group_id"] for row in main]
+        assert len(set(group_ids)) == 2
+        assert group_ids[0] == group_ids[1]
+        assert group_ids[2] != group_ids[0]
+
+    def test_operator_owned_llm_new_group_emits_async_verify(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(assignment_method="llm"),
+        )
+        func._group_profiles = _FakeMapState({})
+        func._meta = _FakeValueState({"total_assigned": 0, "key": "k"})
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        outs = list(
+            func.process_element(
+                SemanticEvent(key="k", payload="brand new topic", seq_id=1).to_dict(),
+                _FakeContext("k"),
+            )
+        )
+        main, side = _split_outputs(outs)
+        assert len(main) == 1
+        assert main[0]["source"] == "new_group"
+        assert len(side) == 1
+        payload = side[0]["payload"]
+        assert payload["tentative_group"] == main[0]["group_id"]
+        assert "candidate_groups" in payload
+
+    def test_window_owned_llm_new_group_emits_async_verify(self):
+        func = WindowOwnedSemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(assignment_method="llm"),
+        )
+        snapshot = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "close",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "brand new topic", "seq_id": 1, "metadata": {}, "boundary_flags": {}},
+            ],
+        }
+        outs = list(func.process_element(snapshot, _FakeContext("k")))
+        main, side = _split_outputs(outs)
+        assert len(main) == 1
+        assert main[0]["source"] == "new_group"
+        assert len(side) == 1
+        payload = side[0]["payload"]
+        assert payload["tentative_group"] == main[0]["group_id"]
+        assert "candidate_groups" in payload
+
+    def test_operator_owned_periodic_maintenance_updates_meta(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
+            ),
+        )
+        func._group_profiles = _FakeMapState({
+            "g1": _new_group_profile("g1", "alpha topic", 100),
+        })
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _Ctx()
+        list(func.process_element(
+            SemanticEvent(key="k", payload="alpha update", seq_id=1).to_dict(),
+            ctx,
+        ))
+        meta = func._meta.value()
+        assert "_timer_recompute" in meta
+        fire_at = meta["_timer_recompute"]
+        func.on_timer(fire_at, ctx)
+        updated = func._meta.value()
+        assert updated["refine_count"] == 1
+        assert updated["last_refine_ms"] == fire_at
+
+    def test_operator_owned_periodic_maintenance_merges_similar_groups(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="rule",
+                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
+                assign_threshold=0.85,
+            ),
+        )
+        func._group_profiles = _FakeMapState({
+            "g1": {
+                **_new_group_profile("g1", "alpha budget planning", 100),
+                "event_count": 3,
+            },
+            "g2": {
+                **_new_group_profile("g2", "alpha budget roadmap", 200),
+                "event_count": 1,
+            },
+            "g3": {
+                **_new_group_profile("g3", "travel hotel booking", 300),
+                "event_count": 2,
+            },
+        })
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _Ctx()
+        list(func.process_element(
+            SemanticEvent(key="k", payload="alpha update", seq_id=1).to_dict(),
+            ctx,
+        ))
+        fire_at = func._meta.value()["_timer_recompute"]
+        func.on_timer(fire_at, ctx)
+
+        keys = set(func._group_profiles.keys())
+        assert len(keys) == 2
+        assert "g3" in keys
+        survivor_id = "g1" if "g1" in keys else "g2"
+        survivor = func._group_profiles.get(survivor_id)
+        assert survivor["event_count"] == 5
+        assert len(survivor["_merged_from"]) == 1
+        assert func._meta.value()["last_merge_count"] == 1
+
+    def test_operator_owned_periodic_maintenance_does_not_merge_dissimilar_groups(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="rule",
+                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
+                assign_threshold=0.85,
+            ),
+        )
+        func._group_profiles = _FakeMapState({
+            "g1": _new_group_profile("g1", "alpha budget planning", 100),
+            "g2": _new_group_profile("g2", "travel hotel booking", 200),
+        })
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _Ctx()
+        list(func.process_element(
+            SemanticEvent(key="k", payload="alpha update", seq_id=1).to_dict(),
+            ctx,
+        ))
+        fire_at = func._meta.value()["_timer_recompute"]
+        func.on_timer(fire_at, ctx)
+
+        assert set(func._group_profiles.keys()) == {"g1", "g2"}
+        assert func._meta.value()["last_merge_count"] == 0
+
+    def test_operator_owned_llm_refine_refreshes_labels_during_maintenance(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="llm_refine",
+                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
+            ),
+        )
+        func._group_profiles = _FakeMapState({
+            "g1": {
+                **_new_group_profile("g1", "stale label", 100),
+                "summary": "alpha budget roadmap milestone",
+                "event_count": 3,
+            },
+        })
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _Ctx()
+        list(func.process_element(
+            SemanticEvent(key="k", payload="alpha update", seq_id=1).to_dict(),
+            ctx,
+        ))
+        fire_at = func._meta.value()["_timer_recompute"]
+        func.on_timer(fire_at, ctx)
+
+        profile = func._group_profiles.get("g1")
+        assert profile["label"] != "stale label"
+        assert "alpha" in profile["label"].lower()
 
 
 class TestAggQuerySpec:
@@ -1732,12 +2251,20 @@ class _FakeContext:
 
     def __init__(self, key="test_key"):
         self._key = key
+        class _TimerService:
+            def register_processing_time_timer(self, ts):
+                pass
+
+            def register_event_time_timer(self, ts):
+                pass
+
+        self._timer = _TimerService()
 
     def get_current_key(self):
         return self._key
 
     def timer_service(self):
-        return None
+        return self._timer
 
     def output(self, tag, value):
         pass
@@ -1748,6 +2275,7 @@ class TestContinuousRAGConfig:
         cfg = ContinuousRAGConfig()
         assert cfg.workflow_version == "v0.2.0"
         assert cfg.topk_config is None
+        assert cfg.groupby_query_spec is None
         assert cfg.async_timeout_ms == 30_000
         assert isinstance(cfg.window_config, SemWindowConfig)
         assert isinstance(cfg.groupby_config, SemGroupbyConfig)
@@ -1757,11 +2285,13 @@ class TestContinuousRAGConfig:
     def test_custom_configs(self):
         cfg = ContinuousRAGConfig(
             window_config=SemWindowConfig(max_window_events=10),
+            groupby_query_spec=GroupbyQuerySpec(assign_threshold=0.8),
             topk_config=SemTopKConfig(max_candidates=50),
             topk_query_spec=TopKQuerySpec(k=5),
             workflow_version="v0.2.1",
         )
         assert cfg.window_config.max_window_events == 10
+        assert cfg.groupby_query_spec.assign_threshold == 0.8
         assert cfg.topk_query_spec.k == 5
         assert cfg.topk_config.max_candidates == 50
         assert cfg.workflow_version == "v0.2.1"

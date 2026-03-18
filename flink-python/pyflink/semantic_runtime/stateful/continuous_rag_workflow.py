@@ -80,7 +80,9 @@ from pyflink.semantic_runtime.stateful.semantic_window import (
 )
 from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
     SemGroupbyConfig,
-    SemGroupbyFunction,
+)
+from pyflink.semantic_runtime.stateful.sem_groupby_pipeline import (
+    build_sem_groupby_operator,
 )
 from pyflink.semantic_runtime.stateful.sem_agg_stateful import (
     SemAggConfig,
@@ -93,7 +95,7 @@ from pyflink.semantic_runtime.stateful.cts_retrieve import (
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
     SemTopKConfig,
 )
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec, TopKQuerySpec
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
@@ -132,6 +134,7 @@ class ContinuousRAGConfig:
     # Subflow A configs
     window_config: SemWindowConfig = field(default_factory=SemWindowConfig)
     groupby_config: SemGroupbyConfig = field(default_factory=SemGroupbyConfig)
+    groupby_query_spec: Optional[GroupbyQuerySpec] = None
     agg_config: SemAggConfig = field(default_factory=SemAggConfig)
 
     # Subflow B configs
@@ -606,7 +609,11 @@ def build_memory_subflow(
 
     # Step 2: Semantic grouping (re-key on window output)
     grouped_raw = windowed.key_by(config.key_selector).process(
-        SemGroupbyFunction(config.groupby_config),
+        build_sem_groupby_operator(
+            config.groupby_config,
+            query_spec=config.groupby_query_spec,
+            input_kind="window_snapshot",
+        ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
