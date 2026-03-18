@@ -45,6 +45,10 @@ from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig, Ct
 from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig, SemGroupbyFunction
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.stateful.external_search_backend import (
+    MockSearchBackend,
+    SearchBackendAsyncFn,
+)
 from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
 from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig, SemWindowFunction
 
@@ -1048,6 +1052,53 @@ def test_v02_workflow_lotus_inspired_contract_and_counts():
                     group_sources.add(src)
     assert "async_classify" in group_sources
     assert any(str(r.get("source", "")).startswith("async_retrieve") for r in retrieval_rows)
+
+
+def test_v02_workflow_retrieve_path_via_mock_search_backend():
+    events = _build_use_case_events()
+    backend = MockSearchBackend(
+        query_rules={
+            "budget": [
+                {
+                    "candidate_id": "mem_project_budget",
+                    "text": "Project budget and timeline were reviewed.",
+                    "score": 0.91,
+                },
+                {
+                    "candidate_id": "mem_project_risk",
+                    "text": "Project risk mitigation steps were discussed.",
+                    "score": 0.84,
+                },
+            ],
+            "travel": [
+                {
+                    "candidate_id": "mem_travel_flight",
+                    "text": "Flight and hotel booking for Tokyo were planned.",
+                    "score": 0.93,
+                }
+            ],
+        },
+        default_results=[
+            {
+                "candidate_id": "mem_generic",
+                "text": "General conversation memory entry.",
+                "score": 0.5,
+            }
+        ],
+    )
+    retrieve_fn = SearchBackendAsyncFn(backend)
+    retrieval_rows = _run_retrieval_path(events, retrieve_async_fn=retrieve_fn)
+
+    assert retrieval_rows
+    assert any(str(r.get("source", "")).startswith("async_retrieve") for r in retrieval_rows)
+    budget_rows = [r for r in retrieval_rows if "budget" in str(r.get("query", "")).lower()]
+    assert budget_rows
+    first_budget_ids = [
+        item.get("candidate_id")
+        for item in budget_rows[0].get("retrieved_context", [])
+        if isinstance(item, dict)
+    ]
+    assert "mem_project_budget" in first_budget_ids
 
 
 def test_v02_workflow_summarize_and_missing_async_fallback():

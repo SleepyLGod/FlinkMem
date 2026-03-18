@@ -13,6 +13,8 @@ if not _sem_runtime_dst.exists():
     os.symlink(_sem_runtime_src, _sem_runtime_dst)
 # ---------------------------------------------------------------------------
 
+import asyncio
+import json
 import time
 import pytest
 
@@ -455,6 +457,32 @@ class TestCtsRetrieveLocalRetrieve:
         # c1 has perfect keyword match (1/1), c2 partial (1/3)
         assert results[0]["candidate_id"] == "c1"
 
+    def test_embedding_match(self):
+        func = CtsRetrieveFunction(
+            CtsRetrieveConfig(cache_match_fn_name="embedding", cache_embedding_dim=64)
+        )
+        func._cache = _FakeMapState({
+            "c1": {"content": "sunny warm weather forecast", "source": "a"},
+            "c2": {"content": "rain storm alert", "source": "b"},
+        })
+        event = SemanticEvent(key="k", payload="best sunny weather", seq_id=0)
+        results = func._local_retrieve(event)
+        assert results
+        assert results[0]["candidate_id"] == "c1"
+
+    def test_embedding_path_supports_text_field(self):
+        func = CtsRetrieveFunction(
+            CtsRetrieveConfig(cache_match_fn_name="embedding", cache_embedding_dim=64)
+        )
+        func._cache = _FakeMapState({
+            "c1": {"text": "budget planning update", "source": "a"},
+            "c2": {"text": "travel packing list", "source": "b"},
+        })
+        event = SemanticEvent(key="k", payload="budget update", seq_id=0)
+        results = func._local_retrieve(event)
+        assert results
+        assert results[0]["candidate_id"] == "c1"
+
 class TestCtsRetrieveCacheEnforcement:
     def test_enforce_cache_limit(self):
         entries = {f"c{i}": {"content": f"text {i}", "_cached_at_ms": i * 100}
@@ -890,7 +918,15 @@ class TestSemTopKPureStateMachine:
 # SemanticSpec & RuntimeConfig Tests
 # ============================================================================
 
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.semantic_spec import (
+    SemanticSpec,
+    GroupbyQuerySpec,
+    GroupbyScopePolicy,
+    AggQuerySpec,
+    AggScopePolicy,
+    JoinQuerySpec,
+    JoinScopePolicy,
+)
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig, DefaultsConfig
 
 
@@ -945,6 +981,149 @@ class TestSemanticSpec:
         assert spec2.output_mode == "score"
 
 
+class TestGroupbyQuerySpec:
+    def test_defaults(self):
+        spec = GroupbyQuerySpec()
+        assert spec.semantic.output_mode == "label"
+        assert spec.assignment_method == "llm"
+        assert spec.query_version == 1
+
+    def test_simple_builder(self):
+        spec = GroupbyQuerySpec.simple(
+            "Group by semantic topic",
+            backend="embedding",
+            assignment_method="embedding",
+            ttl_seconds=600,
+            max_groups_per_key=20,
+        )
+        assert spec.semantic.backend == "embedding"
+        assert spec.assignment_method == "embedding"
+        assert spec.scope_policy.ttl_seconds == 600
+        assert spec.scope_policy.max_groups_per_key == 20
+
+    def test_invalid_assignment_method(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid assignment_method"):
+            GroupbyQuerySpec(assignment_method="bogus")
+
+    def test_roundtrip(self):
+        spec = GroupbyQuerySpec(
+            semantic=SemanticSpec(
+                instruction="Group similar memories",
+                backend="llm",
+                output_mode="label",
+            ),
+            query_id="g1",
+            query_version=2,
+            assignment_method="llm_refine",
+            scope_policy=GroupbyScopePolicy(ttl_seconds=1200, max_groups_per_key=12),
+            new_group_threshold=0.25,
+            assign_threshold=0.8,
+        )
+        restored = GroupbyQuerySpec.from_dict(spec.to_dict())
+        assert restored.query_id == "g1"
+        assert restored.query_version == 2
+        assert restored.assignment_method == "llm_refine"
+        assert restored.scope_policy.max_groups_per_key == 12
+        assert restored.assign_threshold == 0.8
+
+
+class TestAggQuerySpec:
+    def test_defaults(self):
+        spec = AggQuerySpec()
+        assert spec.semantic.output_mode == "summary"
+        assert spec.agg_method == "algebraic"
+
+    def test_simple_builder(self):
+        spec = AggQuerySpec.simple(
+            "Summarize memory state",
+            backend="llm",
+            agg_method="summarize",
+            ttl_seconds=600,
+            max_buffer_events=50,
+            flush_interval_ms=10000,
+        )
+        assert spec.semantic.backend == "llm"
+        assert spec.agg_method == "summarize"
+        assert spec.scope_policy.max_buffer_events == 50
+
+    def test_invalid_agg_method(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid agg_method"):
+            AggQuerySpec(agg_method="bogus")
+
+    def test_roundtrip(self):
+        spec = AggQuerySpec(
+            semantic=SemanticSpec(
+                instruction="Compress memory",
+                backend="hybrid",
+                output_mode="summary",
+            ),
+            query_id="agg1",
+            query_version=3,
+            agg_method="compressive",
+            scope_policy=AggScopePolicy(
+                ttl_seconds=1800,
+                max_buffer_events=16,
+                flush_interval_ms=5000,
+            ),
+        )
+        restored = AggQuerySpec.from_dict(spec.to_dict())
+        assert restored.query_id == "agg1"
+        assert restored.query_version == 3
+        assert restored.agg_method == "compressive"
+        assert restored.scope_policy.flush_interval_ms == 5000
+
+
+class TestJoinQuerySpec:
+    def test_defaults(self):
+        spec = JoinQuerySpec()
+        assert spec.semantic.output_mode == "bool"
+        assert spec.pairing_method == "candidate_pruned"
+
+    def test_simple_builder(self):
+        spec = JoinQuerySpec.simple(
+            "Join request with candidate documents",
+            backend="embedding",
+            pairing_method="embedding_prefilter",
+            ttl_seconds=900,
+            max_left_buffer=10,
+            max_right_buffer=200,
+        )
+        assert spec.semantic.backend == "embedding"
+        assert spec.pairing_method == "embedding_prefilter"
+        assert spec.scope_policy.max_right_buffer == 200
+
+    def test_invalid_pairing_method(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid pairing_method"):
+            JoinQuerySpec(pairing_method="bogus")
+
+    def test_roundtrip(self):
+        spec = JoinQuerySpec(
+            semantic=SemanticSpec(
+                instruction="Judge semantic join eligibility",
+                backend="llm",
+                output_mode="bool",
+            ),
+            query_id="join1",
+            query_version=4,
+            pairing_method="blocking",
+            scope_policy=JoinScopePolicy(
+                ttl_seconds=600,
+                max_left_buffer=5,
+                max_right_buffer=25,
+                window_kind="sliding",
+                window_size_ms=10000,
+            ),
+        )
+        restored = JoinQuerySpec.from_dict(spec.to_dict())
+        assert restored.query_id == "join1"
+        assert restored.query_version == 4
+        assert restored.pairing_method == "blocking"
+        assert restored.scope_policy.window_kind == "sliding"
+
+
 class TestRuntimeConfig:
     def test_defaults(self):
         cfg = RuntimeConfig()
@@ -985,8 +1164,15 @@ class TestRuntimeConfig:
 # ============================================================================
 
 from pyflink.semantic_runtime.stateful.external_search_backend import (
-    ExternalSearchBackend, SearchResult,
+    ExternalSearchBackend, SearchResult, MockSearchBackend, SearchBackendAsyncFn,
+    FaissSearchBackend,
 )
+from pyflink.semantic_runtime.operators.sem_join_retrieve import (
+    CandidateRetrieverFromSearchBackend,
+    SemLookupJoinFunction,
+    SemLookupJoinConfig,
+)
+from pyflink.semantic_runtime.llm_client import LLMClientConfig
 
 
 class TestSearchResult:
@@ -1003,6 +1189,121 @@ class TestExternalSearchBackendInterface:
         import pytest
         with pytest.raises(TypeError):
             ExternalSearchBackend()
+
+    def test_mock_search_backend_query_rules(self):
+        backend = MockSearchBackend(
+            query_rules={
+                "budget": [
+                    {"candidate_id": "c1", "text": "Budget plan", "score": 0.9},
+                    {"candidate_id": "c2", "text": "Budget risk", "score": 0.7},
+                ]
+            }
+        )
+        results = asyncio.run(backend.search("budget update", top_k=2))
+        assert [r.candidate_id for r in results] == ["c1", "c2"]
+
+    def test_mock_search_backend_lexical_corpus(self):
+        backend = MockSearchBackend(
+            corpus=[
+                {"candidate_id": "c1", "text": "Sunny warm weather", "score": 0.2},
+                {"candidate_id": "c2", "text": "Rain and storms", "score": 0.2},
+            ]
+        )
+        results = asyncio.run(backend.search("best sunny weather", top_k=1))
+        assert len(results) == 1
+        assert results[0].candidate_id == "c1"
+
+    def test_search_backend_async_fn(self):
+        backend = MockSearchBackend(
+            query_rules={
+                "budget": [
+                    {"candidate_id": "c1", "text": "Budget plan", "score": 0.9},
+                ]
+            }
+        )
+        worker = SearchBackendAsyncFn(backend)
+        payload = AsyncWorkItem(
+            key="user_1",
+            task_type="retrieve",
+            payload={"query": "budget update", "event_seq_id": 7, "max_candidates": 3},
+        ).to_dict()
+        out = asyncio.run(worker.async_invoke(payload))[0]
+        assert out["success"] is True
+        result = out["result"]
+        assert result["query"] == "budget update"
+        assert result["event_seq_id"] == 7
+        assert result["candidates"][0]["candidate_id"] == "c1"
+        assert result["candidates"][0]["content"] == "Budget plan"
+
+    def test_candidate_retriever_from_search_backend(self):
+        backend = MockSearchBackend(
+            query_rules={
+                "travel": [
+                    {"candidate_id": "c1", "text": "Flight and hotel", "score": 0.93},
+                ]
+            }
+        )
+        retriever = CandidateRetrieverFromSearchBackend(backend)
+        retriever.open()
+        try:
+            results = asyncio.run(retriever.retrieve("travel plan", 3))
+        finally:
+            retriever.close()
+        assert len(results) == 1
+        assert results[0]["candidate_id"] == "c1"
+        assert results[0]["content"] == "Flight and hotel"
+        assert results[0]["score"] == 0.93
+
+    def test_faiss_backend_optional(self):
+        pytest.importorskip("faiss")
+        backend = FaissSearchBackend(
+            corpus=[
+                {"candidate_id": "c1", "text": "Sunny warm weather"},
+                {"candidate_id": "c2", "text": "Rain and storm"},
+            ],
+            dim=64,
+        )
+        backend.open()
+        try:
+            results = asyncio.run(backend.search("best sunny weather", top_k=1))
+        finally:
+            backend.close()
+        assert results
+        assert results[0].candidate_id == "c1"
+
+    def test_sem_lookup_join_uses_search_backend(self):
+        backend = MockSearchBackend(
+            query_rules={
+                "budget": [
+                    {"candidate_id": "c1", "text": "Budget plan", "score": 0.9},
+                ]
+            }
+        )
+        fn = SemLookupJoinFunction(
+            "Match {input} with: {candidates}",
+            LLMClientConfig(
+                backend="mock",
+                mock_response='{"matched":"c1","score":0.9}',
+            ),
+            SemLookupJoinConfig(
+                max_candidates_per_record=3,
+                search_backend=backend,
+            ),
+        )
+
+        class _FakeRuntimeContext:
+            pass
+
+        fn.open(_FakeRuntimeContext())
+        try:
+            out = asyncio.run(fn.async_invoke("budget update"))[0]
+        finally:
+            fn.close()
+
+        assert backend.opened is False
+        parsed = json.loads(out)
+        assert parsed["candidate_count"] == 1
+        assert parsed["join_result"]["matched"] == "c1"
 
 
 # ============================================================================

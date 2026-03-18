@@ -75,6 +75,13 @@ from pyflink.semantic_runtime.stateful.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.stateful.external_search_backend import (
+    ExternalSearchBackend,
+)
+from pyflink.semantic_runtime.stateful.simple_text_encoder import (
+    HashingTextEncoder,
+    tokenize_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +98,10 @@ class CtsRetrieveConfig:
     ttl_seconds: int = 1800              # 30 min default for retrieval cache
     evict_interval_ms: int = 120_000     # 2 min eviction sweep
     cache_match_fn_name: str = "keyword" # "keyword" | "embedding" (extensible)
+    cache_embedding_dim: int = 128
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     min_relevance_score: float = 0.0     # minimum score to include in results
+    search_backend: Optional[ExternalSearchBackend] = None
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,7 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         self._cache: Optional[MapState] = None
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
+        self._encoder = HashingTextEncoder(dim=self._config.cache_embedding_dim)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -248,23 +258,35 @@ class CtsRetrieveFunction(KeyedProcessFunction):
     def _local_retrieve(self, event: SemanticEvent) -> List[Dict[str, Any]]:
         """Retrieve matching candidates from keyed cache.
 
-        Uses simple keyword overlap scoring (V0.2 default).
+        Supports a default keyword overlap path and a lightweight local
+        hashing-vector similarity path for demos.
         """
-        query_words = set(event.payload.lower().split())
-        if not query_words:
+        query = str(event.payload or "")
+        if not query.strip():
             return []
 
         scored = []
+        match_fn = str(self._config.cache_match_fn_name or "keyword").lower()
         for cid in self._cache.keys():
             record = self._cache.get(cid)
             if record is None:
                 continue
-            content = record.get("content", "")
-            content_words = set(content.lower().split())
-            if not content_words:
+            content = str(record.get("content", record.get("text", "")))
+            if not content:
                 continue
-            overlap = len(query_words & content_words)
-            score = overlap / max(len(query_words), 1)
+
+            if match_fn == "embedding":
+                score = self._encoder.similarity(query, content)
+            else:
+                query_words = set(tokenize_text(query))
+                if not query_words:
+                    continue
+                content_words = set(tokenize_text(content))
+                if not content_words:
+                    continue
+                overlap = len(query_words & content_words)
+                score = overlap / max(len(query_words), 1)
+
             if score > self._config.min_relevance_score:
                 scored.append({**record, "_score": score, "candidate_id": cid})
 

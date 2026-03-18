@@ -49,6 +49,10 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators._common import attach_metrics, make_degraded_json
+from pyflink.semantic_runtime.stateful.external_search_backend import (
+    ExternalSearchBackend,
+    SearchResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,12 @@ logger = logging.getLogger(__name__)
 
 class CandidateRetriever(ABC):
     """Interface for candidate retrieval (vector DB, search index, etc.)."""
+
+    def open(self) -> None:
+        """Optional lifecycle hook."""
+
+    def close(self) -> None:
+        """Optional lifecycle hook."""
 
     @abstractmethod
     async def retrieve(self, query: str, max_results: int) -> List[Any]:
@@ -78,6 +88,35 @@ class MockCandidateRetriever(CandidateRetriever):
         return self._candidates[:max_results]
 
 
+class CandidateRetrieverFromSearchBackend(CandidateRetriever):
+    """Compatibility adapter: reuse ExternalSearchBackend inside V0.1 lookup join."""
+
+    def __init__(self, backend: ExternalSearchBackend) -> None:
+        self._backend = backend
+
+    def open(self) -> None:
+        self._backend.open()
+
+    def close(self) -> None:
+        self._backend.close()
+
+    async def retrieve(self, query: str, max_results: int) -> List[Any]:
+        results = await self._backend.search(query, top_k=max_results)
+        converted: List[Any] = []
+        for result in results:
+            sr = SearchResult.from_any(result)
+            converted.append(
+                {
+                    "candidate_id": sr.candidate_id,
+                    "content": sr.text,
+                    "text": sr.text,
+                    "score": float(sr.score),
+                    "metadata": dict(sr.metadata),
+                }
+            )
+        return converted
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -87,6 +126,7 @@ class SemLookupJoinConfig:
     """Picklable configuration for SemLookupJoinFunction."""
     max_candidates_per_record: int = 20
     retrieve_timeout_ms: float = 5000.0
+    search_backend: Optional[ExternalSearchBackend] = None
     # mock-specific
     mock_candidates: Optional[List[Any]] = None
     mock_retrieve_delay_s: float = 0.05
@@ -126,12 +166,14 @@ class SemLookupJoinFunction(AsyncFunction):
         self._client = create_llm_client(self._llm_config)
         self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_lookup_join")
         cfg = self._join_config
-        # V0.1: only mock retriever; real implementations plugged in later.
-        if cfg.mock_candidates is not None:
+        if cfg.search_backend is not None:
+            self._retriever = CandidateRetrieverFromSearchBackend(cfg.search_backend)
+        elif cfg.mock_candidates is not None:
             self._retriever = MockCandidateRetriever(
                 cfg.mock_candidates, cfg.mock_retrieve_delay_s)
         else:
             self._retriever = MockCandidateRetriever([], 0.0)
+        self._retriever.open()
         logger.info("SemLookupJoinFunction opened (max_cand=%d, timeout=%dms)",
                      cfg.max_candidates_per_record, cfg.retrieve_timeout_ms)
 
@@ -139,6 +181,8 @@ class SemLookupJoinFunction(AsyncFunction):
         if self._client is not None:
             self._client.close()
             self._client = None
+        if self._retriever is not None:
+            self._retriever.close()
 
     # -- core ----------------------------------------------------------------
 

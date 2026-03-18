@@ -45,8 +45,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
-import re
 import time
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence
 
@@ -57,6 +55,10 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.stateful.simple_text_encoder import (
+    HashingTextEncoder,
+    tokenize_text,
+)
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
     SemTopKConfig,
     SemTopKFunction,
@@ -163,19 +165,15 @@ def build_topk_passthrough_record(
     }
 
 
-def _tokenize(text: str) -> set[str]:
-    return {tok for tok in re.findall(r"[A-Za-z0-9_]+", text.lower()) if tok}
-
-
 def lexical_similarity(query_text: str, candidate_text: str) -> float:
     """Cheap deterministic text similarity used for embedding/mock scoring."""
-    query_tokens = _tokenize(query_text)
-    candidate_tokens = _tokenize(candidate_text)
+    query_tokens = set(tokenize_text(query_text))
+    candidate_tokens = set(tokenize_text(candidate_text))
     if not query_tokens or not candidate_tokens:
         return 0.0
 
     overlap = query_tokens & candidate_tokens
-    denom = math.sqrt(len(query_tokens) * len(candidate_tokens))
+    denom = (len(query_tokens) * len(candidate_tokens)) ** 0.5
     if denom <= 0:
         return 0.0
     return min(1.0, max(0.0, len(overlap) / denom))
@@ -300,10 +298,11 @@ class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
 
 
 class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
-    """Deterministic embedding-style scorer for continuous top-k.
+    """Deterministic local embedding-style scorer for continuous top-k.
 
     Current status:
-    - ``backend == "mock"`` or empty → lexical similarity surrogate
+    - ``backend == "mock"`` → lexical similarity surrogate for tests
+    - ``backend == "local_lexical"`` / ``"local_hashing"`` → local hashing encoder
     - real external embedding services are not implemented yet
     """
 
@@ -316,13 +315,15 @@ class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
     ) -> None:
         super().__init__(query_spec, score_field, candidate_text_fields)
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
+        dim = int(self._embedding_config.dimensions or 128)
+        self._encoder = HashingTextEncoder(dim=max(dim, 1))
 
     async def async_invoke(self, value):
         if not is_topk_candidate_record(value):
             return [value]
 
         backend = self._embedding_config.backend or "mock"
-        if backend not in {"mock", "local_lexical"}:
+        if backend not in {"mock", "local_lexical", "local_hashing"}:
             return [
                 build_topk_passthrough_record(
                     value,
@@ -331,10 +332,16 @@ class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
                 )
             ]
 
-        score = lexical_similarity(
-            self._query_text(value),
-            self._extract_candidate_text(value),
-        )
+        if backend == "mock":
+            score = lexical_similarity(
+                self._query_text(value),
+                self._extract_candidate_text(value),
+            )
+        else:
+            score = self._encoder.similarity(
+                self._query_text(value),
+                self._extract_candidate_text(value),
+            )
         await asyncio.sleep(0)
         return [
             build_scored_topk_candidate(
@@ -462,4 +469,3 @@ def build_sem_topk_pipeline(
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
     return reranked.union(passthrough_total)
-

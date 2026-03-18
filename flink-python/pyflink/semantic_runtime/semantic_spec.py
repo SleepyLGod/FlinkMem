@@ -17,21 +17,25 @@
 
 """
 SemanticSpec — unified semantic criterion specification.
+Operator-specific query specs — continuous semantic query definitions.
 
-This is the minimal V0.2+ dataclass that captures the semantic "what to do"
-across operators, decoupled from how each operator manages state or topology.
+SemanticSpec captures the semantic "what to do" across operators, decoupled
+from how each operator manages state or topology.
+
+The operator-specific query specs wrap SemanticSpec and add operator-level
+continuous semantics such as scope policy, method selection, and versioning.
 
 Currently serves:
   - ``sem_map``: instruction + backend + output_mode + schema
-  - ``sem_topk``: instruction + backend (scorer) + output_mode(score) + threshold
+  - ``sem_topk``: instruction + backend (scorer) + output_mode(score) + threshold + scope
 
-Later phases may extend this to ``sem_filter``, ``sem_groupby``, etc.
+V0.2+ extends this pattern to ``sem_groupby``, ``sem_agg``, and future ``sem_join``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -155,3 +159,473 @@ class SemanticSpec:
             metadata=d.get("metadata", {}),
         )
 
+
+
+# ---------------------------------------------------------------------------
+# TopKScopePolicy — candidate scope boundary for continuous top-k
+# ---------------------------------------------------------------------------
+
+VALID_WINDOW_KINDS = {"tumbling", "sliding", "semantic", "session", None}
+
+
+@dataclass
+class TopKScopePolicy:
+    """Defines which tuples are eligible for ranking in a continuous top-k query.
+
+    The candidate scope can be bounded by TTL, a maximum pool size, or a
+    window.  These boundaries are evaluated *before* scoring — a tuple that
+    falls outside the active scope is evicted from the candidate pool
+    regardless of its score.
+
+    Parameters
+    ----------
+    ttl_seconds : int or None
+        Time-to-live for candidates in the pool.  ``None`` means no TTL
+        (candidates are only evicted by ``max_candidates``).
+    max_candidates : int or None
+        Hard cap on the candidate pool size.  When exceeded, the overflow
+        policy (configured on the kernel) decides which candidates to evict.
+    window_kind : str or None
+        Optional window type that feeds candidates into the scope.
+        One of ``"tumbling"``, ``"sliding"``, ``"semantic"``, ``"session"``,
+        or ``None`` (no windowing).
+    window_size_ms : int or None
+        Window size in milliseconds (only meaningful when ``window_kind``
+        is set).
+    """
+
+    ttl_seconds: Optional[int] = None
+    max_candidates: Optional[int] = None
+    window_kind: Optional[str] = None
+    window_size_ms: Optional[int] = None
+
+    def __post_init__(self):
+        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
+            raise ValueError(
+                f"Invalid window_kind={self.window_kind!r}. "
+                f"Must be one of {VALID_WINDOW_KINDS}."
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "max_candidates": self.max_candidates,
+            "window_kind": self.window_kind,
+            "window_size_ms": self.window_size_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TopKScopePolicy":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ---------------------------------------------------------------------------
+# TopKQuerySpec — continuous query definition for sem_topk
+# ---------------------------------------------------------------------------
+
+VALID_RANKING_METHODS = {"pointwise", "pairwise", "listwise"}
+VALID_ASSIGNMENT_METHODS = {"rule", "embedding", "llm", "llm_refine"}
+VALID_AGG_METHODS = {"algebraic", "summarize", "compressive"}
+VALID_JOIN_PAIRING_METHODS = {
+    "candidate_pruned",
+    "embedding_prefilter",
+    "blocking",
+    "brute_force",
+}
+
+
+@dataclass
+class TopKQuerySpec:
+    """Complete specification for a continuous top-k query.
+
+    Wraps a :class:`SemanticSpec` (criterion / backend / prompt) and adds
+    the top-k-specific parameters: *k*, query versioning, scope policy,
+    and ranking method.
+
+    Parameters
+    ----------
+    semantic : SemanticSpec
+        The semantic criterion (instruction, backend, output_mode, …).
+        ``semantic.instruction`` is the ranking prompt / predicate.
+        ``semantic.backend`` is the scorer backend
+        (``"external_score"``, ``"llm"``, ``"embedding"``).
+    k : int
+        Number of top items to maintain.
+    query_id : str
+        Logical identifier for this continuous query.  Useful when the
+        same key space hosts multiple concurrent top-k queries.
+    query_version : int
+        Monotonically increasing version.  When the instruction or backend
+        changes, bump this to invalidate cached scores in the state.
+    ranking_method : str
+        Execution strategy for scoring.  ``"pointwise"`` (default) asks the
+        backend to score each candidate independently.  ``"pairwise"`` and
+        ``"listwise"`` are contextual reranking strategies evaluated on
+        bounded candidate pools (Phase C).
+    scope_policy : TopKScopePolicy
+        Defines the active candidate scope (TTL, pool cap, window).
+    """
+
+    semantic: SemanticSpec = field(default_factory=lambda: SemanticSpec.for_sem_topk())
+    k: int = 10
+    query_id: str = "default"
+    query_version: int = 1
+    ranking_method: str = "pointwise"
+    scope_policy: TopKScopePolicy = field(default_factory=TopKScopePolicy)
+
+    def __post_init__(self):
+        if self.ranking_method not in VALID_RANKING_METHODS:
+            raise ValueError(
+                f"Invalid ranking_method={self.ranking_method!r}. "
+                f"Must be one of {VALID_RANKING_METHODS}."
+            )
+        if self.k < 1:
+            raise ValueError(f"k must be >= 1, got {self.k}")
+
+    # -- convenience constructors ---------------------------------------------
+
+    @classmethod
+    def simple(
+        cls,
+        instruction: str = "",
+        *,
+        k: int = 10,
+        backend: str = "external_score",
+        ttl_seconds: Optional[int] = None,
+        max_candidates: Optional[int] = None,
+    ) -> "TopKQuerySpec":
+        """Quick builder for the common case.
+
+        Example::
+
+            spec = TopKQuerySpec.simple(
+                "Rank by relevance to user interests",
+                k=5,
+                backend="llm",
+                ttl_seconds=3600,
+                max_candidates=100,
+            )
+        """
+        return cls(
+            semantic=SemanticSpec.for_sem_topk(instruction, scorer_backend=backend),
+            k=k,
+            scope_policy=TopKScopePolicy(
+                ttl_seconds=ttl_seconds,
+                max_candidates=max_candidates,
+            ),
+        )
+
+    # -- serde ----------------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "semantic": self.semantic.to_dict(),
+            "k": self.k,
+            "query_id": self.query_id,
+            "query_version": self.query_version,
+            "ranking_method": self.ranking_method,
+            "scope_policy": self.scope_policy.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TopKQuerySpec":
+        return cls(
+            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            k=d.get("k", 10),
+            query_id=d.get("query_id", "default"),
+            query_version=d.get("query_version", 1),
+            ranking_method=d.get("ranking_method", "pointwise"),
+            scope_policy=TopKScopePolicy.from_dict(d.get("scope_policy", {})),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Groupby query spec
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GroupbyScopePolicy:
+    """Scope boundary for continuous semantic grouping."""
+
+    ttl_seconds: Optional[int] = None
+    max_groups_per_key: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "max_groups_per_key": self.max_groups_per_key,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "GroupbyScopePolicy":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class GroupbyQuerySpec:
+    """Continuous query definition for ``sem_groupby``."""
+
+    semantic: SemanticSpec = field(
+        default_factory=lambda: SemanticSpec(
+            instruction="Assign tuples to semantic groups.",
+            backend="llm",
+            output_mode="label",
+        )
+    )
+    query_id: str = "default"
+    query_version: int = 1
+    assignment_method: str = "llm"
+    scope_policy: GroupbyScopePolicy = field(default_factory=GroupbyScopePolicy)
+    new_group_threshold: float = 0.3
+    assign_threshold: float = 0.7
+
+    def __post_init__(self):
+        if self.assignment_method not in VALID_ASSIGNMENT_METHODS:
+            raise ValueError(
+                f"Invalid assignment_method={self.assignment_method!r}. "
+                f"Must be one of {VALID_ASSIGNMENT_METHODS}."
+            )
+
+    @classmethod
+    def simple(
+        cls,
+        instruction: str = "Assign tuples to semantic groups.",
+        *,
+        backend: str = "llm",
+        assignment_method: str = "llm",
+        ttl_seconds: Optional[int] = None,
+        max_groups_per_key: Optional[int] = None,
+    ) -> "GroupbyQuerySpec":
+        return cls(
+            semantic=SemanticSpec(
+                instruction=instruction,
+                backend=backend,
+                output_mode="label",
+            ),
+            assignment_method=assignment_method,
+            scope_policy=GroupbyScopePolicy(
+                ttl_seconds=ttl_seconds,
+                max_groups_per_key=max_groups_per_key,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "semantic": self.semantic.to_dict(),
+            "query_id": self.query_id,
+            "query_version": self.query_version,
+            "assignment_method": self.assignment_method,
+            "scope_policy": self.scope_policy.to_dict(),
+            "new_group_threshold": self.new_group_threshold,
+            "assign_threshold": self.assign_threshold,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "GroupbyQuerySpec":
+        return cls(
+            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            query_id=d.get("query_id", "default"),
+            query_version=d.get("query_version", 1),
+            assignment_method=d.get("assignment_method", "llm"),
+            scope_policy=GroupbyScopePolicy.from_dict(d.get("scope_policy", {})),
+            new_group_threshold=d.get("new_group_threshold", 0.3),
+            assign_threshold=d.get("assign_threshold", 0.7),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agg query spec
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AggScopePolicy:
+    """Scope boundary for continuous semantic aggregation."""
+
+    ttl_seconds: Optional[int] = None
+    max_buffer_events: Optional[int] = None
+    flush_interval_ms: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "max_buffer_events": self.max_buffer_events,
+            "flush_interval_ms": self.flush_interval_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AggScopePolicy":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class AggQuerySpec:
+    """Continuous query definition for ``sem_agg``."""
+
+    semantic: SemanticSpec = field(
+        default_factory=lambda: SemanticSpec(
+            instruction="Aggregate semantic state over a keyed stream.",
+            backend="rule",
+            output_mode="summary",
+        )
+    )
+    query_id: str = "default"
+    query_version: int = 1
+    agg_method: str = "algebraic"
+    scope_policy: AggScopePolicy = field(default_factory=AggScopePolicy)
+
+    def __post_init__(self):
+        if self.agg_method not in VALID_AGG_METHODS:
+            raise ValueError(
+                f"Invalid agg_method={self.agg_method!r}. "
+                f"Must be one of {VALID_AGG_METHODS}."
+            )
+
+    @classmethod
+    def simple(
+        cls,
+        instruction: str = "Aggregate semantic state over a keyed stream.",
+        *,
+        backend: str = "rule",
+        agg_method: str = "algebraic",
+        ttl_seconds: Optional[int] = None,
+        max_buffer_events: Optional[int] = None,
+        flush_interval_ms: Optional[int] = None,
+    ) -> "AggQuerySpec":
+        return cls(
+            semantic=SemanticSpec(
+                instruction=instruction,
+                backend=backend,
+                output_mode="summary",
+            ),
+            agg_method=agg_method,
+            scope_policy=AggScopePolicy(
+                ttl_seconds=ttl_seconds,
+                max_buffer_events=max_buffer_events,
+                flush_interval_ms=flush_interval_ms,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "semantic": self.semantic.to_dict(),
+            "query_id": self.query_id,
+            "query_version": self.query_version,
+            "agg_method": self.agg_method,
+            "scope_policy": self.scope_policy.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AggQuerySpec":
+        return cls(
+            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            query_id=d.get("query_id", "default"),
+            query_version=d.get("query_version", 1),
+            agg_method=d.get("agg_method", "algebraic"),
+            scope_policy=AggScopePolicy.from_dict(d.get("scope_policy", {})),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Join query spec (design shell for V0.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JoinScopePolicy:
+    """Scope boundary for future true two-input semantic join."""
+
+    ttl_seconds: Optional[int] = None
+    max_left_buffer: Optional[int] = None
+    max_right_buffer: Optional[int] = None
+    window_kind: Optional[str] = None
+    window_size_ms: Optional[int] = None
+
+    def __post_init__(self):
+        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
+            raise ValueError(
+                f"Invalid window_kind={self.window_kind!r}. "
+                f"Must be one of {VALID_WINDOW_KINDS}."
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "max_left_buffer": self.max_left_buffer,
+            "max_right_buffer": self.max_right_buffer,
+            "window_kind": self.window_kind,
+            "window_size_ms": self.window_size_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "JoinScopePolicy":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class JoinQuerySpec:
+    """Continuous query definition for future true two-input ``sem_join``."""
+
+    semantic: SemanticSpec = field(
+        default_factory=lambda: SemanticSpec(
+            instruction="Decide whether left and right tuples semantically join.",
+            backend="llm",
+            output_mode="bool",
+        )
+    )
+    query_id: str = "default"
+    query_version: int = 1
+    pairing_method: str = "candidate_pruned"
+    scope_policy: JoinScopePolicy = field(default_factory=JoinScopePolicy)
+
+    def __post_init__(self):
+        if self.pairing_method not in VALID_JOIN_PAIRING_METHODS:
+            raise ValueError(
+                f"Invalid pairing_method={self.pairing_method!r}. "
+                f"Must be one of {VALID_JOIN_PAIRING_METHODS}."
+            )
+
+    @classmethod
+    def simple(
+        cls,
+        instruction: str = "Decide whether left and right tuples semantically join.",
+        *,
+        backend: str = "llm",
+        pairing_method: str = "candidate_pruned",
+        ttl_seconds: Optional[int] = None,
+        max_left_buffer: Optional[int] = None,
+        max_right_buffer: Optional[int] = None,
+    ) -> "JoinQuerySpec":
+        return cls(
+            semantic=SemanticSpec(
+                instruction=instruction,
+                backend=backend,
+                output_mode="bool",
+            ),
+            pairing_method=pairing_method,
+            scope_policy=JoinScopePolicy(
+                ttl_seconds=ttl_seconds,
+                max_left_buffer=max_left_buffer,
+                max_right_buffer=max_right_buffer,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "semantic": self.semantic.to_dict(),
+            "query_id": self.query_id,
+            "query_version": self.query_version,
+            "pairing_method": self.pairing_method,
+            "scope_policy": self.scope_policy.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "JoinQuerySpec":
+        return cls(
+            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            query_id=d.get("query_id", "default"),
+            query_version=d.get("query_version", 1),
+            pairing_method=d.get("pairing_method", "candidate_pruned"),
+            scope_policy=JoinScopePolicy.from_dict(d.get("scope_policy", {})),
+        )

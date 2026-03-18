@@ -21,6 +21,11 @@ from pyflink.semantic_runtime.semantic_spec import (  # noqa: F401
     SemanticSpec,
     TopKScopePolicy,
     TopKQuerySpec,
+    GroupbyScopePolicy,
+    GroupbyQuerySpec,
+    AggScopePolicy,
+    AggQuerySpec,
+    JoinScopePolicy,
+    JoinQuerySpec,
 )
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig  # noqa: F401
-

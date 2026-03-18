@@ -38,5 +38,9 @@ from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (  # noqa: F401
     build_sem_topk_pipeline,
 )
 from pyflink.semantic_runtime.stateful.external_search_backend import (  # noqa: F401
-    ExternalSearchBackend, SearchResult,
+    ExternalSearchBackend, SearchResult, MockSearchBackend, FaissSearchBackend,
+    SearchBackendAsyncFn,
+)
+from pyflink.semantic_runtime.stateful.simple_text_encoder import (  # noqa: F401
+    HashingTextEncoder,
 )

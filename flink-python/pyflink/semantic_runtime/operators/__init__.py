@@ -27,10 +27,10 @@ from pyflink.semantic_runtime.operators.sem_join_retrieve import (  # noqa: F401
     SemJoinRetrieveConfig,
     CandidateRetriever,
     MockCandidateRetriever,
+    CandidateRetrieverFromSearchBackend,
 )
 from pyflink.semantic_runtime.operators.sem_topk import (  # noqa: F401
     SemLocalTopKFunction,
     # deprecated alias — V0.1 local variant
     SemTopKFunction,
 )
-

@@ -99,6 +99,9 @@ from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
     build_sem_topk_pipeline,
 )
+from pyflink.semantic_runtime.stateful.external_search_backend import (
+    SearchBackendAsyncFn,
+)
 from pyflink.semantic_runtime.stateful.async_bridge import (
     ASYNC_WORK_TAG,
     build_async_bridge,
@@ -562,6 +565,17 @@ def _wire_async_bridge_if_configured(
     )
 
 
+def _resolve_retrieve_async_fn(config: ContinuousRAGConfig):
+    """Resolve the retrieve async worker from config."""
+    if config.retrieve_async_fn is not None:
+        return config.retrieve_async_fn
+
+    backend = getattr(config.retrieve_config, "search_backend", None)
+    if backend is not None:
+        return SearchBackendAsyncFn(backend)
+    return None
+
+
 def build_memory_subflow(
     memory_ds: DataStream,
     config: ContinuousRAGConfig,
@@ -659,7 +673,7 @@ def build_retrieval_subflow(
     # Wire async bridge for cts_retrieve external store fallback
     retrieved = _wire_async_bridge_if_configured(
         retrieved_raw,
-        config.retrieve_async_fn,
+        _resolve_retrieve_async_fn(config),
         _RetrieveAsyncMergeFunction(),
         "retrieve",
         config,

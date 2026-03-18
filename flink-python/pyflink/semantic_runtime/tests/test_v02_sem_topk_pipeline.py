@@ -216,6 +216,23 @@ class TestPointwiseScorers:
         assert out["_score_backend"] == "embedding"
         assert out["source"] == "topk_embedding_pointwise"
 
+    def test_embedding_local_hashing_scores_candidate(self):
+        spec = TopKQuerySpec.simple("best weather days", backend="embedding")
+        worker = _EmbeddingScorerWorker(
+            spec,
+            EmbeddingBackendConfig(backend="local_hashing", dimensions=64),
+        )
+        row = {
+            "key": "user_1",
+            "candidate_id": "c1",
+            "query": "best sunny weather days",
+            "text": "sunny warm weather forecast",
+        }
+        out = _invoke_async(worker, row)[0]
+        assert out["candidate_id"] == "c1"
+        assert 0.0 <= out["score"] <= 1.0
+        assert out["_score_backend"] == "embedding"
+
     def test_embedding_unsupported_backend_degrades(self):
         spec = TopKQuerySpec.simple("best weather days", backend="embedding")
         worker = _EmbeddingScorerWorker(spec, EmbeddingBackendConfig(backend="remote_api"))
@@ -308,4 +325,3 @@ class TestTopKPipelineInMemory:
         assert len(out) == 1
         assert out[0]["degraded"] is True
         assert out[0]["error"] == "retrieve_timeout"
-
