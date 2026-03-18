@@ -23,7 +23,8 @@ SemanticSpec captures the semantic "what to do" across operators, decoupled
 from how each operator manages state or topology.
 
 The operator-specific query specs wrap SemanticSpec and add operator-level
-continuous semantics such as scope policy, method selection, and versioning.
+continuous semantics such as scope policy, trigger policy, method selection,
+and versioning.
 
 Currently serves:
   - ``sem_map``: instruction + backend + output_mode + schema
@@ -232,6 +233,50 @@ VALID_JOIN_PAIRING_METHODS = {
     "blocking",
     "brute_force",
 }
+VALID_TRIGGER_MODES = {
+    "on_event",
+    "on_scope_close",
+    "periodic",
+    "idle_flush",
+    "count_threshold",
+}
+
+
+@dataclass
+class TriggerPolicy:
+    """Defines when an operator computes, refreshes, or emits results.
+
+    Scope answers "who participates"; trigger answers "when to act on the
+    current active set".
+    """
+
+    mode: str = "on_event"
+    interval_ms: Optional[int] = None
+    idle_ms: Optional[int] = None
+    count_threshold: Optional[int] = None
+    emit_intermediate: bool = True
+    emit_final_on_scope_close: bool = True
+
+    def __post_init__(self):
+        if self.mode not in VALID_TRIGGER_MODES:
+            raise ValueError(
+                f"Invalid trigger mode={self.mode!r}. "
+                f"Must be one of {VALID_TRIGGER_MODES}."
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "interval_ms": self.interval_ms,
+            "idle_ms": self.idle_ms,
+            "count_threshold": self.count_threshold,
+            "emit_intermediate": self.emit_intermediate,
+            "emit_final_on_scope_close": self.emit_final_on_scope_close,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TriggerPolicy":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -240,7 +285,7 @@ class TopKQuerySpec:
 
     Wraps a :class:`SemanticSpec` (criterion / backend / prompt) and adds
     the top-k-specific parameters: *k*, query versioning, scope policy,
-    and ranking method.
+    ranking method, and trigger policy.
 
     Parameters
     ----------
@@ -262,6 +307,8 @@ class TopKQuerySpec:
         backend to score each candidate independently.  ``"pairwise"`` and
         ``"listwise"`` are contextual reranking strategies evaluated on
         bounded candidate pools (Phase C).
+    trigger_policy : TriggerPolicy
+        Defines when the current active candidate set is ranked/refreshed.
     scope_policy : TopKScopePolicy
         Defines the active candidate scope (TTL, pool cap, window).
     """
@@ -271,6 +318,7 @@ class TopKQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     ranking_method: str = "pointwise"
+    trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: TopKScopePolicy = field(default_factory=TopKScopePolicy)
 
     def __post_init__(self):
@@ -309,6 +357,7 @@ class TopKQuerySpec:
         return cls(
             semantic=SemanticSpec.for_sem_topk(instruction, scorer_backend=backend),
             k=k,
+            trigger_policy=TriggerPolicy(),
             scope_policy=TopKScopePolicy(
                 ttl_seconds=ttl_seconds,
                 max_candidates=max_candidates,
@@ -324,6 +373,7 @@ class TopKQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "ranking_method": self.ranking_method,
+            "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
 
@@ -335,6 +385,7 @@ class TopKQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             ranking_method=d.get("ranking_method", "pointwise"),
+            trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=TopKScopePolicy.from_dict(d.get("scope_policy", {})),
         )
 
@@ -376,6 +427,7 @@ class GroupbyQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     assignment_method: str = "llm"
+    trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: GroupbyScopePolicy = field(default_factory=GroupbyScopePolicy)
     new_group_threshold: float = 0.3
     assign_threshold: float = 0.7
@@ -404,6 +456,7 @@ class GroupbyQuerySpec:
                 output_mode="label",
             ),
             assignment_method=assignment_method,
+            trigger_policy=TriggerPolicy(),
             scope_policy=GroupbyScopePolicy(
                 ttl_seconds=ttl_seconds,
                 max_groups_per_key=max_groups_per_key,
@@ -416,6 +469,7 @@ class GroupbyQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "assignment_method": self.assignment_method,
+            "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
             "new_group_threshold": self.new_group_threshold,
             "assign_threshold": self.assign_threshold,
@@ -428,6 +482,7 @@ class GroupbyQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             assignment_method=d.get("assignment_method", "llm"),
+            trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=GroupbyScopePolicy.from_dict(d.get("scope_policy", {})),
             new_group_threshold=d.get("new_group_threshold", 0.3),
             assign_threshold=d.get("assign_threshold", 0.7),
@@ -473,6 +528,7 @@ class AggQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     agg_method: str = "algebraic"
+    trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: AggScopePolicy = field(default_factory=AggScopePolicy)
 
     def __post_init__(self):
@@ -500,6 +556,7 @@ class AggQuerySpec:
                 output_mode="summary",
             ),
             agg_method=agg_method,
+            trigger_policy=TriggerPolicy(),
             scope_policy=AggScopePolicy(
                 ttl_seconds=ttl_seconds,
                 max_buffer_events=max_buffer_events,
@@ -513,6 +570,7 @@ class AggQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "agg_method": self.agg_method,
+            "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
 
@@ -523,6 +581,7 @@ class AggQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             agg_method=d.get("agg_method", "algebraic"),
+            trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=AggScopePolicy.from_dict(d.get("scope_policy", {})),
         )
 
@@ -577,6 +636,7 @@ class JoinQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     pairing_method: str = "candidate_pruned"
+    trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: JoinScopePolicy = field(default_factory=JoinScopePolicy)
 
     def __post_init__(self):
@@ -604,6 +664,7 @@ class JoinQuerySpec:
                 output_mode="bool",
             ),
             pairing_method=pairing_method,
+            trigger_policy=TriggerPolicy(),
             scope_policy=JoinScopePolicy(
                 ttl_seconds=ttl_seconds,
                 max_left_buffer=max_left_buffer,
@@ -617,6 +678,7 @@ class JoinQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "pairing_method": self.pairing_method,
+            "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
 
@@ -627,5 +689,6 @@ class JoinQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             pairing_method=d.get("pairing_method", "candidate_pruned"),
+            trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=JoinScopePolicy.from_dict(d.get("scope_policy", {})),
         )

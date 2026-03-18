@@ -681,18 +681,23 @@ def build_retrieval_subflow(
 
     # Step 2: Optional top-k reranking
     if config.topk_config is not None:
-        # Expand retrieval envelopes into flat candidate dicts, then let the
-        # top-k pipeline builder orchestrate optional async scoring + the pure
-        # SemTopKFunction kernel.
-        expanded = retrieved.key_by(config.key_selector).process(
-            _RetrievalEnvelopeExpander(),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
+        topk_query_spec = config.topk_query_spec or TopKQuerySpec()
+        # Pointwise top-k consumes flat candidates. Bounded-pool pairwise/listwise
+        # consumes retrieval envelopes directly so that the pool boundary remains
+        # explicit. This keeps the pure kernel independent from workflow envelopes
+        # while preserving a clear rerank boundary for contextual methods.
+        if topk_query_spec.ranking_method == "pointwise":
+            topk_input = retrieved.key_by(config.key_selector).process(
+                _RetrievalEnvelopeExpander(),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+        else:
+            topk_input = retrieved
         reranked_or_passthrough = build_sem_topk_pipeline(
-            expanded,
+            topk_input,
             key_selector=config.key_selector,
             topk_config=config.topk_config,
-            query_spec=config.topk_query_spec or TopKQuerySpec(),
+            query_spec=topk_query_spec,
             llm_config=config.topk_llm_config,
             embedding_config=config.topk_embedding_config,
             async_timeout_ms=config.async_timeout_ms,

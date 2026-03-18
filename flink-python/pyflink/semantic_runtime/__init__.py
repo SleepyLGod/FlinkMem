@@ -19,6 +19,7 @@
 
 from pyflink.semantic_runtime.semantic_spec import (  # noqa: F401
     SemanticSpec,
+    TriggerPolicy,
     TopKScopePolicy,
     TopKQuerySpec,
     GroupbyScopePolicy,

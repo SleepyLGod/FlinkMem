@@ -50,6 +50,9 @@ from pyflink.semantic_runtime.stateful.external_search_backend import (
     SearchBackendAsyncFn,
 )
 from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
+    _BoundedPoolExternalScoreRerankerWorker,
+)
 from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig, SemWindowFunction
 
 
@@ -738,9 +741,12 @@ def _run_memory_path(
 def _run_retrieval_path(
     events: List[Dict[str, Any]],
     retrieve_async_fn: Optional[AsyncFunction],
+    *,
+    topk_query_spec: Optional[TopKQuerySpec] = None,
 ) -> List[Dict[str, Any]]:
     key = "user_001"
     _, _, retrieve_cfg, topk_cfg, topk_qs = _build_configs()
+    topk_qs = topk_query_spec or topk_qs
 
     retrieve = CtsRetrieveFunction(retrieve_cfg)
     retrieve._cache = _FakeMapState()
@@ -779,13 +785,26 @@ def _run_retrieval_path(
         key,
     )
 
-    # Expand retrieval envelopes into flat candidates before feeding to topk
-    expanded_candidates: List[Dict[str, Any]] = []
-    for row in merged_retrieve:
-        expanded_candidates.extend(list(expander.process_element(row, expander_ctx)))
-
-    scored_candidate_rows = [row for row in expanded_candidates if "candidate_id" in row]
-    passthrough_rows = [row for row in expanded_candidates if "candidate_id" not in row]
+    if topk_qs.ranking_method == "pointwise":
+        # Pointwise top-k consumes flat candidates.
+        expanded_candidates: List[Dict[str, Any]] = []
+        for row in merged_retrieve:
+            expanded_candidates.extend(list(expander.process_element(row, expander_ctx)))
+        scored_candidate_rows = [row for row in expanded_candidates if "candidate_id" in row]
+        passthrough_rows = [row for row in expanded_candidates if "candidate_id" not in row]
+    else:
+        # Contextual pairwise/listwise rerank consumes bounded retrieval pools
+        # directly, preserving the pool boundary until rerank is complete.
+        reranker = _BoundedPoolExternalScoreRerankerWorker(topk_qs, topk_cfg.score_field)
+        scored_candidate_rows = []
+        passthrough_rows = []
+        for row in merged_retrieve:
+            reranked_rows = asyncio.run(reranker.async_invoke(row))
+            for reranked in reranked_rows:
+                if "candidate_id" in reranked and topk_cfg.score_field in reranked:
+                    scored_candidate_rows.append(reranked)
+                else:
+                    passthrough_rows.append(reranked)
 
     topk_rows: List[Dict[str, Any]] = []
     for row in scored_candidate_rows:
@@ -1099,6 +1118,28 @@ def test_v02_workflow_retrieve_path_via_mock_search_backend():
         if isinstance(item, dict)
     ]
     assert "mem_project_budget" in first_budget_ids
+
+
+def test_v02_workflow_retrieve_path_pairwise_topk():
+    events = _build_use_case_events()
+    topk_qs = TopKQuerySpec.simple(
+        "Rank the best matching memories for the query",
+        k=2,
+        backend="external_score",
+    )
+    topk_qs.ranking_method = "pairwise"
+    retrieval_rows = _run_retrieval_path(
+        events,
+        retrieve_async_fn=_DeterministicRetrieveAsyncFn(),
+        topk_query_spec=topk_qs,
+    )
+
+    assert retrieval_rows
+    budget_rows = [r for r in retrieval_rows if "budget" in str(r.get("query", "")).lower()]
+    assert budget_rows
+    assert budget_rows[0].get("degraded") is False
+    assert budget_rows[0].get("total_candidates", 0) >= 1
+    assert len(budget_rows[0].get("retrieved_context", [])) >= 1
 
 
 def test_v02_workflow_summarize_and_missing_async_fallback():

@@ -26,10 +26,14 @@ from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
     SemTopKFunction,
 )
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
+    _BoundedPoolEmbeddingRerankerWorker,
+    _BoundedPoolExternalScoreRerankerWorker,
+    _BoundedPoolLLMRerankerWorker,
     _EmbeddingScorerWorker,
     _PointwiseLLMScorerWorker,
     _mark_missing_external_score,
     is_topk_candidate_record,
+    is_topk_candidate_pool,
     topk_candidate_has_score,
     topk_candidate_needs_scoring,
 )
@@ -104,6 +108,7 @@ def _run_pipeline_in_memory(
 
     llm_worker = None
     embedding_worker = None
+    pool_worker = None
     if query_spec.semantic.backend == "llm":
         llm_worker = _PointwiseLLMScorerWorker(
             query_spec,
@@ -116,8 +121,40 @@ def _run_pipeline_in_memory(
             embedding_config or EmbeddingBackendConfig(backend="mock"),
             score_field,
         )
+    if query_spec.ranking_method in {"pairwise", "listwise"}:
+        if query_spec.semantic.backend == "llm":
+            pool_worker = _BoundedPoolLLMRerankerWorker(
+                query_spec,
+                llm_config or LLMClientConfig(backend="mock"),
+                score_field,
+            )
+        elif query_spec.semantic.backend == "embedding":
+            pool_worker = _BoundedPoolEmbeddingRerankerWorker(
+                query_spec,
+                embedding_config or EmbeddingBackendConfig(backend="mock"),
+                score_field,
+            )
+        elif query_spec.semantic.backend == "external_score":
+            pool_worker = _BoundedPoolExternalScoreRerankerWorker(
+                query_spec,
+                score_field,
+            )
+        else:
+            raise AssertionError(f"unexpected backend: {query_spec.semantic.backend}")
 
     for row in rows:
+        if query_spec.ranking_method in {"pairwise", "listwise"}:
+            if not is_topk_candidate_pool(row):
+                outputs.append(row)
+                continue
+            reranked_rows = _invoke_async(pool_worker, row)
+            for reranked in reranked_rows:
+                if is_topk_candidate_record(reranked) and topk_candidate_has_score(reranked, score_field):
+                    outputs.extend(list(topk.process_element(reranked, ctx)))
+                else:
+                    outputs.append(reranked)
+            continue
+
         if not is_topk_candidate_record(row):
             outputs.append(row)
             continue
@@ -325,3 +362,48 @@ class TestTopKPipelineInMemory:
         assert len(out) == 1
         assert out[0]["degraded"] is True
         assert out[0]["error"] == "retrieve_timeout"
+
+    def test_llm_pairwise_bounded_pool_emits_topk(self):
+        spec = TopKQuerySpec.simple("best sunny weather days", k=2, backend="llm")
+        spec.ranking_method = "pairwise"
+        rows = [
+            {
+                "key": "user_1",
+                "query": "best sunny weather days",
+                "query_seq_id": 7,
+                "candidate_count": 3,
+                "candidates": [
+                    {"candidate_id": "d1", "text": "sunny warm weather all day"},
+                    {"candidate_id": "d2", "text": "rain and storms"},
+                    {"candidate_id": "d3", "text": "sunny clear dry sky"},
+                ],
+            }
+        ]
+        out = _run_pipeline_in_memory(rows, spec, llm_config=LLMClientConfig(backend="mock"))
+        snapshots = [row for row in out if "top_ids" in row]
+        assert snapshots
+        assert set(snapshots[-1]["top_ids"]) == {"d1", "d3"}
+
+    def test_embedding_listwise_bounded_pool_emits_topk(self):
+        spec = TopKQuerySpec.simple("best sunny weather days", k=1, backend="embedding")
+        spec.ranking_method = "listwise"
+        rows = [
+            {
+                "key": "user_1",
+                "query": "best sunny weather days",
+                "query_seq_id": 9,
+                "candidate_count": 2,
+                "candidates": [
+                    {"candidate_id": "d1", "text": "cold rain and storms"},
+                    {"candidate_id": "d2", "text": "sunny warm weather forecast"},
+                ],
+            }
+        ]
+        out = _run_pipeline_in_memory(
+            rows,
+            spec,
+            embedding_config=EmbeddingBackendConfig(backend="local_hashing", dimensions=64),
+        )
+        snapshots = [row for row in out if "top_ids" in row]
+        assert snapshots
+        assert snapshots[-1]["top_ids"] == ["d2"]

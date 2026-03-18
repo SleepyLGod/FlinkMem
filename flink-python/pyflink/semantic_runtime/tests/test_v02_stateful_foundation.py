@@ -920,6 +920,7 @@ class TestSemTopKPureStateMachine:
 
 from pyflink.semantic_runtime.semantic_spec import (
     SemanticSpec,
+    TriggerPolicy,
     GroupbyQuerySpec,
     GroupbyScopePolicy,
     AggQuerySpec,
@@ -981,12 +982,42 @@ class TestSemanticSpec:
         assert spec2.output_mode == "score"
 
 
+class TestTriggerPolicy:
+    def test_defaults(self):
+        policy = TriggerPolicy()
+        assert policy.mode == "on_event"
+        assert policy.emit_intermediate is True
+        assert policy.emit_final_on_scope_close is True
+
+    def test_invalid_mode(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid trigger mode"):
+            TriggerPolicy(mode="bogus")
+
+    def test_roundtrip(self):
+        policy = TriggerPolicy(
+            mode="periodic",
+            interval_ms=1000,
+            idle_ms=500,
+            count_threshold=10,
+            emit_intermediate=False,
+            emit_final_on_scope_close=True,
+        )
+        restored = TriggerPolicy.from_dict(policy.to_dict())
+        assert restored.mode == "periodic"
+        assert restored.interval_ms == 1000
+        assert restored.idle_ms == 500
+        assert restored.count_threshold == 10
+        assert restored.emit_intermediate is False
+
+
 class TestGroupbyQuerySpec:
     def test_defaults(self):
         spec = GroupbyQuerySpec()
         assert spec.semantic.output_mode == "label"
         assert spec.assignment_method == "llm"
         assert spec.query_version == 1
+        assert spec.trigger_policy.mode == "on_event"
 
     def test_simple_builder(self):
         spec = GroupbyQuerySpec.simple(
@@ -1016,6 +1047,7 @@ class TestGroupbyQuerySpec:
             query_id="g1",
             query_version=2,
             assignment_method="llm_refine",
+            trigger_policy=TriggerPolicy(mode="periodic", interval_ms=2000),
             scope_policy=GroupbyScopePolicy(ttl_seconds=1200, max_groups_per_key=12),
             new_group_threshold=0.25,
             assign_threshold=0.8,
@@ -1024,6 +1056,7 @@ class TestGroupbyQuerySpec:
         assert restored.query_id == "g1"
         assert restored.query_version == 2
         assert restored.assignment_method == "llm_refine"
+        assert restored.trigger_policy.mode == "periodic"
         assert restored.scope_policy.max_groups_per_key == 12
         assert restored.assign_threshold == 0.8
 
@@ -1033,6 +1066,7 @@ class TestAggQuerySpec:
         spec = AggQuerySpec()
         assert spec.semantic.output_mode == "summary"
         assert spec.agg_method == "algebraic"
+        assert spec.trigger_policy.mode == "on_event"
 
     def test_simple_builder(self):
         spec = AggQuerySpec.simple(
@@ -1062,6 +1096,7 @@ class TestAggQuerySpec:
             query_id="agg1",
             query_version=3,
             agg_method="compressive",
+            trigger_policy=TriggerPolicy(mode="count_threshold", count_threshold=16),
             scope_policy=AggScopePolicy(
                 ttl_seconds=1800,
                 max_buffer_events=16,
@@ -1072,6 +1107,7 @@ class TestAggQuerySpec:
         assert restored.query_id == "agg1"
         assert restored.query_version == 3
         assert restored.agg_method == "compressive"
+        assert restored.trigger_policy.mode == "count_threshold"
         assert restored.scope_policy.flush_interval_ms == 5000
 
 
@@ -1080,6 +1116,7 @@ class TestJoinQuerySpec:
         spec = JoinQuerySpec()
         assert spec.semantic.output_mode == "bool"
         assert spec.pairing_method == "candidate_pruned"
+        assert spec.trigger_policy.mode == "on_event"
 
     def test_simple_builder(self):
         spec = JoinQuerySpec.simple(
@@ -1109,6 +1146,7 @@ class TestJoinQuerySpec:
             query_id="join1",
             query_version=4,
             pairing_method="blocking",
+            trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=800),
             scope_policy=JoinScopePolicy(
                 ttl_seconds=600,
                 max_left_buffer=5,
@@ -1121,6 +1159,7 @@ class TestJoinQuerySpec:
         assert restored.query_id == "join1"
         assert restored.query_version == 4
         assert restored.pairing_method == "blocking"
+        assert restored.trigger_policy.mode == "idle_flush"
         assert restored.scope_policy.window_kind == "sliding"
 
 
