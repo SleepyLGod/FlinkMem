@@ -670,6 +670,7 @@ class TestSemTopKConfig:
         assert qs.k == 10
         assert qs.query_version == 1
         assert qs.ranking_method == "pointwise"
+        assert qs.execution_path == "auto"
         assert qs.scope_policy.ttl_seconds is None
 
     def test_query_spec_simple(self):
@@ -684,6 +685,41 @@ class TestSemTopKConfig:
         import pytest
         with pytest.raises(ValueError, match="Invalid ranking_method"):
             TopKQuerySpec(ranking_method="bogus")
+
+    def test_query_spec_invalid_execution_path(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid execution_path"):
+            TopKQuerySpec(execution_path="bogus")
+
+    def test_scope_policy_session_gap_validation(self):
+        import pytest
+        with pytest.raises(ValueError, match="session_gap_ms"):
+            TopKScopePolicy(window_kind="session", session_gap_ms=0)
+
+    def test_topk_query_spec_roundtrip_with_session_scope(self):
+        spec = TopKQuerySpec(
+            semantic=SemanticSpec.for_sem_topk("rank best weather days", scorer_backend="embedding"),
+            k=4,
+            query_id="topk1",
+            query_version=3,
+            ranking_method="pointwise",
+            execution_path="operator_owned",
+            trigger_policy=TriggerPolicy(mode="periodic", interval_ms=2000),
+            scope_policy=TopKScopePolicy(
+                ttl_seconds=600,
+                max_candidates=50,
+                window_kind="session",
+                session_gap_ms=15000,
+                boundary_flag="topic_shift",
+            ),
+        )
+        restored = TopKQuerySpec.from_dict(spec.to_dict())
+        assert restored.query_id == "topk1"
+        assert restored.execution_path == "operator_owned"
+        assert restored.trigger_policy.mode == "periodic"
+        assert restored.scope_policy.window_kind == "session"
+        assert restored.scope_policy.session_gap_ms == 15000
+        assert restored.scope_policy.boundary_flag == "topic_shift"
 
 
 class TestSemTopKRecompute:
@@ -913,6 +949,223 @@ class TestSemTopKPureStateMachine:
         assert out["degraded"] is True
         assert out["error"] == "partial_score_timeout"
 
+    def test_idle_flush_emits_only_when_flush_timer_fires(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = self._make_func(
+            k=1,
+            query_version=1,
+            trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=50),
+        )
+        ctx = _Ctx()
+        results = list(func.process_element(
+            {"candidate_id": "c1", "score": 0.9, "event_time_ms": 1000},
+            ctx,
+        ))
+        assert results == []
+        meta = func._meta.value()
+        fire_at = meta["_timer_flush"]
+        timer_results = list(func.on_timer(fire_at, ctx))
+        assert len(timer_results) == 1
+        assert timer_results[0]["top_ids"] == ["c1"]
+
+    def test_count_threshold_emits_every_n_accepted_candidates(self):
+        func = self._make_func(
+            k=1,
+            trigger_policy=TriggerPolicy(mode="count_threshold", count_threshold=2),
+        )
+        ctx = _FakeContext("k")
+        first = list(func.process_element(
+            {"candidate_id": "c1", "score": 0.3, "event_time_ms": 1000},
+            ctx,
+        ))
+        second = list(func.process_element(
+            {"candidate_id": "c2", "score": 0.9, "event_time_ms": 1001},
+            ctx,
+        ))
+        third = list(func.process_element(
+            {"candidate_id": "c3", "score": 0.2, "event_time_ms": 1002},
+            ctx,
+        ))
+        assert first == []
+        assert len(second) == 1
+        assert second[0]["top_ids"] == ["c2"]
+        assert third == []
+
+    def test_operator_owned_scope_close_session_emits_and_resets_on_timer(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = self._make_func(
+            k=1,
+            trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            scope_policy=TopKScopePolicy(window_kind="session", session_gap_ms=50),
+        )
+        ctx = _Ctx()
+        first = list(func.process_element(
+            {"candidate_id": "c1", "score": 0.4, "event_time_ms": 1000},
+            ctx,
+        ))
+        second = list(func.process_element(
+            {"candidate_id": "c2", "score": 0.9, "event_time_ms": 1010},
+            ctx,
+        ))
+        assert first == []
+        assert second == []
+        meta = func._meta.value()
+        fire_at = meta["_timer_flush"]
+        timer_results = list(func.on_timer(fire_at, ctx))
+        assert len(timer_results) == 1
+        assert timer_results[0]["top_ids"] == ["c2"]
+        assert timer_results[0]["scope_close_reason"] == "session_gap"
+        assert len(func._candidates.keys()) == 0
+
+    def test_operator_owned_scope_close_semantic_emits_after_boundary(self):
+        func = self._make_func(
+            k=1,
+            trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            scope_policy=TopKScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+        )
+        ctx = _FakeContext("k")
+        first = list(func.process_element(
+            {"candidate_id": "c1", "score": 0.4, "event_time_ms": 1000, "boundary_flags": {}},
+            ctx,
+        ))
+        second = list(func.process_element(
+            {
+                "candidate_id": "c2",
+                "score": 0.9,
+                "event_time_ms": 1010,
+                "boundary_flags": {"topic_shift": True},
+            },
+            ctx,
+        ))
+        assert first == []
+        assert len(second) == 1
+        assert second[0]["top_ids"] == ["c2"]
+        assert second[0]["scope_close_reason"] == "semantic_boundary"
+        assert len(func._candidates.keys()) == 0
+
+    def test_session_scope_resets_before_new_event(self):
+        func = self._make_func(
+            k=1,
+            scope_policy=TopKScopePolicy(window_kind="session", session_gap_ms=100),
+        )
+        list(func.process_element(
+            {"candidate_id": "c1", "score": 0.9, "event_time_ms": 1000},
+            _FakeContext("k"),
+        ))
+        results = list(func.process_element(
+            {"candidate_id": "c2", "score": 0.8, "event_time_ms": 1201},
+            _FakeContext("k"),
+        ))
+        assert len(results) == 2
+        assert results[0]["scope_close_reason"] == "session_gap"
+        assert results[-1]["top_ids"] == ["c2"]
+        assert set(func._candidates.keys()) == {"c2"}
+        meta = func._meta.value()
+        assert meta["scope_epoch"] == 1
+        assert meta["last_scope_reset_reason"] == "session_gap"
+
+    def test_tumbling_scope_resets_on_bucket_rollover(self):
+        func = self._make_func(
+            k=1,
+            scope_policy=TopKScopePolicy(window_kind="tumbling", window_size_ms=100),
+        )
+        list(func.process_element(
+            {"candidate_id": "c1", "score": 0.9, "event_time_ms": 10},
+            _FakeContext("k"),
+        ))
+        results = list(func.process_element(
+            {"candidate_id": "c2", "score": 0.8, "event_time_ms": 120},
+            _FakeContext("k"),
+        ))
+        assert len(results) == 2
+        assert results[0]["scope_close_reason"] == "tumbling_rollover"
+        assert results[-1]["top_ids"] == ["c2"]
+        assert set(func._candidates.keys()) == {"c2"}
+
+    def test_semantic_scope_resets_after_boundary_event(self):
+        func = self._make_func(
+            k=2,
+            scope_policy=TopKScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+        )
+        list(func.process_element(
+            {"candidate_id": "c1", "score": 0.9, "event_time_ms": 10},
+            _FakeContext("k"),
+        ))
+        results = list(func.process_element(
+            {
+                "candidate_id": "c2",
+                "score": 0.8,
+                "event_time_ms": 20,
+                "boundary_flags": {"topic_shift": True},
+            },
+            _FakeContext("k"),
+        ))
+        assert len(results) == 1
+        assert results[0]["top_ids"] == ["c1", "c2"]
+        assert len(func._candidates.keys()) == 0
+        meta = func._meta.value()
+        assert meta["scope_epoch"] == 1
+        assert meta["last_scope_reset_reason"] == "semantic_boundary"
+
+    def test_sliding_scope_evicts_old_candidates(self):
+        func = self._make_func(
+            k=1,
+            scope_policy=TopKScopePolicy(window_kind="sliding", window_size_ms=100),
+        )
+        list(func.process_element(
+            {"candidate_id": "c1", "score": 0.9, "event_time_ms": 10},
+            _FakeContext("k"),
+        ))
+        list(func.process_element(
+            {"candidate_id": "c2", "score": 0.8, "event_time_ms": 50},
+            _FakeContext("k"),
+        ))
+        results = list(func.process_element(
+            {"candidate_id": "c3", "score": 0.7, "event_time_ms": 200},
+            _FakeContext("k"),
+        ))
+        assert len(results) == 1
+        assert results[0]["top_ids"] == ["c3"]
+        assert set(func._candidates.keys()) == {"c3"}
+
 
 # ============================================================================
 # SemanticSpec & RuntimeConfig Tests
@@ -1009,6 +1262,21 @@ class TestTriggerPolicy:
         assert restored.idle_ms == 500
         assert restored.count_threshold == 10
         assert restored.emit_intermediate is False
+
+    def test_periodic_requires_interval(self):
+        import pytest
+        with pytest.raises(ValueError, match="interval_ms"):
+            TriggerPolicy(mode="periodic")
+
+    def test_idle_flush_requires_idle_ms(self):
+        import pytest
+        with pytest.raises(ValueError, match="idle_ms"):
+            TriggerPolicy(mode="idle_flush")
+
+    def test_count_threshold_requires_positive_threshold(self):
+        import pytest
+        with pytest.raises(ValueError, match="count_threshold"):
+            TriggerPolicy(mode="count_threshold", count_threshold=0)
 
 
 class TestGroupbyQuerySpec:

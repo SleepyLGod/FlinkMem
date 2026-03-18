@@ -193,12 +193,20 @@ class TopKScopePolicy:
     window_size_ms : int or None
         Window size in milliseconds (only meaningful when ``window_kind``
         is set).
+    session_gap_ms : int or None
+        Idle-gap boundary for operator-owned session scopes.  Only meaningful
+        when ``window_kind="session"``.
+    boundary_flag : str
+        Semantic boundary flag name used by operator-owned semantic scopes.
+        Only meaningful when ``window_kind="semantic"``.
     """
 
     ttl_seconds: Optional[int] = None
     max_candidates: Optional[int] = None
     window_kind: Optional[str] = None
     window_size_ms: Optional[int] = None
+    session_gap_ms: Optional[int] = None
+    boundary_flag: str = "topic_shift"
 
     def __post_init__(self):
         if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
@@ -206,6 +214,10 @@ class TopKScopePolicy:
                 f"Invalid window_kind={self.window_kind!r}. "
                 f"Must be one of {VALID_WINDOW_KINDS}."
             )
+        if self.window_kind == "session" and self.session_gap_ms is not None and self.session_gap_ms <= 0:
+            raise ValueError("session_gap_ms must be > 0 when provided")
+        if self.window_kind == "semantic" and not self.boundary_flag:
+            raise ValueError("boundary_flag must be non-empty for semantic scopes")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -213,6 +225,8 @@ class TopKScopePolicy:
             "max_candidates": self.max_candidates,
             "window_kind": self.window_kind,
             "window_size_ms": self.window_size_ms,
+            "session_gap_ms": self.session_gap_ms,
+            "boundary_flag": self.boundary_flag,
         }
 
     @classmethod
@@ -240,6 +254,7 @@ VALID_TRIGGER_MODES = {
     "idle_flush",
     "count_threshold",
 }
+VALID_TOPK_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
 
 
 @dataclass
@@ -263,6 +278,17 @@ class TriggerPolicy:
                 f"Invalid trigger mode={self.mode!r}. "
                 f"Must be one of {VALID_TRIGGER_MODES}."
             )
+        if self.mode == "periodic":
+            if self.interval_ms is None or int(self.interval_ms) <= 0:
+                raise ValueError("interval_ms must be > 0 when mode='periodic'")
+        if self.mode == "idle_flush":
+            if self.idle_ms is None or int(self.idle_ms) <= 0:
+                raise ValueError("idle_ms must be > 0 when mode='idle_flush'")
+        if self.mode == "count_threshold":
+            if self.count_threshold is None or int(self.count_threshold) <= 0:
+                raise ValueError(
+                    "count_threshold must be > 0 when mode='count_threshold'"
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -307,6 +333,11 @@ class TopKQuerySpec:
         backend to score each candidate independently.  ``"pairwise"`` and
         ``"listwise"`` are contextual reranking strategies evaluated on
         bounded candidate pools (Phase C).
+    execution_path : str
+        Execution path selector. ``"window_owned"`` expects bounded pools or
+        window-bounded snapshots. ``"operator_owned"`` expects continuous flat
+        candidate updates. ``"auto"`` chooses the most suitable path for the
+        currently supported semantics.
     trigger_policy : TriggerPolicy
         Defines when the current active candidate set is ranked/refreshed.
     scope_policy : TopKScopePolicy
@@ -318,6 +349,7 @@ class TopKQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     ranking_method: str = "pointwise"
+    execution_path: str = "auto"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: TopKScopePolicy = field(default_factory=TopKScopePolicy)
 
@@ -326,6 +358,11 @@ class TopKQuerySpec:
             raise ValueError(
                 f"Invalid ranking_method={self.ranking_method!r}. "
                 f"Must be one of {VALID_RANKING_METHODS}."
+            )
+        if self.execution_path not in VALID_TOPK_EXECUTION_PATHS:
+            raise ValueError(
+                f"Invalid execution_path={self.execution_path!r}. "
+                f"Must be one of {VALID_TOPK_EXECUTION_PATHS}."
             )
         if self.k < 1:
             raise ValueError(f"k must be >= 1, got {self.k}")
@@ -341,6 +378,7 @@ class TopKQuerySpec:
         backend: str = "external_score",
         ttl_seconds: Optional[int] = None,
         max_candidates: Optional[int] = None,
+        execution_path: str = "auto",
     ) -> "TopKQuerySpec":
         """Quick builder for the common case.
 
@@ -357,6 +395,7 @@ class TopKQuerySpec:
         return cls(
             semantic=SemanticSpec.for_sem_topk(instruction, scorer_backend=backend),
             k=k,
+            execution_path=execution_path,
             trigger_policy=TriggerPolicy(),
             scope_policy=TopKScopePolicy(
                 ttl_seconds=ttl_seconds,
@@ -373,6 +412,7 @@ class TopKQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "ranking_method": self.ranking_method,
+            "execution_path": self.execution_path,
             "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
@@ -385,6 +425,7 @@ class TopKQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             ranking_method=d.get("ranking_method", "pointwise"),
+            execution_path=d.get("execution_path", "auto"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=TopKScopePolicy.from_dict(d.get("scope_policy", {})),
         )

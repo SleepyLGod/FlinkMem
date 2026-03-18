@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pyflink.common import Types
@@ -54,7 +55,8 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec, TriggerPolicy
+from pyflink.semantic_runtime.stateful.event_model import retrieve_to_topk_items
 from pyflink.semantic_runtime.stateful.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,
@@ -62,12 +64,154 @@ from pyflink.semantic_runtime.stateful.simple_text_encoder import (
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
     SemTopKConfig,
     SemTopKFunction,
+    SemTopKScopeSnapshotFunction,
 )
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_CANDIDATE_TEXT_FIELDS: tuple[str, ...] = ("text", "payload", "content")
+
+VALID_CONTEXTUAL_MERGE_STRATEGIES = {"tournament", "global_rank"}
+VALID_CONTEXTUAL_CLOSE_SURROGATES = {
+    "none",
+    "natural_close",
+    "periodic_snapshot",
+    "idle_flush",
+    "count_threshold_snapshot",
+    "epoch_close",
+}
+
+
+@dataclass(frozen=True)
+class TopKContextualPlan:
+    """Internal execution plan for contextual top-k reranking.
+
+    This is intentionally not part of the public API. It captures execution
+    details that may later be chosen by a planner/CBO:
+    - `context_chunk_size`: per-call candidate context size
+    - `merge_strategy`: how local rankings are merged
+    - `close_surrogate`: how operator-owned scopes without a natural close are
+      snapshot-triggered for contextual rerank
+    """
+
+    context_chunk_size: Optional[int]
+    merge_strategy: str
+    close_surrogate: str = "none"
+    epoch_ms: Optional[int] = None
+
+    def __post_init__(self):
+        if self.merge_strategy not in VALID_CONTEXTUAL_MERGE_STRATEGIES:
+            raise ValueError(
+                f"Invalid merge_strategy={self.merge_strategy!r}. "
+                f"Must be one of {VALID_CONTEXTUAL_MERGE_STRATEGIES}."
+            )
+        if self.close_surrogate not in VALID_CONTEXTUAL_CLOSE_SURROGATES:
+            raise ValueError(
+                f"Invalid close_surrogate={self.close_surrogate!r}. "
+                f"Must be one of {VALID_CONTEXTUAL_CLOSE_SURROGATES}."
+            )
+        if self.close_surrogate == "epoch_close":
+            if self.epoch_ms is None or int(self.epoch_ms) <= 0:
+                raise ValueError("epoch_ms must be > 0 when close_surrogate='epoch_close'")
+
+
+def derive_topk_contextual_plan(
+    query_spec: TopKQuerySpec,
+    topk_config: SemTopKConfig,
+) -> TopKContextualPlan:
+    """Derive the internal contextual rerank plan.
+
+    Public semantics stay in `TopKQuerySpec`; this plan only captures execution
+    details and close-surrogate choices.
+    """
+    method = query_spec.ranking_method
+    if method == "pairwise":
+        chunk_size = 2
+        merge_strategy = "tournament"
+    elif method == "listwise":
+        chunk_size = None
+        merge_strategy = "global_rank"
+    else:
+        raise ValueError("TopKContextualPlan applies only to pairwise/listwise methods")
+
+    trigger = query_spec.trigger_policy.mode
+    scope = query_spec.scope_policy
+    surrogate = "none"
+    epoch_ms: Optional[int] = None
+
+    if trigger == "on_scope_close":
+        if scope.window_kind in {"session", "tumbling", "semantic"}:
+            surrogate = "natural_close"
+        elif scope.window_kind == "sliding" and scope.window_size_ms and scope.window_size_ms > 0:
+            surrogate = "epoch_close"
+            epoch_ms = int(scope.window_size_ms)
+        elif scope.ttl_seconds:
+            surrogate = "periodic_snapshot"
+        else:
+            surrogate = "idle_flush"
+    elif trigger == "periodic":
+        surrogate = "periodic_snapshot"
+    elif trigger == "idle_flush":
+        surrogate = "idle_flush"
+    elif trigger == "count_threshold":
+        surrogate = "count_threshold_snapshot"
+
+    return TopKContextualPlan(
+        context_chunk_size=chunk_size,
+        merge_strategy=merge_strategy,
+        close_surrogate=surrogate,
+        epoch_ms=epoch_ms,
+    )
+
+
+def build_contextual_snapshot_query_spec(
+    query_spec: TopKQuerySpec,
+    topk_config: SemTopKConfig,
+    plan: TopKContextualPlan,
+) -> TopKQuerySpec:
+    """Map contextual close surrogates to an executable operator-owned trigger."""
+    trigger = query_spec.trigger_policy
+    if plan.close_surrogate in {"none", "natural_close"}:
+        return query_spec
+    if plan.close_surrogate == "epoch_close":
+        eff_trigger = TriggerPolicy(
+            mode="periodic",
+            interval_ms=int(plan.epoch_ms or topk_config.recompute_interval_ms or 1),
+            emit_intermediate=trigger.emit_intermediate,
+            emit_final_on_scope_close=trigger.emit_final_on_scope_close,
+        )
+        return replace(query_spec, trigger_policy=eff_trigger)
+    if plan.close_surrogate == "periodic_snapshot":
+        interval_ms = topk_config.recompute_interval_ms
+        if interval_ms <= 0:
+            interval_ms = int((query_spec.scope_policy.ttl_seconds or 1) * 1000)
+        eff_trigger = TriggerPolicy(
+            mode="periodic",
+            interval_ms=max(1, int(interval_ms)),
+            emit_intermediate=trigger.emit_intermediate,
+            emit_final_on_scope_close=trigger.emit_final_on_scope_close,
+        )
+        return replace(query_spec, trigger_policy=eff_trigger)
+    if plan.close_surrogate == "idle_flush":
+        idle_ms = trigger.idle_ms or topk_config.recompute_interval_ms or 1000
+        eff_trigger = TriggerPolicy(
+            mode="idle_flush",
+            idle_ms=max(1, int(idle_ms)),
+            emit_intermediate=trigger.emit_intermediate,
+            emit_final_on_scope_close=trigger.emit_final_on_scope_close,
+        )
+        return replace(query_spec, trigger_policy=eff_trigger)
+    if plan.close_surrogate == "count_threshold_snapshot":
+        count_threshold = trigger.count_threshold or max(1, query_spec.k)
+        eff_trigger = TriggerPolicy(
+            mode="count_threshold",
+            count_threshold=max(1, int(count_threshold)),
+            emit_intermediate=trigger.emit_intermediate,
+            emit_final_on_scope_close=trigger.emit_final_on_scope_close,
+        )
+        return replace(query_spec, trigger_policy=eff_trigger)
+    return query_spec
 
 
 def is_topk_candidate_record(value: Any) -> bool:
@@ -168,6 +312,15 @@ def build_topk_passthrough_record(
         "error": error,
         "timestamp_ms": int(time.time() * 1000),
     }
+
+
+def _mark_incompatible_execution_path(
+    value: Dict[str, Any],
+    *,
+    source: str,
+    error: str,
+) -> Dict[str, Any]:
+    return build_topk_passthrough_record(value, source=source, error=error)
 
 
 def lexical_similarity(query_text: str, candidate_text: str) -> float:
@@ -297,6 +450,47 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
                 )
             ]
         return out
+
+    def _build_snapshot(
+        self,
+        original_value: Dict[str, Any],
+        ranked: List[Tuple[Dict[str, Any], float]],
+        *,
+        source: str,
+        emission_policy: str,
+    ) -> List[Dict[str, Any]]:
+        now_ms = int(time.time() * 1000)
+        scored_rows = []
+        for candidate, score in ranked:
+            scored_rows.append(
+                build_scored_topk_candidate(
+                    candidate,
+                    score=float(score),
+                    query_spec=self._query_spec,
+                    score_field=self._score_field,
+                    source=source,
+                )
+            )
+        top_rows = scored_rows[: self._query_spec.k]
+        return [
+            {
+                "key": original_value.get("key", ""),
+                "topk": top_rows,
+                "top_items": top_rows,
+                "top_ids": [row.get("candidate_id", "") for row in top_rows],
+                "query": original_value.get("query", ""),
+                "query_seq_id": int(original_value.get("query_seq_id", 0)),
+                "source": source,
+                "total_candidates": len(scored_rows),
+                "stale_candidates": 0,
+                "version": 1,
+                "changed": True,
+                "emission_policy": emission_policy,
+                "degraded": bool(original_value.get("degraded", False)),
+                "error": str(original_value.get("error", "")),
+                "timestamp_ms": now_ms,
+            }
+        ]
 
 
 class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
@@ -655,6 +849,225 @@ class _BoundedPoolExternalScoreRerankerWorker(_BaseBoundedPoolRerankerWorker):
         )
 
 
+class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
+    """Window-owned bounded-pool scorer/reranker that emits one final top-k snapshot."""
+
+    def __init__(
+        self,
+        query_spec: TopKQuerySpec,
+        llm_config: LLMClientConfig,
+        score_field: str = "score",
+        candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+    ) -> None:
+        super().__init__(query_spec, score_field, candidate_text_fields)
+        self._llm_config = llm_config
+        self._client = None
+
+    def open(self, runtime_context: RuntimeContext) -> None:
+        self._client = create_llm_client(self._llm_config)
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def _candidate_text(self, value: Dict[str, Any]) -> str:
+        return extract_topk_candidate_text(value, self._candidate_text_fields)
+
+    async def _ensure_client(self):
+        if self._client is None:
+            self._client = create_llm_client(self._llm_config)
+
+    async def _rank_pointwise(self, value: Dict[str, Any]) -> List[Tuple[Dict[str, Any], float]]:
+        query_text = self._query_text(value)
+        ranked: List[Tuple[Dict[str, Any], float]] = []
+        for cand in self._extract_pool(value):
+            candidate_text = self._candidate_text(cand)
+            if self._llm_config.backend == "mock":
+                score = lexical_similarity(query_text, candidate_text)
+            else:
+                await self._ensure_client()
+                assert self._client is not None
+                prompt = (
+                    "You are scoring one candidate for a continuous semantic top-k query.\n"
+                    "Return JSON only with key score and a float in [0, 1].\n"
+                    f"Criterion: {self._query_spec.semantic.instruction or 'Score candidate relevance.'}\n"
+                    f"Query: {query_text}\n"
+                    f"Candidate: {candidate_text}\n"
+                )
+                text, _ = await self._client.call(prompt)
+                parsed = _PointwiseLLMScorerWorker._parse_json_object(text)
+                score = float(parsed.get("score", 0.0))
+            ranked.append((cand, max(0.0, min(1.0, score))))
+        return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+    async def _rank_contextual(self, value: Dict[str, Any]) -> List[Tuple[Dict[str, Any], float]]:
+        query_text = self._query_text(value)
+        pool = self._extract_pool(value)
+        scored = [(cand, lexical_similarity(query_text, self._candidate_text(cand))) for cand in pool]
+        if self._llm_config.backend != "mock":
+            await self._ensure_client()
+            assert self._client is not None
+            lines = [f"- {cand['candidate_id']}: {self._candidate_text(cand)}" for cand in pool]
+            prompt = (
+                "You are reranking a bounded candidate pool for a continuous semantic top-k query.\n"
+                "Return JSON only with key ranked_candidate_ids and a ranked list of candidate ids.\n"
+                f"Method: {self._query_spec.ranking_method}\n"
+                f"Criterion: {self._query_spec.semantic.instruction or 'Rerank bounded candidate pool.'}\n"
+                f"Query: {query_text}\n"
+                "Candidates:\n" + "\n".join(lines)
+            )
+            text, _ = await self._client.call(prompt)
+            parsed = json.loads(text)
+            ranked_ids = parsed.get("ranked_candidate_ids", []) if isinstance(parsed, dict) else []
+            scored_map = {cand["candidate_id"]: (cand, score) for cand, score in scored}
+            ranked = [scored_map.pop(cid) for cid in ranked_ids if cid in scored_map]
+            ranked.extend(scored_map.values())
+            return ranked
+        if self._query_spec.ranking_method == "pairwise":
+            return _pairwise_rank(scored)
+        return sorted(scored, key=lambda item: item[1], reverse=True)
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            return [value]
+        try:
+            if self._query_spec.ranking_method == "pointwise":
+                ranked = await self._rank_pointwise(value)
+            else:
+                ranked = await self._rank_contextual(value)
+                if self._query_spec.semantic.backend == "llm":
+                    total = len(ranked)
+                    ranked = [
+                        (candidate, _position_score(idx, total))
+                        for idx, (candidate, _) in enumerate(ranked)
+                    ]
+            if not ranked:
+                return [value]
+            return self._build_snapshot(
+                value,
+                ranked,
+                source=f"topk_llm_{self._query_spec.ranking_method}",
+                emission_policy="scope_close_final",
+            )
+        except Exception as exc:
+            return [
+                build_topk_passthrough_record(
+                    value,
+                    source=f"topk_llm_{self._query_spec.ranking_method}",
+                    error=f"topk_llm_{self._query_spec.ranking_method}_error: {exc}",
+                )
+            ]
+
+    def timeout(self, value):
+        return [
+            build_topk_passthrough_record(
+                value,
+                source=f"topk_llm_{self._query_spec.ranking_method}",
+                error=f"topk_llm_{self._query_spec.ranking_method}_timeout",
+            )
+        ]
+
+
+class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
+    """Window-owned bounded-pool embedding scorer/reranker with final-only emission."""
+
+    def __init__(
+        self,
+        query_spec: TopKQuerySpec,
+        embedding_config: Optional[EmbeddingBackendConfig] = None,
+        score_field: str = "score",
+        candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+    ) -> None:
+        super().__init__(query_spec, score_field, candidate_text_fields)
+        self._embedding_config = embedding_config or EmbeddingBackendConfig()
+        dim = int(self._embedding_config.dimensions or 128)
+        self._encoder = HashingTextEncoder(dim=max(dim, 1))
+
+    def _candidate_text(self, value: Dict[str, Any]) -> str:
+        return extract_topk_candidate_text(value, self._candidate_text_fields)
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            return [value]
+
+        backend = self._embedding_config.backend or "mock"
+        if backend not in {"mock", "local_lexical", "local_hashing"}:
+            return [
+                build_topk_passthrough_record(
+                    value,
+                    source=f"topk_embedding_{self._query_spec.ranking_method}",
+                    error=f"topk_embedding_backend_not_implemented: {backend}",
+                )
+            ]
+
+        query_text = self._query_text(value)
+        scored: List[Tuple[Dict[str, Any], float]] = []
+        for cand in self._extract_pool(value):
+            candidate_text = self._candidate_text(cand)
+            if backend == "mock":
+                score = lexical_similarity(query_text, candidate_text)
+            else:
+                score = self._encoder.similarity(query_text, candidate_text)
+            scored.append((cand, score))
+
+        if self._query_spec.ranking_method == "pairwise":
+            ranked = _pairwise_rank(scored)
+        else:
+            ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        await asyncio.sleep(0)
+        if not ranked:
+            return [value]
+        return self._build_snapshot(
+            value,
+            ranked,
+            source=f"topk_embedding_{self._query_spec.ranking_method}",
+            emission_policy="scope_close_final",
+        )
+
+    def timeout(self, value):
+        return [
+            build_topk_passthrough_record(
+                value,
+                source=f"topk_embedding_{self._query_spec.ranking_method}",
+                error=f"topk_embedding_{self._query_spec.ranking_method}_timeout",
+            )
+        ]
+
+
+class _BoundedPoolExternalTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
+    """Window-owned bounded-pool external-score executor with final-only emission."""
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            return [value]
+        scored = []
+        for cand in self._extract_pool(value):
+            if self._score_field not in cand or cand[self._score_field] is None:
+                return [
+                    build_topk_passthrough_record(
+                        value,
+                        source=f"topk_external_{self._query_spec.ranking_method}",
+                        error=f"topk_missing_external_score:{self._score_field}",
+                    )
+                ]
+            scored.append((cand, float(cand[self._score_field])))
+
+        if self._query_spec.ranking_method == "pairwise":
+            ranked = _pairwise_rank(scored)
+        else:
+            ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        await asyncio.sleep(0)
+        if not ranked:
+            return [value]
+        return self._build_snapshot(
+            value,
+            ranked,
+            source=f"topk_external_{self._query_spec.ranking_method}",
+            emission_policy="scope_close_final",
+        )
+
+
 def _mark_missing_external_score(value: Dict[str, Any], score_field: str) -> Dict[str, Any]:
     return build_topk_passthrough_record(
         value,
@@ -698,57 +1111,216 @@ def build_sem_topk_pipeline(
     """
     score_field = topk_config.score_field
     backend = query_spec.semantic.backend
+    execution_path = query_spec.execution_path
+    trigger_mode = query_spec.trigger_policy.mode
+    supported_scope_close_kinds = {"session", "tumbling", "semantic"}
 
-    if query_spec.ranking_method in {"pairwise", "listwise"}:
-        pools = input_ds.filter(
-            lambda v: is_topk_candidate_pool(v),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
-        passthrough = input_ds.filter(
-            lambda v: not is_topk_candidate_pool(v),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
+    if trigger_mode not in {"on_event", "on_scope_close", "periodic", "idle_flush", "count_threshold"}:
+        raise ValueError(
+            "sem_topk currently supports only trigger_policy.mode in "
+            "{'on_event', 'on_scope_close', 'periodic', 'idle_flush', 'count_threshold'}"
         )
 
+    if execution_path == "operator_owned" and trigger_mode not in {"on_event", "periodic", "idle_flush", "count_threshold", "on_scope_close"}:
+        raise ValueError(
+            "sem_topk execution_path='operator_owned' currently supports only "
+            "trigger_policy.mode in {'on_event', 'periodic', 'idle_flush', 'count_threshold', 'on_scope_close'}"
+        )
+    if execution_path == "window_owned" and trigger_mode in {"periodic", "idle_flush", "count_threshold"}:
+        raise ValueError(
+            "sem_topk execution_path='window_owned' does not support "
+            f"trigger_policy.mode={trigger_mode!r} yet"
+        )
+    pools = input_ds.filter(
+        lambda v: is_topk_candidate_pool(v),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    nonempty_pools = pools.filter(
+        lambda v: len(v.get("candidates", [])) > 0,
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    empty_pools = pools.filter(
+        lambda v: len(v.get("candidates", [])) == 0,
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    flat_candidates = input_ds.filter(
+        lambda v: is_topk_candidate_record(v),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    passthrough = input_ds.filter(
+        lambda v: not is_topk_candidate_pool(v) and not is_topk_candidate_record(v),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+
+    def _make_final_pool_worker():
         if backend == "llm":
             if llm_config is None:
                 raise ValueError("llm_config is required for sem_topk backend='llm'")
-            reranker_fn = _BoundedPoolLLMRerankerWorker(query_spec, llm_config, score_field)
-        elif backend == "embedding":
-            reranker_fn = _BoundedPoolEmbeddingRerankerWorker(query_spec, embedding_config, score_field)
-        elif backend == "external_score":
-            reranker_fn = _BoundedPoolExternalScoreRerankerWorker(query_spec, score_field)
-        else:
+            return _BoundedPoolLLMTopKSnapshotWorker(query_spec, llm_config, score_field)
+        if backend == "embedding":
+            return _BoundedPoolEmbeddingTopKSnapshotWorker(query_spec, embedding_config, score_field)
+        if backend == "external_score":
+            return _BoundedPoolExternalTopKSnapshotWorker(query_spec, score_field)
+        raise ValueError(f"Unsupported sem_topk backend: {backend!r}")
+
+    scope_close_pool_results = None
+
+    if execution_path == "window_owned" and trigger_mode == "on_scope_close":
+        final_worker = _make_final_pool_worker()
+        final_results = AsyncDataStream.unordered_wait(
+            nonempty_pools, final_worker, async_timeout_ms, async_capacity,
+        )
+        incompatible_flat = flat_candidates.map(
+            lambda v: _mark_incompatible_execution_path(
+                v,
+                source="topk_scope_close",
+                error="topk_scope_close_requires_bounded_pool",
+            ),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+        return final_results.union(passthrough.union(empty_pools).union(incompatible_flat))
+
+    operator_pools = pools
+    if execution_path == "auto" and trigger_mode == "on_scope_close":
+        final_worker = _make_final_pool_worker()
+        scope_close_pool_results = AsyncDataStream.unordered_wait(
+            nonempty_pools, final_worker, async_timeout_ms, async_capacity,
+        )
+        passthrough = passthrough.union(empty_pools)
+        operator_pools = empty_pools.filter(
+            lambda v: False,
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+        if query_spec.ranking_method == "pointwise":
+            execution_path = "operator_owned"
+
+    if execution_path == "auto" and trigger_mode in {"periodic", "idle_flush", "count_threshold"}:
+        execution_path = "operator_owned"
+
+    if query_spec.ranking_method in {"pairwise", "listwise"}:
+        contextual_plan = derive_topk_contextual_plan(query_spec, topk_config)
+
+        def _make_contextual_snapshot_worker():
+            if backend == "llm":
+                if llm_config is None:
+                    raise ValueError("llm_config is required for sem_topk backend='llm'")
+                return _BoundedPoolLLMTopKSnapshotWorker(query_spec, llm_config, score_field)
+            if backend == "embedding":
+                return _BoundedPoolEmbeddingTopKSnapshotWorker(query_spec, embedding_config, score_field)
+            if backend == "external_score":
+                return _BoundedPoolExternalTopKSnapshotWorker(query_spec, score_field)
             raise ValueError(f"Unsupported sem_topk backend: {backend!r}")
 
+        snapshot_worker = _make_contextual_snapshot_worker()
+
+        if execution_path == "operator_owned":
+            snapshot_query_spec = build_contextual_snapshot_query_spec(
+                query_spec, topk_config, contextual_plan
+            )
+            incompatible_pools = operator_pools.map(
+                lambda v: _mark_incompatible_execution_path(
+                    v,
+                    source=f"topk_{query_spec.ranking_method}",
+                    error="topk_operator_owned_contextual_requires_flat_candidates",
+                ),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            pool_emitter = flat_candidates.key_by(key_selector).process(
+                SemTopKScopeSnapshotFunction(topk_config, snapshot_query_spec),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            final_results = AsyncDataStream.unordered_wait(
+                pool_emitter, snapshot_worker, async_timeout_ms, async_capacity,
+            )
+            return final_results.union(passthrough.union(incompatible_pools))
+
+        if execution_path == "auto":
+            if scope_close_pool_results is not None:
+                pool_results = empty_pools.filter(
+                    lambda v: False,
+                    output_type=Types.PICKLED_BYTE_ARRAY(),
+                )
+            else:
+                pool_results = AsyncDataStream.unordered_wait(
+                    nonempty_pools, snapshot_worker, async_timeout_ms, async_capacity,
+                )
+            snapshot_query_spec = build_contextual_snapshot_query_spec(
+                query_spec, topk_config, contextual_plan
+            )
+            pool_emitter = flat_candidates.key_by(key_selector).process(
+                SemTopKScopeSnapshotFunction(topk_config, snapshot_query_spec),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            flat_results = AsyncDataStream.unordered_wait(
+                pool_emitter, snapshot_worker, async_timeout_ms, async_capacity,
+            )
+            pass_total = passthrough if trigger_mode == "on_scope_close" else passthrough.union(empty_pools)
+            return pool_results.union(flat_results).union(pass_total)
+
         reranked_or_passthrough = AsyncDataStream.unordered_wait(
-            pools, reranker_fn, async_timeout_ms, async_capacity,
+            nonempty_pools, snapshot_worker, async_timeout_ms, async_capacity,
         )
-        scored_ready = reranked_or_passthrough.filter(
-            lambda v: is_topk_candidate_record(v) and topk_candidate_has_score(v, score_field),
+        incompatible_flat = flat_candidates.map(
+            lambda v: _mark_incompatible_execution_path(
+                v,
+                source=f"topk_{query_spec.ranking_method}",
+                error="topk_contextual_requires_bounded_pool",
+            ),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
-        async_passthrough = reranked_or_passthrough.filter(
-            lambda v: not (is_topk_candidate_record(v) and topk_candidate_has_score(v, score_field)),
+        passthrough_total = passthrough.union(empty_pools).union(reranked_or_passthrough.filter(
+            lambda v: not ("top_ids" in v),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )).union(incompatible_flat)
+        contextual_results = reranked_or_passthrough.filter(
+            lambda v: "top_ids" in v,
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
-        passthrough_total = passthrough.union(async_passthrough)
-        kernel_input = scored_ready
+        if scope_close_pool_results is not None:
+            contextual_results = contextual_results.union(scope_close_pool_results)
+        return contextual_results.union(passthrough_total)
     else:
-        candidates = input_ds.filter(
-            lambda v: is_topk_candidate_record(v),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
-        passthrough = input_ds.filter(
-            lambda v: not is_topk_candidate_record(v),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
+        if (
+            execution_path == "operator_owned"
+            and trigger_mode == "on_scope_close"
+            and query_spec.scope_policy.window_kind not in supported_scope_close_kinds
+        ):
+            raise ValueError(
+                "sem_topk execution_path='operator_owned' with trigger_policy.mode='on_scope_close' "
+                "requires scope_policy.window_kind in {'session', 'tumbling', 'semantic'} for pointwise top-k"
+            )
+        if execution_path == "operator_owned":
+            candidate_stream = flat_candidates
+            incompatible_pools = operator_pools.map(
+                lambda v: _mark_incompatible_execution_path(
+                    v,
+                    source="topk_pointwise",
+                    error="topk_operator_owned_requires_flat_candidates",
+                ),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            passthrough = passthrough.union(incompatible_pools)
+        elif execution_path == "window_owned":
+            expanded_from_pools = nonempty_pools.flat_map(
+                lambda v: retrieve_to_topk_items(v),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            candidate_stream = flat_candidates.union(expanded_from_pools)
+            passthrough = passthrough.union(empty_pools)
+        else:  # auto
+            expanded_from_pools = nonempty_pools.flat_map(
+                lambda v: retrieve_to_topk_items(v),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            candidate_stream = flat_candidates.union(expanded_from_pools)
+            passthrough = passthrough.union(empty_pools)
 
         if backend == "external_score":
-            ready = candidates.filter(
+            ready = candidate_stream.filter(
                 lambda v: topk_candidate_has_score(v, score_field),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             )
-            missing = candidates.filter(
+            missing = candidate_stream.filter(
                 lambda v: not topk_candidate_has_score(v, score_field),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             ).map(
@@ -758,11 +1330,11 @@ def build_sem_topk_pipeline(
             passthrough_total = passthrough.union(missing)
             kernel_input = ready
         else:
-            ready = candidates.filter(
+            ready = candidate_stream.filter(
                 lambda v: not topk_candidate_needs_scoring(v, query_spec, score_field),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             )
-            to_score = candidates.filter(
+            to_score = candidate_stream.filter(
                 lambda v: topk_candidate_needs_scoring(v, query_spec, score_field),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             )
@@ -795,4 +1367,7 @@ def build_sem_topk_pipeline(
         SemTopKFunction(topk_config, query_spec),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
-    return reranked.union(passthrough_total)
+    out = reranked.union(passthrough_total)
+    if scope_close_pool_results is not None:
+        out = out.union(scope_close_pool_results)
+    return out
