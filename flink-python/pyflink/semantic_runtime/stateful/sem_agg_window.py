@@ -1,0 +1,118 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Window-owned bounded aggregation for ``sem_agg``."""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional
+
+from pyflink.datastream.functions import KeyedProcessFunction
+
+from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
+from pyflink.semantic_runtime.stateful.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
+from pyflink.semantic_runtime.stateful.event_model import (
+    SemanticEvent,
+    is_window_snapshot,
+    window_snapshot_to_semantic_events,
+)
+from pyflink.semantic_runtime.stateful.sem_agg_stateful import (
+    SemAggConfig,
+    resolve_agg_runtime_params,
+)
+
+
+class WindowOwnedSemAggFunction(KeyedProcessFunction):
+    """Bounded/window-owned runtime for ``sem_agg``.
+
+    The input must already be one closed or early-fired ``WindowSnapshot``.
+    No cross-scope aggregate state is preserved.
+    """
+
+    def __init__(
+        self,
+        config: Optional[SemAggConfig] = None,
+        query_spec: Optional[AggQuerySpec] = None,
+    ) -> None:
+        self._config = config or SemAggConfig()
+        self._query_spec = query_spec
+        (
+            self._resolved_mode,
+            self._resolved_ttl_seconds,
+            self._resolved_max_buffer_events,
+            self._resolved_flush_interval_ms,
+        ) = resolve_agg_runtime_params(self._config, self._query_spec)
+
+    def process_element(self, value, ctx: "KeyedProcessFunction.Context"):
+        if not isinstance(value, dict):
+            return
+        if not is_window_snapshot(value):
+            return
+
+        raw_events = list(window_snapshot_to_semantic_events(value))
+        if not raw_events:
+            return
+        events = [SemanticEvent.from_dict(e) for e in raw_events]
+        now_ms = int(time.time() * 1000)
+
+        if self._resolved_mode == "algebraic":
+            aggregate = self._aggregate_algebraic(raw_events)
+            yield {
+                "key": str(value.get("key", str(ctx.get_current_key()))),
+                "aggregate": aggregate,
+                "version": 1,
+                "mode": "algebraic_window",
+                "event_count": len(events),
+                "timestamp_ms": now_ms,
+            }
+            return
+
+        bounded_events = raw_events
+        if self._resolved_mode == "compressive":
+            bounded_events = self._compress_events(bounded_events)
+        yield ASYNC_WORK_TAG, AsyncWorkItem(
+            key=str(value.get("key", str(ctx.get_current_key()))),
+            task_type="summarize",
+            payload={
+                "events": bounded_events,
+                "event_count": len(bounded_events),
+                "current_version": 0,
+                "agg_method": self._resolved_mode,
+                "scope_kind": "window_snapshot",
+            },
+        ).to_dict()
+
+    def _aggregate_algebraic(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+        reduce_fn = self._config.reduce_fn
+        if not events:
+            return {}
+        current = events[0]
+        if reduce_fn is None:
+            return current
+        for event in events[1:]:
+            try:
+                current = reduce_fn(current, event)
+            except Exception:
+                current = event
+        return current
+
+    def _compress_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if len(events) <= 2:
+            return events
+        keep = max(1, min(len(events), self._resolved_max_buffer_events // 2))
+        return events[-keep:]

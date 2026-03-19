@@ -43,13 +43,20 @@ from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
 )
 from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig, CtsRetrieveFunction
 from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig, SemAggFunction
+from pyflink.semantic_runtime.stateful.sem_agg_pipeline import build_sem_agg_operator
 from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig, SemGroupbyFunction
 from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig, SemTopKFunction
 from pyflink.semantic_runtime.stateful.external_search_backend import (
     MockSearchBackend,
     SearchBackendAsyncFn,
 )
-from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec, TopKQuerySpec, TriggerPolicy
+from pyflink.semantic_runtime.semantic_spec import (
+    AggScopePolicy,
+    AggQuerySpec,
+    GroupbyQuerySpec,
+    TopKQuerySpec,
+    TriggerPolicy,
+)
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
     _BoundedPoolExternalScoreRerankerWorker,
 )
@@ -195,6 +202,8 @@ class _DeterministicSummarizeAsyncFn(AsyncFunction):
                     "summary": summary,
                     "version": int(payload.get("current_version", 0)) + 1,
                     "event_count": len(events),
+                    "scope_epoch": int(payload.get("scope_epoch", 0)),
+                    "scope_close_pending": bool(payload.get("scope_close_pending", False)),
                 },
             ).to_dict()
         ]
@@ -398,6 +407,8 @@ class _RealSummarizeAsyncFn(_JsonLLMAsyncFn):
                         "summary": str(parsed.get("summary", "")),
                         "version": int(payload.get("current_version", 0)) + 1,
                         "event_count": len(events),
+                        "scope_epoch": int(payload.get("scope_epoch", 0)),
+                        "scope_close_pending": bool(payload.get("scope_close_pending", False)),
                     },
                 ).to_dict()
             ]
@@ -663,6 +674,7 @@ def _run_memory_path(
     summarize_async_fn: Optional[AsyncFunction],
     *,
     groupby_query_spec: Optional[GroupbyQuerySpec] = None,
+    agg_query_spec: Optional[AggQuerySpec] = None,
 ) -> List[Dict[str, Any]]:
     key = "user_001"
     window_cfg, groupby_cfg, _, _, _ = _build_configs()
@@ -676,7 +688,12 @@ def _run_memory_path(
     sem_groupby._group_profiles = _FakeMapState()
     sem_groupby._meta = _FakeValueState(None)
 
-    sem_agg = SemAggFunction(agg_cfg)
+    sem_agg = build_sem_agg_operator(
+        agg_cfg,
+        agg_query_spec,
+        input_kind="event_stream",
+    )
+    assert isinstance(sem_agg, SemAggFunction)
     sem_agg._buffer = _FakeListState()
     sem_agg._agg_value = _FakeValueState(None)
     sem_agg._meta = _FakeValueState(None)
@@ -1192,6 +1209,46 @@ def test_v02_workflow_groupby_llm_refine_window_owned_scope_close():
     assert memory_rows
     assert any("project" in str(row.get("aggregate", "")).lower() for row in memory_rows)
     assert any("travel" in str(row.get("aggregate", "")).lower() for row in memory_rows)
+
+
+def test_v02_workflow_agg_query_spec_count_threshold():
+    events = _build_use_case_events()
+    agg_qs = AggQuerySpec(
+        agg_method="summarize",
+        trigger_policy=TriggerPolicy(mode="count_threshold", count_threshold=2),
+    )
+
+    memory_rows = _run_memory_path(
+        events,
+        agg_mode="summarize",
+        classify_async_fn=_DeterministicClassifyAsyncFn(),
+        summarize_async_fn=_DeterministicSummarizeAsyncFn(),
+        agg_query_spec=agg_qs,
+    )
+
+    assert memory_rows
+    assert any(row.get("mode") == "summarize_async" for row in memory_rows)
+    assert any("summary" in (row.get("aggregate") or {}) for row in memory_rows)
+
+
+def test_v02_workflow_agg_operator_owned_semantic_scope_close():
+    events = _build_use_case_events()
+    agg_qs = AggQuerySpec(
+        agg_method="algebraic",
+        trigger_policy=TriggerPolicy(mode="on_scope_close"),
+        scope_policy=AggScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+    )
+
+    memory_rows = _run_memory_path(
+        events,
+        agg_mode="algebraic",
+        classify_async_fn=_DeterministicClassifyAsyncFn(),
+        summarize_async_fn=None,
+        agg_query_spec=agg_qs,
+    )
+
+    assert memory_rows
+    assert any(str(row.get("mode", "")).startswith("algebraic_") for row in memory_rows)
 
 
 def _close_workers(*workers: Optional[AsyncFunction]) -> None:

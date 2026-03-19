@@ -64,13 +64,83 @@ from pyflink.semantic_runtime.stateful.async_bridge import (
 )
 from pyflink.semantic_runtime.stateful.timer_policy import (
     TimerCategory,
+    encode_timer_key,
     register_timer,
     resolve_timer_category,
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _AggScopeDecision:
+    event_time_ms: int
+    scope_bucket_id: Optional[int] = None
+    pre_reset_reason: str = ""
+    post_reset_reason: str = ""
+
+
+class _AggScopeRuntime:
+    """Pure scope-boundary logic for operator-owned agg kernels."""
+
+    def __init__(self, query_spec: AggQuerySpec) -> None:
+        self._query_spec = query_spec
+        self._scope = query_spec.scope_policy
+
+    def resolve_event_time_ms(self, value: Dict[str, Any], now_ms: int) -> int:
+        for field in ("event_time_ms", "timestamp_ms", "proc_time_ms"):
+            raw = value.get(field)
+            if raw is not None:
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    continue
+        return now_ms
+
+    def _resolve_bucket_id(self, event_time_ms: int) -> Optional[int]:
+        if self._scope.window_kind != "tumbling":
+            return None
+        if not self._scope.window_size_ms or self._scope.window_size_ms <= 0:
+            return None
+        return int(event_time_ms // self._scope.window_size_ms)
+
+    def _has_semantic_boundary(self, value: Dict[str, Any]) -> bool:
+        if self._scope.window_kind != "semantic":
+            return False
+        flags = value.get("boundary_flags")
+        if not isinstance(flags, dict):
+            return False
+        return bool(flags.get(self._scope.boundary_flag, False))
+
+    def plan(self, value: Dict[str, Any], meta: Dict[str, Any], now_ms: int) -> _AggScopeDecision:
+        event_time_ms = self.resolve_event_time_ms(value, now_ms)
+        decision = _AggScopeDecision(
+            event_time_ms=event_time_ms,
+            scope_bucket_id=self._resolve_bucket_id(event_time_ms),
+        )
+        kind = self._scope.window_kind
+        prev_last_time_ms = int(meta.get("scope_last_time_ms", 0) or 0)
+        prev_bucket_id = meta.get("scope_bucket_id")
+
+        if kind == "session":
+            gap_ms = self._scope.session_gap_ms
+            if gap_ms and prev_last_time_ms > 0 and (event_time_ms - prev_last_time_ms) > gap_ms:
+                decision.pre_reset_reason = "session_gap"
+        elif kind == "tumbling":
+            if (
+                decision.scope_bucket_id is not None
+                and prev_bucket_id is not None
+                and decision.scope_bucket_id != prev_bucket_id
+            ):
+                decision.pre_reset_reason = "tumbling_rollover"
+        elif kind == "semantic":
+            if self._has_semantic_boundary(value):
+                decision.post_reset_reason = "semantic_boundary"
+
+        return decision
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +157,63 @@ class SemAggConfig:
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     # Algebraic mode: user provides a 2-arg reduce function
     reduce_fn: Optional[Callable[[Dict, Dict], Dict]] = None
+
+
+def resolve_agg_runtime_params(
+    config: SemAggConfig,
+    query_spec: Optional[AggQuerySpec] = None,
+):
+    """Resolve runtime parameters from config + query spec."""
+    resolved_mode = config.mode
+    if query_spec is not None:
+        if query_spec.agg_method == "algebraic":
+            resolved_mode = "algebraic"
+        else:
+            resolved_mode = query_spec.agg_method
+    ttl_seconds = int(
+        query_spec.scope_policy.ttl_seconds
+        if query_spec and query_spec.scope_policy.ttl_seconds is not None
+        else config.ttl_seconds
+    )
+    max_buffer_events = int(
+        query_spec.scope_policy.max_buffer_events
+        if query_spec and query_spec.scope_policy.max_buffer_events is not None
+        else config.max_buffer_events
+    )
+    flush_interval_ms = int(
+        query_spec.scope_policy.flush_interval_ms
+        if query_spec and query_spec.scope_policy.flush_interval_ms is not None
+        else config.flush_interval_ms
+    )
+    return resolved_mode, ttl_seconds, max_buffer_events, flush_interval_ms
+
+
+def resolve_agg_trigger_runtime(
+    resolved_mode: str,
+    config: SemAggConfig,
+    query_spec: Optional[AggQuerySpec] = None,
+):
+    """Resolve trigger runtime from config + query spec.
+
+    Returns
+    -------
+    tuple
+        ``(trigger_mode, periodic_ms, idle_ms, count_threshold, legacy_mode)``
+    """
+    if query_spec is None:
+        if resolved_mode == "algebraic":
+            return "on_event", 0, 0, 0, True
+        return "legacy_buffered", config.flush_interval_ms, 0, config.max_buffer_events, True
+
+    trigger = query_spec.trigger_policy
+    periodic_ms = int(trigger.interval_ms or 0) if trigger.mode == "periodic" else 0
+    idle_ms = int(trigger.idle_ms or 0) if trigger.mode == "idle_flush" else 0
+    count_threshold = (
+        int(trigger.count_threshold or 0)
+        if trigger.mode == "count_threshold"
+        else 0
+    )
+    return trigger.mode, periodic_ms, idle_ms, count_threshold, False
 
 
 # ---------------------------------------------------------------------------
@@ -108,17 +235,44 @@ class SemAggFunction(KeyedProcessFunction):
         merged = build_async_bridge(main_ds, summarizer_fn, merge_fn, ...)
     """
 
-    def __init__(self, config: Optional[SemAggConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[SemAggConfig] = None,
+        query_spec: Optional[AggQuerySpec] = None,
+    ) -> None:
         self._config = config or SemAggConfig()
+        self._query_spec = query_spec
+        self._scope_runtime = _AggScopeRuntime(query_spec) if query_spec is not None else None
         self._buffer: Optional[ListState] = None
         self._agg_value: Optional[ValueState] = None
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
+        (
+            self._resolved_mode,
+            self._resolved_ttl_seconds,
+            self._resolved_max_buffer_events,
+            self._resolved_flush_interval_ms,
+        ) = resolve_agg_runtime_params(self._config, self._query_spec)
+        (
+            self._trigger_mode,
+            self._resolved_periodic_ms,
+            self._resolved_idle_ms,
+            self._resolved_count_threshold,
+            self._legacy_trigger_mode,
+        ) = resolve_agg_trigger_runtime(
+            self._resolved_mode, self._config, self._query_spec
+        )
+        if self._query_spec is not None and self._trigger_mode == "on_scope_close":
+            if not self._supports_operator_scope_close:
+                raise NotImplementedError(
+                    "sem_agg operator_owned on_scope_close requires "
+                    "scope_policy.window_kind in {'session', 'tumbling', 'semantic'}"
+                )
 
     # -- lifecycle -----------------------------------------------------------
 
     def open(self, runtime_context: RuntimeContext) -> None:
-        ttl = self._config.ttl_seconds
+        ttl = self._resolved_ttl_seconds
         self._buffer = runtime_context.get_list_state(
             sem_agg_buffer_descriptor(ttl)
         )
@@ -133,8 +287,14 @@ class SemAggFunction(KeyedProcessFunction):
         )
         logger.info(
             "SemAggFunction opened (mode=%s, max_buffer=%d)",
-            self._config.mode, self._config.max_buffer_events,
+            self._resolved_mode, self._resolved_max_buffer_events,
         )
+
+    @property
+    def _supports_operator_scope_close(self) -> bool:
+        if self._query_spec is None:
+            return False
+        return self._query_spec.scope_policy.window_kind in {"session", "tumbling", "semantic"}
 
     # -- core ----------------------------------------------------------------
 
@@ -172,23 +332,48 @@ class SemAggFunction(KeyedProcessFunction):
         meta = self._meta.value() or {
             "key": event.key, "event_count": 0,
             "version": 0, "pending_summarize": False,
+            "_last_emit_count": 0,
+            "_pending_buffer_count": 0,
+            "scope_epoch": 0,
+            "scope_last_time_ms": 0,
+            "scope_bucket_id": None,
         }
 
-        # Register flush timer on first event (summarize mode)
-        if (meta["event_count"] == 0
-                and self._config.mode == "summarize"
-                and self._config.flush_interval_ms > 0):
-            register_timer(
-                ctx.timer_service(), meta, TimerCategory.FLUSH,
-                now_ms + self._config.flush_interval_ms,
-            )
+        decision = (
+            self._scope_runtime.plan(event_dict, meta, now_ms)
+            if self._scope_runtime is not None
+            else _AggScopeDecision(event_time_ms=now_ms)
+        )
+
+        if decision.pre_reset_reason:
+            yield from self._emit_scope_close_output(meta, now_ms, decision.pre_reset_reason)
+            self._reset_scope_state(meta, reason=decision.pre_reset_reason)
 
         meta["event_count"] += 1
+        meta["scope_last_time_ms"] = decision.event_time_ms
+        if decision.scope_bucket_id is not None:
+            meta["scope_bucket_id"] = decision.scope_bucket_id
+        self._maybe_register_event_timers(ctx, meta, now_ms)
 
-        if self._config.mode == "algebraic":
+        if self._resolved_mode == "algebraic":
             yield from self._algebraic_step(event_dict, meta, now_ms)
         else:
             yield from self._summarize_step(event_dict, meta, now_ms)
+
+        if self._trigger_mode == "on_scope_close":
+            if decision.post_reset_reason:
+                yield from self._emit_scope_close_output(meta, now_ms, decision.post_reset_reason)
+                self._reset_scope_state(meta, reason=decision.post_reset_reason)
+            else:
+                self._register_scope_close_timer(ctx, meta, decision, now_ms)
+            self._meta.update(meta)
+            return
+
+        if decision.post_reset_reason:
+            yield from self._emit_scope_close_output(meta, now_ms, decision.post_reset_reason)
+            self._reset_scope_state(meta, reason=decision.post_reset_reason)
+            self._meta.update(meta)
+            return
 
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
         """Timer-driven summarization flush."""
@@ -204,15 +389,36 @@ class SemAggFunction(KeyedProcessFunction):
 
         clear_timer_registration(meta, TimerCategory.FLUSH)
 
-        if self._config.mode == "summarize" and not meta.get("pending_summarize"):
+        if self._legacy_trigger_mode:
+            if self._resolved_mode in {"summarize", "compressive"} and not meta.get("pending_summarize"):
+                yield from self._emit_summarize_request(meta)
+            if self._resolved_flush_interval_ms > 0:
+                now_ms = int(time.time() * 1000)
+                register_timer(
+                    ctx.timer_service(), meta, TimerCategory.FLUSH,
+                    now_ms + self._resolved_flush_interval_ms,
+                )
+            self._meta.update(meta)
+            return
+
+        now_ms = int(time.time() * 1000)
+        if self._trigger_mode == "on_scope_close":
+            reason = str(meta.pop("pending_scope_close_reason", "") or "scope_close")
+            yield from self._emit_scope_close_output(meta, now_ms, reason)
+            self._reset_scope_state(meta, reason=reason)
+            self._meta.update(meta)
+            return
+
+        if self._resolved_mode == "algebraic":
+            yield from self._emit_current_aggregate(meta, now_ms, reason=self._trigger_mode)
+        elif not meta.get("pending_summarize"):
             yield from self._emit_summarize_request(meta)
 
-        # Re-register flush timer
-        now_ms = int(time.time() * 1000)
-        register_timer(
-            ctx.timer_service(), meta, TimerCategory.FLUSH,
-            now_ms + self._config.flush_interval_ms,
-        )
+        if self._trigger_mode == "periodic" and self._resolved_periodic_ms > 0:
+            register_timer(
+                ctx.timer_service(), meta, TimerCategory.FLUSH,
+                now_ms + self._resolved_periodic_ms,
+            )
         self._meta.update(meta)
 
     # -- algebraic path ------------------------------------------------------
@@ -238,16 +444,21 @@ class SemAggFunction(KeyedProcessFunction):
         meta["version"] = meta.get("version", 0) + 1
         self._meta.update(meta)
 
-        # Emit current aggregate snapshot
-        agg = self._agg_value.value()
-        yield {
-            "key": meta.get("key", ""),
-            "aggregate": agg,
-            "version": meta["version"],
-            "mode": "algebraic",
-            "event_count": meta["event_count"],
-            "timestamp_ms": now_ms,
-        }
+        if self._legacy_trigger_mode:
+            yield from self._emit_current_aggregate(meta, now_ms, reason="algebraic")
+            return
+
+        if self._trigger_mode == "on_event":
+            yield from self._emit_current_aggregate(meta, now_ms, reason="on_event")
+            return
+
+        if self._trigger_mode == "count_threshold":
+            threshold = max(1, self._resolved_count_threshold)
+            last_emit = int(meta.get("_last_emit_count", 0) or 0)
+            if meta["event_count"] - last_emit >= threshold:
+                yield from self._emit_current_aggregate(
+                    meta, now_ms, reason="count_threshold"
+                )
 
     # -- summarize path ------------------------------------------------------
 
@@ -258,12 +469,13 @@ class SemAggFunction(KeyedProcessFunction):
         self._buffer.add(event_dict)
 
         # Enforce buffer limit
-        buf_count = meta["event_count"] - meta.get("_last_summarize_count", 0)
-        if buf_count > self._config.max_buffer_events:
+        buf_count = len(list(self._buffer.get()))
+        if buf_count > self._resolved_max_buffer_events:
             overflow = self._config.overflow_policy
             if overflow == OverflowPolicy.DROP_OLDEST:
                 self._trim_buffer_oldest(meta)
             elif overflow == OverflowPolicy.DROP_NEWEST:
+                self._trim_buffer_newest(meta)
                 meta["event_count"] -= 1
                 self._meta.update(meta)
                 return
@@ -271,9 +483,22 @@ class SemAggFunction(KeyedProcessFunction):
 
         self._meta.update(meta)
 
-        # Check if buffer is full → trigger summarize
-        if buf_count >= self._config.max_buffer_events and not meta.get("pending_summarize"):
+        if meta.get("pending_summarize"):
+            return
+
+        if self._legacy_trigger_mode:
+            if len(list(self._buffer.get())) >= self._resolved_max_buffer_events:
+                yield from self._emit_summarize_request(meta)
+            return
+
+        if self._trigger_mode == "on_event":
             yield from self._emit_summarize_request(meta)
+            return
+
+        if self._trigger_mode == "count_threshold":
+            threshold = max(1, self._resolved_count_threshold)
+            if len(list(self._buffer.get())) >= threshold:
+                yield from self._emit_summarize_request(meta)
 
     def _emit_summarize_request(self, meta: Dict[str, Any]):
         """Emit buffered events as an async summarize work item."""
@@ -283,15 +508,19 @@ class SemAggFunction(KeyedProcessFunction):
 
         meta["pending_summarize"] = True
         meta["_last_summarize_count"] = meta.get("event_count", 0)
+        meta["_pending_buffer_count"] = len(events)
         self._meta.update(meta)
 
         work = AsyncWorkItem(
             key=meta.get("key", ""),
             task_type="summarize",
             payload={
-                "events": events,
+                "events": self._prepare_summary_events(events),
                 "event_count": len(events),
                 "current_version": meta.get("version", 0),
+                "agg_method": self._resolved_mode,
+                "scope_epoch": int(meta.get("scope_epoch", 0) or 0),
+                "scope_close_pending": bool(meta.get("_scope_close_pending", False)),
             },
         )
         if self._metrics:
@@ -306,6 +535,7 @@ class SemAggFunction(KeyedProcessFunction):
 
         if not result_dict.get("success", False):
             meta["pending_summarize"] = False
+            meta["_pending_buffer_count"] = 0
             self._meta.update(meta)
             yield {
                 "key": result_dict.get("key", ""),
@@ -318,28 +548,63 @@ class SemAggFunction(KeyedProcessFunction):
             return
 
         summary = result_dict.get("result", {}).get("summary", "")
+        result_epoch = int(
+            result_dict.get("result", {}).get(
+                "scope_epoch",
+                result_dict.get("scope_epoch", meta.get("scope_epoch", 0)),
+            ) or 0
+        )
+        result_scope_close = bool(
+            result_dict.get("result", {}).get(
+                "scope_close_pending",
+                result_dict.get("scope_close_pending", False),
+            )
+        )
         meta["version"] = meta.get("version", 0) + 1
         meta["pending_summarize"] = False
+        emitted_count = int(meta.get("_pending_buffer_count", 0) or 0)
+        meta["_pending_buffer_count"] = 0
 
         agg = {
             "summary": summary,
             "version": meta["version"],
             "updated_ms": now_ms,
         }
-        self._agg_value.update(agg)
+        current_epoch = int(meta.get("scope_epoch", 0) or 0)
+        should_update_current_state = not result_scope_close and result_epoch == current_epoch
+        if should_update_current_state:
+            self._agg_value.update(agg)
 
-        # Clear buffer after successful summarize
-        self._buffer.clear()
+        # Preserve events that arrived while the summarize request was in flight.
+        if should_update_current_state:
+            self._drop_buffer_prefix(emitted_count)
         self._meta.update(meta)
 
         yield {
             "key": meta.get("key", ""),
             "aggregate": agg,
             "version": meta["version"],
-            "mode": "summarize",
+            "mode": "summarize_scope_close" if result_scope_close else "summarize",
             "event_count": meta.get("event_count", 0),
             "timestamp_ms": now_ms,
+            "scope_epoch": result_epoch,
         }
+
+        if result_scope_close:
+            return
+        if meta.get("pending_summarize"):
+            return
+        if self._legacy_trigger_mode:
+            if len(list(self._buffer.get())) >= self._resolved_max_buffer_events:
+                yield from self._emit_summarize_request(meta)
+            return
+        if self._trigger_mode == "on_event" and list(self._buffer.get()):
+            yield from self._emit_summarize_request(meta)
+            return
+        if self._trigger_mode == "count_threshold":
+            threshold = max(1, self._resolved_count_threshold)
+            if len(list(self._buffer.get())) >= threshold:
+                yield from self._emit_summarize_request(meta)
 
     def _trim_buffer_oldest(self, meta: Dict[str, Any]) -> None:
         """Drop the oldest event from the buffer."""
@@ -350,3 +615,151 @@ class SemAggFunction(KeyedProcessFunction):
         for e in events:
             self._buffer.add(e)
 
+    def _trim_buffer_newest(self, meta: Dict[str, Any]) -> None:
+        """Drop the newest event from the buffer."""
+        events = list(self._buffer.get())
+        if len(events) > 1:
+            events = events[:-1]
+        else:
+            events = []
+        self._buffer.clear()
+        for e in events:
+            self._buffer.add(e)
+
+    def _drop_buffer_prefix(self, count: int) -> None:
+        """Drop the oldest ``count`` buffered events, preserving later arrivals."""
+        if count <= 0:
+            return
+        events = list(self._buffer.get())
+        events = events[count:]
+        self._buffer.clear()
+        for event in events:
+            self._buffer.add(event)
+
+    def _prepare_summary_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self._resolved_mode != "compressive":
+            return events
+        if len(events) <= 2:
+            return events
+        keep = max(1, min(len(events), self._resolved_max_buffer_events // 2))
+        return events[-keep:]
+
+    def _maybe_register_event_timers(self, ctx, meta: Dict[str, Any], now_ms: int) -> None:
+        if self._legacy_trigger_mode:
+            if (
+                meta.get("event_count", 0) == 1
+                and self._resolved_mode in {"summarize", "compressive"}
+                and self._resolved_flush_interval_ms > 0
+            ):
+                register_timer(
+                    ctx.timer_service(), meta, TimerCategory.FLUSH,
+                    now_ms + self._resolved_flush_interval_ms,
+                )
+            return
+
+        if self._trigger_mode == "periodic" and self._resolved_periodic_ms > 0:
+            tkey = encode_timer_key(TimerCategory.FLUSH)
+            if not meta.get(tkey):
+                register_timer(
+                    ctx.timer_service(), meta, TimerCategory.FLUSH,
+                    now_ms + self._resolved_periodic_ms,
+                )
+            return
+
+        if self._trigger_mode == "idle_flush" and self._resolved_idle_ms > 0:
+            register_timer(
+                ctx.timer_service(), meta, TimerCategory.FLUSH,
+                now_ms + self._resolved_idle_ms,
+            )
+            return
+
+        if self._trigger_mode == "on_scope_close":
+            self._register_scope_close_timer(
+                ctx,
+                meta,
+                _AggScopeDecision(
+                    event_time_ms=int(meta.get("scope_last_time_ms", now_ms) or now_ms),
+                    scope_bucket_id=meta.get("scope_bucket_id"),
+                ),
+                now_ms,
+            )
+
+    def _emit_current_aggregate(self, meta: Dict[str, Any], now_ms: int, *, reason: str):
+        agg = self._agg_value.value()
+        if agg is None:
+            return
+        meta["_last_emit_count"] = meta.get("event_count", 0)
+        self._meta.update(meta)
+        mode = "algebraic" if reason == "algebraic" else f"algebraic_{reason}"
+        yield {
+            "key": meta.get("key", ""),
+            "aggregate": agg,
+            "version": meta.get("version", 0),
+            "mode": mode,
+            "event_count": meta.get("event_count", 0),
+            "timestamp_ms": now_ms,
+        }
+
+    def _emit_scope_close_output(self, meta: Dict[str, Any], now_ms: int, reason: str):
+        if self._resolved_mode == "algebraic":
+            yield from self._emit_current_aggregate(meta, now_ms, reason=reason)
+            return
+        if meta.get("pending_summarize"):
+            meta["_scope_close_pending"] = True
+            self._meta.update(meta)
+            return
+        if not list(self._buffer.get()):
+            return
+        meta["_scope_close_pending"] = True
+        yield from self._emit_summarize_request(meta)
+
+    def _register_scope_close_timer(
+        self,
+        ctx,
+        meta: Dict[str, Any],
+        decision: _AggScopeDecision,
+        now_ms: int,
+    ) -> None:
+        if self._query_spec is None:
+            return
+        scope = self._query_spec.scope_policy
+        kind = scope.window_kind
+        fire_at_ms: Optional[int] = None
+        use_event_time = False
+        reason = ""
+
+        if kind == "session":
+            if scope.session_gap_ms and scope.session_gap_ms > 0:
+                fire_at_ms = now_ms + scope.session_gap_ms
+                reason = "session_gap"
+        elif kind == "tumbling":
+            if scope.window_size_ms and scope.window_size_ms > 0 and decision.scope_bucket_id is not None:
+                fire_at_ms = int((decision.scope_bucket_id + 1) * scope.window_size_ms)
+                use_event_time = True
+                reason = "tumbling_rollover"
+        elif kind == "semantic":
+            return
+
+        if fire_at_ms is None:
+            return
+        meta["pending_scope_close_reason"] = reason
+        register_timer(
+            ctx.timer_service(), meta, TimerCategory.FLUSH,
+            fire_at_ms, use_event_time=use_event_time,
+        )
+
+    def _reset_scope_state(self, meta: Dict[str, Any], *, reason: str) -> None:
+        self._buffer.clear()
+        self._agg_value.clear()
+        clear_timer_registration(meta, TimerCategory.FLUSH)
+        meta.pop("pending_scope_close_reason", None)
+        meta.pop("_scope_close_pending", None)
+        meta["event_count"] = 0
+        meta["_last_emit_count"] = 0
+        meta["_last_summarize_count"] = 0
+        meta["_pending_buffer_count"] = 0
+        meta["pending_summarize"] = False
+        meta["scope_epoch"] = int(meta.get("scope_epoch", 0) or 0) + 1
+        meta["scope_last_time_ms"] = 0
+        meta["scope_bucket_id"] = None
+        meta["last_scope_reset_reason"] = reason

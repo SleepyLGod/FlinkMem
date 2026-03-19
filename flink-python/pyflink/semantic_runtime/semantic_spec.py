@@ -256,6 +256,7 @@ VALID_TRIGGER_MODES = {
 }
 VALID_TOPK_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
 VALID_GROUPBY_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
+VALID_AGG_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
 
 
 @dataclass
@@ -443,11 +444,30 @@ class GroupbyScopePolicy:
 
     ttl_seconds: Optional[int] = None
     max_groups_per_key: Optional[int] = None
+    window_kind: Optional[str] = None
+    window_size_ms: Optional[int] = None
+    session_gap_ms: Optional[int] = None
+    boundary_flag: str = "topic_shift"
+
+    def __post_init__(self):
+        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
+            raise ValueError(
+                f"Invalid window_kind={self.window_kind!r}. "
+                f"Must be one of {VALID_WINDOW_KINDS}."
+            )
+        if self.window_kind == "session" and self.session_gap_ms is not None and self.session_gap_ms <= 0:
+            raise ValueError("session_gap_ms must be > 0 when provided")
+        if self.window_kind == "semantic" and not self.boundary_flag:
+            raise ValueError("boundary_flag must be non-empty for semantic scopes")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ttl_seconds": self.ttl_seconds,
             "max_groups_per_key": self.max_groups_per_key,
+            "window_kind": self.window_kind,
+            "window_size_ms": self.window_size_ms,
+            "session_gap_ms": self.session_gap_ms,
+            "boundary_flag": self.boundary_flag,
         }
 
     @classmethod
@@ -564,12 +584,31 @@ class AggScopePolicy:
     ttl_seconds: Optional[int] = None
     max_buffer_events: Optional[int] = None
     flush_interval_ms: Optional[int] = None
+    window_kind: Optional[str] = None
+    window_size_ms: Optional[int] = None
+    session_gap_ms: Optional[int] = None
+    boundary_flag: str = "topic_shift"
+
+    def __post_init__(self):
+        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
+            raise ValueError(
+                f"Invalid window_kind={self.window_kind!r}. "
+                f"Must be one of {VALID_WINDOW_KINDS}."
+            )
+        if self.window_kind == "session" and self.session_gap_ms is not None and self.session_gap_ms <= 0:
+            raise ValueError("session_gap_ms must be > 0 when provided")
+        if self.window_kind == "semantic" and not self.boundary_flag:
+            raise ValueError("boundary_flag must be non-empty for semantic scopes")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ttl_seconds": self.ttl_seconds,
             "max_buffer_events": self.max_buffer_events,
             "flush_interval_ms": self.flush_interval_ms,
+            "window_kind": self.window_kind,
+            "window_size_ms": self.window_size_ms,
+            "session_gap_ms": self.session_gap_ms,
+            "boundary_flag": self.boundary_flag,
         }
 
     @classmethod
@@ -591,6 +630,7 @@ class AggQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     agg_method: str = "algebraic"
+    execution_path: str = "auto"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: AggScopePolicy = field(default_factory=AggScopePolicy)
 
@@ -599,6 +639,11 @@ class AggQuerySpec:
             raise ValueError(
                 f"Invalid agg_method={self.agg_method!r}. "
                 f"Must be one of {VALID_AGG_METHODS}."
+            )
+        if self.execution_path not in VALID_AGG_EXECUTION_PATHS:
+            raise ValueError(
+                f"Invalid execution_path={self.execution_path!r}. "
+                f"Must be one of {VALID_AGG_EXECUTION_PATHS}."
             )
 
     @classmethod
@@ -619,6 +664,7 @@ class AggQuerySpec:
                 output_mode="summary",
             ),
             agg_method=agg_method,
+            execution_path="auto",
             trigger_policy=TriggerPolicy(),
             scope_policy=AggScopePolicy(
                 ttl_seconds=ttl_seconds,
@@ -633,6 +679,7 @@ class AggQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "agg_method": self.agg_method,
+            "execution_path": self.execution_path,
             "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
@@ -644,6 +691,7 @@ class AggQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             agg_method=d.get("agg_method", "algebraic"),
+            execution_path=d.get("execution_path", "auto"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=AggScopePolicy.from_dict(d.get("scope_policy", {})),
         )

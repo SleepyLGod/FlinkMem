@@ -1200,6 +1200,13 @@ from pyflink.semantic_runtime.stateful.sem_groupby_pipeline import (
 from pyflink.semantic_runtime.stateful.sem_groupby_window import (
     WindowOwnedSemGroupbyFunction,
 )
+from pyflink.semantic_runtime.stateful.sem_agg_pipeline import (
+    build_sem_agg_operator,
+    resolve_agg_execution_plan,
+)
+from pyflink.semantic_runtime.stateful.sem_agg_window import (
+    WindowOwnedSemAggFunction,
+)
 
 
 class TestSemanticSpec:
@@ -1343,7 +1350,13 @@ class TestGroupbyQuerySpec:
             execution_path="operator_owned",
             trigger_policy=TriggerPolicy(mode="periodic", interval_ms=2000),
             maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=5000),
-            scope_policy=GroupbyScopePolicy(ttl_seconds=1200, max_groups_per_key=12),
+            scope_policy=GroupbyScopePolicy(
+                ttl_seconds=1200,
+                max_groups_per_key=12,
+                window_kind="session",
+                session_gap_ms=15000,
+                boundary_flag="topic_shift",
+            ),
             new_group_threshold=0.25,
             assign_threshold=0.8,
         )
@@ -1355,7 +1368,15 @@ class TestGroupbyQuerySpec:
         assert restored.trigger_policy.mode == "periodic"
         assert restored.maintenance_trigger_policy.mode == "periodic"
         assert restored.scope_policy.max_groups_per_key == 12
+        assert restored.scope_policy.window_kind == "session"
+        assert restored.scope_policy.session_gap_ms == 15000
+        assert restored.scope_policy.boundary_flag == "topic_shift"
         assert restored.assign_threshold == 0.8
+
+    def test_invalid_scope_policy_session_gap(self):
+        import pytest
+        with pytest.raises(ValueError, match="session_gap_ms"):
+            GroupbyScopePolicy(window_kind="session", session_gap_ms=0)
 
     def test_runtime_resolution_overrides_config(self):
         cfg = SemGroupbyConfig(
@@ -1447,9 +1468,9 @@ class TestGroupbyQuerySpec:
                 ),
             )
 
-    def test_builder_operator_owned_rejects_non_periodic_maintenance(self):
+    def test_builder_operator_owned_rejects_unsupported_maintenance(self):
         import pytest
-        with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='periodic'"):
+        with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='periodic' or 'on_scope_close'"):
             build_sem_groupby_operator(
                 SemGroupbyConfig(),
                 GroupbyQuerySpec(
@@ -1457,6 +1478,29 @@ class TestGroupbyQuerySpec:
                     maintenance_trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=1000),
                 ),
             )
+
+    def test_builder_operator_owned_rejects_on_scope_close_for_sliding(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="close-capable scopes"):
+            build_sem_groupby_operator(
+                SemGroupbyConfig(),
+                GroupbyQuerySpec(
+                    execution_path="operator_owned",
+                    scope_policy=GroupbyScopePolicy(window_kind="sliding", window_size_ms=1000),
+                    maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+                ),
+            )
+
+    def test_builder_operator_owned_accepts_on_scope_close_for_semantic(self):
+        op = build_sem_groupby_operator(
+            SemGroupbyConfig(),
+            GroupbyQuerySpec(
+                execution_path="operator_owned",
+                scope_policy=GroupbyScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            ),
+        )
+        assert isinstance(op, SemGroupbyFunction)
 
     def test_builder_window_owned_requires_window_snapshot_input(self):
         import pytest
@@ -1847,12 +1891,97 @@ class TestGroupbyQuerySpec:
         assert profile["label"] != "stale label"
         assert "alpha" in profile["label"].lower()
 
+    def test_operator_owned_semantic_on_scope_close_resets_group_state(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="rule",
+                trigger_policy=TriggerPolicy(mode="on_event"),
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+                scope_policy=GroupbyScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+            ),
+        )
+        func._group_profiles = _FakeMapState({})
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _FakeContext("k")
+        list(func.process_element(
+            SemanticEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
+            ctx,
+        ))
+        assert len(list(func._group_profiles.keys())) == 1
+
+        list(func.process_element(
+            SemanticEvent(
+                key="k",
+                payload="travel booking",
+                seq_id=2,
+                boundary_flags={"topic_shift": True},
+            ).to_dict(),
+            ctx,
+        ))
+        assert len(list(func._group_profiles.keys())) == 0
+        meta = func._meta.value()
+        assert meta["last_scope_reset_reason"] == "semantic_boundary"
+        assert meta["scope_epoch"] == 1
+
+    def test_operator_owned_session_on_scope_close_timer_resets_group_state(self):
+        class _TimerService:
+            def __init__(self):
+                self.registered = []
+
+            def register_processing_time_timer(self, ts):
+                self.registered.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.registered.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._ts = _TimerService()
+
+            def get_current_key(self):
+                return "k"
+
+            def timer_service(self):
+                return self._ts
+
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(max_groups_per_key=10),
+            GroupbyQuerySpec(
+                assignment_method="rule",
+                trigger_policy=TriggerPolicy(mode="on_event"),
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+                scope_policy=GroupbyScopePolicy(window_kind="session", session_gap_ms=50),
+            ),
+        )
+        func._group_profiles = _FakeMapState({})
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _Ctx()
+        list(func.process_element(
+            SemanticEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
+            ctx,
+        ))
+        meta = func._meta.value()
+        fire_at = meta["_timer_flush"]
+        assert len(list(func._group_profiles.keys())) == 1
+
+        func.on_timer(fire_at, ctx)
+        assert len(list(func._group_profiles.keys())) == 0
+        updated = func._meta.value()
+        assert updated["last_scope_reset_reason"] == "session_gap"
+        assert updated["scope_epoch"] == 1
+
 
 class TestAggQuerySpec:
     def test_defaults(self):
         spec = AggQuerySpec()
         assert spec.semantic.output_mode == "summary"
         assert spec.agg_method == "algebraic"
+        assert spec.execution_path == "auto"
         assert spec.trigger_policy.mode == "on_event"
 
     def test_simple_builder(self):
@@ -1866,12 +1995,18 @@ class TestAggQuerySpec:
         )
         assert spec.semantic.backend == "llm"
         assert spec.agg_method == "summarize"
+        assert spec.execution_path == "auto"
         assert spec.scope_policy.max_buffer_events == 50
 
     def test_invalid_agg_method(self):
         import pytest
         with pytest.raises(ValueError, match="Invalid agg_method"):
             AggQuerySpec(agg_method="bogus")
+
+    def test_invalid_execution_path(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid execution_path"):
+            AggQuerySpec(execution_path="bogus")
 
     def test_roundtrip(self):
         spec = AggQuerySpec(
@@ -1883,6 +2018,7 @@ class TestAggQuerySpec:
             query_id="agg1",
             query_version=3,
             agg_method="compressive",
+            execution_path="window_owned",
             trigger_policy=TriggerPolicy(mode="count_threshold", count_threshold=16),
             scope_policy=AggScopePolicy(
                 ttl_seconds=1800,
@@ -1894,8 +2030,343 @@ class TestAggQuerySpec:
         assert restored.query_id == "agg1"
         assert restored.query_version == 3
         assert restored.agg_method == "compressive"
+        assert restored.execution_path == "window_owned"
         assert restored.trigger_policy.mode == "count_threshold"
         assert restored.scope_policy.flush_interval_ms == 5000
+
+    def test_roundtrip_with_close_capable_scope(self):
+        spec = AggQuerySpec(
+            trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            scope_policy=AggScopePolicy(
+                ttl_seconds=300,
+                window_kind="session",
+                session_gap_ms=1000,
+            ),
+        )
+        restored = AggQuerySpec.from_dict(spec.to_dict())
+        assert restored.trigger_policy.mode == "on_scope_close"
+        assert restored.scope_policy.window_kind == "session"
+        assert restored.scope_policy.session_gap_ms == 1000
+
+    def test_execution_plan_auto_resolves_operator_owned(self):
+        plan = resolve_agg_execution_plan(AggQuerySpec())
+        assert plan.execution_path == "operator_owned"
+
+    def test_execution_plan_auto_window_snapshot_resolves_window_owned(self):
+        plan = resolve_agg_execution_plan(
+            AggQuerySpec(),
+            input_kind="window_snapshot",
+        )
+        assert plan.execution_path == "window_owned"
+
+    def test_builder_window_owned_returns_bounded_runtime(self):
+        op = build_sem_agg_operator(
+            SemAggConfig(),
+            AggQuerySpec(execution_path="window_owned"),
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, WindowOwnedSemAggFunction)
+
+    def test_builder_window_owned_requires_window_snapshot_input(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="window_snapshot"):
+            build_sem_agg_operator(
+                SemAggConfig(),
+                AggQuerySpec(execution_path="window_owned"),
+                input_kind="event_stream",
+            )
+
+    def test_builder_operator_owned_rejects_on_scope_close(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="on_scope_close"):
+            build_sem_agg_operator(
+                SemAggConfig(),
+                AggQuerySpec(
+                    trigger_policy=TriggerPolicy(mode="on_scope_close"),
+                    scope_policy=AggScopePolicy(window_kind="sliding", window_size_ms=1000),
+                ),
+                input_kind="event_stream",
+            )
+
+    def test_builder_operator_owned_accepts_close_capable_scope(self):
+        op = build_sem_agg_operator(
+            SemAggConfig(),
+            AggQuerySpec(
+                trigger_policy=TriggerPolicy(mode="on_scope_close"),
+                scope_policy=AggScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+            ),
+            input_kind="event_stream",
+        )
+        assert isinstance(op, SemAggFunction)
+
+    def test_window_owned_algebraic_aggregates_snapshot(self):
+        def sum_reduce(a, b):
+            return {"key": a.get("key", "k"), "total": a.get("total", 0) + b.get("total", 0)}
+
+        func = WindowOwnedSemAggFunction(
+            SemAggConfig(mode="algebraic", reduce_fn=sum_reduce),
+            AggQuerySpec(execution_path="window_owned", agg_method="algebraic"),
+        )
+        snapshot = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "close",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "a", "total": 3, "seq_id": 1},
+                {"key": "k", "payload": "b", "total": 5, "seq_id": 2},
+            ],
+        }
+        outs = list(func.process_element(snapshot, _FakeContext("k")))
+        assert len(outs) == 1
+        assert outs[0]["mode"] == "algebraic_window"
+        assert outs[0]["aggregate"]["total"] == 8
+
+    def test_window_owned_summarize_emits_async_work(self):
+        func = WindowOwnedSemAggFunction(
+            SemAggConfig(mode="summarize", max_buffer_events=10),
+            AggQuerySpec(execution_path="window_owned", agg_method="summarize"),
+        )
+        snapshot = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "close",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "alpha", "seq_id": 1},
+                {"key": "k", "payload": "beta", "seq_id": 2},
+            ],
+        }
+        outs = list(func.process_element(snapshot, _FakeContext("k")))
+        main, side = _split_outputs(outs)
+        assert len(main) == 0
+        assert len(side) == 1
+        assert side[0]["task_type"] == "summarize"
+
+    def test_runtime_resolution_overrides_config(self):
+        cfg = SemAggConfig(mode="summarize", max_buffer_events=50, flush_interval_ms=5000, ttl_seconds=3600)
+        spec = AggQuerySpec(
+            agg_method="compressive",
+            scope_policy=AggScopePolicy(ttl_seconds=600, max_buffer_events=12, flush_interval_ms=1000),
+        )
+        func = SemAggFunction(cfg, spec)
+        assert func._resolved_mode == "compressive"
+        assert func._resolved_ttl_seconds == 600
+        assert func._resolved_max_buffer_events == 12
+        assert func._resolved_flush_interval_ms == 1000
+
+    def test_builder_without_query_spec_preserves_config_mode(self):
+        op = build_sem_agg_operator(
+            SemAggConfig(mode="summarize"),
+            None,
+            input_kind="event_stream",
+        )
+        assert isinstance(op, SemAggFunction)
+        assert op._resolved_mode == "summarize"
+
+
+class TestSemAggTriggerRuntime:
+    class _CaptureContext:
+        def __init__(self, key="k"):
+            self._key = key
+            self.timers = []
+
+            class _TimerService:
+                def __init__(self, sink):
+                    self._sink = sink
+
+                def register_processing_time_timer(self, ts):
+                    self._sink.append(("proc", ts))
+
+                def register_event_time_timer(self, ts):
+                    self._sink.append(("event", ts))
+
+            self._timer = _TimerService(self.timers)
+
+        def get_current_key(self):
+            return self._key
+
+        def timer_service(self):
+            return self._timer
+
+        def output(self, tag, value):
+            pass
+
+    def _make_func(self, cfg, spec):
+        func = SemAggFunction(cfg, spec)
+        func._buffer = _FakeListState()
+        func._agg_value = _FakeValueState(None)
+        func._meta = _FakeValueState(None)
+        return func
+
+    def test_algebraic_periodic_emits_only_on_timer(self):
+        def sum_reduce(a, b):
+            return {"key": a.get("key", "k"), "total": a.get("total", 0) + b.get("total", 0)}
+
+        cfg = SemAggConfig(mode="algebraic", reduce_fn=sum_reduce)
+        spec = AggQuerySpec(
+            agg_method="algebraic",
+            trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        outs = list(func.process_element({"key": "k", "payload": "alpha", "seq_id": 1, "total": 3}, ctx))
+        assert outs == []
+        fire_at = func._meta.value()[encode_timer_key(TimerCategory.FLUSH)]
+        timer_outs = list(func.on_timer(fire_at, ctx))
+        assert len(timer_outs) == 1
+        assert timer_outs[0]["mode"] == "algebraic_periodic"
+        assert timer_outs[0]["aggregate"]["total"] == 3
+
+    def test_algebraic_idle_flush_emits_on_timer(self):
+        cfg = SemAggConfig(mode="algebraic")
+        spec = AggQuerySpec(
+            agg_method="algebraic",
+            trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=25),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        outs = list(func.process_element({"key": "k", "payload": "alpha", "seq_id": 1}, ctx))
+        assert outs == []
+        fire_at = func._meta.value()[encode_timer_key(TimerCategory.FLUSH)]
+        timer_outs = list(func.on_timer(fire_at, ctx))
+        assert len(timer_outs) == 1
+        assert timer_outs[0]["mode"] == "algebraic_idle_flush"
+
+    def test_summarize_count_threshold_uses_trigger_threshold(self):
+        cfg = SemAggConfig(mode="summarize", max_buffer_events=10)
+        spec = AggQuerySpec(
+            agg_method="summarize",
+            trigger_policy=TriggerPolicy(mode="count_threshold", count_threshold=2),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        outs1 = list(func.process_element({"key": "k", "payload": "a", "seq_id": 1}, ctx))
+        main1, side1 = _split_outputs(outs1)
+        assert main1 == []
+        assert side1 == []
+
+        outs2 = list(func.process_element({"key": "k", "payload": "b", "seq_id": 2}, ctx))
+        main2, side2 = _split_outputs(outs2)
+        assert main2 == []
+        assert len(side2) == 1
+        assert side2[0]["task_type"] == "summarize"
+
+    def test_summarize_result_preserves_post_request_events(self):
+        cfg = SemAggConfig(mode="summarize", max_buffer_events=10)
+        spec = AggQuerySpec(
+            agg_method="summarize",
+            trigger_policy=TriggerPolicy(mode="on_event"),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        first = list(func.process_element({"key": "k", "payload": "a", "seq_id": 1}, ctx))
+        _, first_side = _split_outputs(first)
+        assert len(first_side) == 1
+
+        second = list(func.process_element({"key": "k", "payload": "b", "seq_id": 2}, ctx))
+        _, second_side = _split_outputs(second)
+        assert second_side == []
+        assert len(list(func._buffer.get())) == 2
+
+        merged = list(func._handle_summarize_result({
+            "task_type": "summarize",
+            "key": "k",
+            "success": True,
+            "result": {"summary": "summary(a)"},
+        }, 3000))
+        main, side = _split_outputs(merged)
+        assert len(main) == 1
+        assert main[0]["mode"] == "summarize"
+        assert len(side) == 1
+        assert side[0]["task_type"] == "summarize"
+        assert len(list(func._buffer.get())) == 1
+
+    def test_algebraic_semantic_on_scope_close_emits_final_and_resets(self):
+        cfg = SemAggConfig(mode="algebraic")
+        spec = AggQuerySpec(
+            agg_method="algebraic",
+            trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            scope_policy=AggScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        outs = list(func.process_element({
+            "key": "k",
+            "payload": "alpha",
+            "seq_id": 1,
+            "value": 1,
+            "boundary_flags": {"topic_shift": True},
+        }, ctx))
+        assert len(outs) == 1
+        assert outs[0]["mode"] == "algebraic_semantic_boundary"
+        assert func._meta.value()["scope_epoch"] == 1
+        assert func._agg_value.value() is None
+
+    def test_summarize_semantic_on_scope_close_emits_work_and_final_result(self):
+        cfg = SemAggConfig(mode="summarize", max_buffer_events=10)
+        spec = AggQuerySpec(
+            agg_method="summarize",
+            trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            scope_policy=AggScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        outs = list(func.process_element({
+            "key": "k",
+            "payload": "alpha",
+            "seq_id": 1,
+            "boundary_flags": {"topic_shift": True},
+        }, ctx))
+        main, side = _split_outputs(outs)
+        assert main == []
+        assert len(side) == 1
+        assert side[0]["task_type"] == "summarize"
+        assert side[0]["payload"]["scope_close_pending"] is True
+        assert func._meta.value()["scope_epoch"] == 1
+        assert len(list(func._buffer.get())) == 0
+
+        merged = list(func._handle_summarize_result({
+            "task_type": "summarize",
+            "key": "k",
+            "success": True,
+            "result": {
+                "summary": "summary(alpha)",
+                "scope_epoch": 0,
+                "scope_close_pending": True,
+            },
+        }, 4000))
+        assert len(merged) == 1
+        assert merged[0]["mode"] == "summarize_scope_close"
+        assert merged[0]["scope_epoch"] == 0
+
+    def test_algebraic_session_on_scope_close_timer_emits_and_resets(self):
+        cfg = SemAggConfig(mode="algebraic")
+        spec = AggQuerySpec(
+            agg_method="algebraic",
+            trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            scope_policy=AggScopePolicy(window_kind="session", session_gap_ms=50),
+        )
+        func = self._make_func(cfg, spec)
+        ctx = self._CaptureContext("k")
+
+        outs = list(func.process_element({
+            "key": "k",
+            "payload": "alpha",
+            "seq_id": 1,
+        }, ctx))
+        assert outs == []
+        fire_at = func._meta.value()[encode_timer_key(TimerCategory.FLUSH)]
+        timer_outs = list(func.on_timer(fire_at, ctx))
+        assert len(timer_outs) == 1
+        assert timer_outs[0]["mode"] == "algebraic_session_gap"
+        assert func._meta.value()["scope_epoch"] == 1
 
 
 class TestJoinQuerySpec:
