@@ -19,6 +19,11 @@
 
 from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction  # noqa: F401
 from pyflink.semantic_runtime.operators.sem_map import SemMapFunction  # noqa: F401
+from pyflink.semantic_runtime.operators.semantic_attrs import (  # noqa: F401
+    SemScoreFunction,
+    SemLabelFunction,
+    SemMatchFunction,
+)
 from pyflink.semantic_runtime.operators.sem_join_retrieve import (  # noqa: F401
     SemLookupJoinFunction,
     SemLookupJoinConfig,

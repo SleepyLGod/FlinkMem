@@ -57,6 +57,9 @@ from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_clie
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec, TriggerPolicy
 from pyflink.semantic_runtime.stateful.event_model import retrieve_to_topk_items
+from pyflink.semantic_runtime.stateful.semantic_lowering import (
+    resolve_topk_lowering_plan,
+)
 from pyflink.semantic_runtime.stateful.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,
@@ -1113,6 +1116,7 @@ def build_sem_topk_pipeline(
     backend = query_spec.semantic.backend
     execution_path = query_spec.execution_path
     trigger_mode = query_spec.trigger_policy.mode
+    lowering_plan = resolve_topk_lowering_plan(query_spec)
     supported_scope_close_kinds = {"session", "tumbling", "semantic"}
 
     if trigger_mode not in {"on_event", "on_scope_close", "periodic", "idle_flush", "count_threshold"}:
@@ -1191,7 +1195,7 @@ def build_sem_topk_pipeline(
             lambda v: False,
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
-        if query_spec.ranking_method == "pointwise":
+        if lowering_plan.lowering_kind == "derived_attribute_then_classical":
             execution_path = "operator_owned"
 
     if execution_path == "auto" and trigger_mode in {"periodic", "idle_flush", "count_threshold"}:

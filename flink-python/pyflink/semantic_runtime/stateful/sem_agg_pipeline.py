@@ -15,7 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Planner/builder helpers for ``sem_agg``."""
+"""Planner/builder helpers for ``sem_agg``.
+
+The current lowering view for sem_agg remains conservative: the runtime is
+still treated as a native semantic reduction operator. This planner records
+that internal decision explicitly so future derived-aggregate lowering has a
+stable insertion point.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +29,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
+from pyflink.semantic_runtime.stateful.semantic_lowering import (
+    SemanticLoweringPlan,
+    resolve_agg_lowering_plan,
+)
 from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.stateful.sem_agg_window import WindowOwnedSemAggFunction
 
@@ -31,6 +41,7 @@ from pyflink.semantic_runtime.stateful.sem_agg_window import WindowOwnedSemAggFu
 class AggExecutionPlan:
     execution_path: str = "operator_owned"
     input_kind: str = "event_stream"
+    lowering_plan: Optional[SemanticLoweringPlan] = None
 
 
 def resolve_agg_execution_plan(
@@ -42,7 +53,11 @@ def resolve_agg_execution_plan(
     path = spec.execution_path
     if path == "auto":
         path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
-    return AggExecutionPlan(execution_path=path, input_kind=input_kind)
+    return AggExecutionPlan(
+        execution_path=path,
+        input_kind=input_kind,
+        lowering_plan=resolve_agg_lowering_plan(spec, input_kind=input_kind),
+    )
 
 
 def build_sem_agg_operator(

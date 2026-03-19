@@ -1207,6 +1207,12 @@ from pyflink.semantic_runtime.stateful.sem_agg_pipeline import (
 from pyflink.semantic_runtime.stateful.sem_agg_window import (
     WindowOwnedSemAggFunction,
 )
+from pyflink.semantic_runtime.stateful.semantic_lowering import (
+    resolve_topk_lowering_plan,
+    resolve_groupby_lowering_plan,
+    resolve_agg_lowering_plan,
+    resolve_join_lowering_plan,
+)
 
 
 class TestSemanticSpec:
@@ -1976,6 +1982,52 @@ class TestGroupbyQuerySpec:
         assert updated["scope_epoch"] == 1
 
 
+class TestSemanticLoweringPlans:
+    def test_topk_pointwise_lowers_to_score_plus_topn(self):
+        plan = resolve_topk_lowering_plan(TopKQuerySpec(ranking_method="pointwise"))
+        assert plan.lowering_kind == "derived_attribute_then_classical"
+        assert plan.classical_operator == "topn"
+        assert plan.derived_attribute is not None
+        assert plan.derived_attribute.attribute_kind == "score"
+        assert plan.derived_attribute.output_field == "score"
+
+    def test_topk_contextual_stays_native(self):
+        plan = resolve_topk_lowering_plan(TopKQuerySpec(ranking_method="pairwise"))
+        assert plan.lowering_kind == "native_runtime"
+        assert plan.derived_attribute is None
+
+    def test_groupby_window_owned_lowers_to_label_plus_groupby(self):
+        plan = resolve_groupby_lowering_plan(
+            GroupbyQuerySpec(execution_path="window_owned"),
+            input_kind="window_snapshot",
+        )
+        assert plan.lowering_kind == "derived_attribute_then_classical"
+        assert plan.classical_operator == "groupby"
+        assert plan.derived_attribute is not None
+        assert plan.derived_attribute.attribute_kind == "label"
+        assert plan.derived_attribute.output_field == "group_id"
+
+    def test_groupby_operator_owned_stays_native(self):
+        plan = resolve_groupby_lowering_plan(
+            GroupbyQuerySpec(execution_path="operator_owned"),
+            input_kind="event_stream",
+        )
+        assert plan.lowering_kind == "native_runtime"
+        assert plan.derived_attribute is None
+
+    def test_agg_currently_stays_native(self):
+        plan = resolve_agg_lowering_plan(AggQuerySpec(agg_method="summarize"))
+        assert plan.lowering_kind == "native_runtime"
+        assert plan.classical_operator is None
+
+    def test_join_lowers_to_match_plus_join(self):
+        plan = resolve_join_lowering_plan(JoinQuerySpec())
+        assert plan.lowering_kind == "derived_attribute_then_classical"
+        assert plan.classical_operator == "join/filter"
+        assert plan.derived_attribute is not None
+        assert plan.derived_attribute.attribute_kind == "match"
+
+
 class TestAggQuerySpec:
     def test_defaults(self):
         spec = AggQuerySpec()
@@ -2455,6 +2507,131 @@ class TestRuntimeConfig:
         raw = cfg.get_operator_raw("nonexistent")
         assert raw["ttl_seconds"] == 3600  # from defaults
 
+    def test_typed_topk_query_spec_from_legacy_flat_config(self):
+        cfg = RuntimeConfig.from_dict({
+            "defaults": {"ttl_seconds": 600},
+            "operators": {
+                "sem_topk": {
+                    "k": 3,
+                    "scorer_backend": "embedding",
+                    "ranking_method": "pointwise",
+                    "max_candidates": 25,
+                }
+            },
+        })
+        spec = cfg.get_topk_query_spec()
+        assert spec.k == 3
+        assert spec.semantic.backend == "embedding"
+        assert spec.scope_policy.ttl_seconds == 600
+        assert spec.scope_policy.max_candidates == 25
+
+    def test_typed_topk_query_spec_and_kernel_from_nested_config(self):
+        cfg = RuntimeConfig.from_dict({
+            "defaults": {"ttl_seconds": 900, "overflow_policy": "drop_newest"},
+            "operators": {
+                "sem_topk": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "rank weather days",
+                            "backend": "llm",
+                            "output_mode": "score",
+                        },
+                        "k": 5,
+                        "ranking_method": "pointwise",
+                        "execution_path": "window_owned",
+                        "scope_policy": {"max_candidates": 50},
+                    },
+                    "kernel": {
+                        "score_field": "similarity",
+                        "recompute_interval_ms": 2000,
+                        "overflow_policy": "drop_newest",
+                    },
+                }
+            },
+        })
+        spec = cfg.get_topk_query_spec()
+        kernel = cfg.get_topk_kernel_config()
+        assert spec.k == 5
+        assert spec.execution_path == "window_owned"
+        assert spec.scope_policy.ttl_seconds == 900
+        assert kernel.score_field == "similarity"
+        assert kernel.recompute_interval_ms == 2000
+        assert kernel.overflow_policy.value == "drop_newest"
+
+    def test_groupby_runtime_bundle_resolves_lowering(self):
+        cfg = RuntimeConfig.from_dict({
+            "operators": {
+                "sem_groupby": {
+                    "query_spec": {
+                        "execution_path": "window_owned",
+                        "semantic": {
+                            "instruction": "label records",
+                            "backend": "embedding",
+                            "output_mode": "label",
+                        },
+                    }
+                }
+            }
+        })
+        bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
+        assert bundle.query_spec.execution_path == "window_owned"
+        assert bundle.lowering_plan.lowering_kind == "derived_attribute_then_classical"
+        assert bundle.lowering_plan.classical_operator == "groupby"
+
+    def test_agg_runtime_bundle_preserves_native_reduce_view(self):
+        cfg = RuntimeConfig.from_dict({
+            "operators": {
+                "sem_agg": {
+                    "query_spec": {
+                        "agg_method": "summarize",
+                        "execution_path": "window_owned",
+                    },
+                    "kernel": {
+                        "max_buffer_events": 12,
+                    },
+                }
+            }
+        })
+        bundle = cfg.resolve_agg_runtime_bundle(input_kind="window_snapshot")
+        assert bundle.query_spec.agg_method == "summarize"
+        assert bundle.kernel_config.max_buffer_events == 12
+        assert bundle.lowering_plan.lowering_kind == "native_runtime"
+
+    def test_join_runtime_bundle_uses_match_lowering(self):
+        cfg = RuntimeConfig.from_dict({
+            "defaults": {"ttl_seconds": 1200},
+            "operators": {
+                "sem_join": {
+                    "backend": "embedding",
+                    "pairing_method": "blocking",
+                    "window_kind": "sliding",
+                    "window_size_ms": 3000,
+                }
+            },
+        })
+        bundle = cfg.resolve_join_runtime_bundle()
+        assert bundle.query_spec.semantic.backend == "embedding"
+        assert bundle.query_spec.scope_policy.ttl_seconds == 1200
+        assert bundle.lowering_plan.classical_operator == "join/filter"
+
+    def test_get_window_config_hydrates_typed_window_config(self):
+        cfg = RuntimeConfig.from_dict({
+            "defaults": {"ttl_seconds": 1800, "overflow_policy": "drop_newest"},
+            "operators": {
+                "sem_window": {
+                    "max_window_events": 7,
+                    "window_timeout_ms": 12000,
+                    "boundary_flag": "segment_done",
+                }
+            },
+        })
+        window_cfg = cfg.get_window_config()
+        assert window_cfg.max_window_events == 7
+        assert window_cfg.window_timeout_ms == 12000
+        assert window_cfg.boundary_flag == "segment_done"
+        assert window_cfg.ttl_seconds == 1800
+        assert window_cfg.overflow_policy.value == "drop_newest"
+
 
 # ============================================================================
 # External Search Backend Tests
@@ -2709,6 +2886,7 @@ class _FakeValueState:
 
 from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
     ContinuousRAGConfig,
+    build_continuous_rag_workflow_from_runtime_config,
     _StreamRouter,
     _AnswerSynthesiser,
     validate_rag_config,
@@ -2766,6 +2944,113 @@ class TestContinuousRAGConfig:
         assert cfg.topk_query_spec.k == 5
         assert cfg.topk_config.max_candidates == 50
         assert cfg.workflow_version == "v0.2.1"
+
+    def test_from_runtime_config_hydrates_typed_subconfigs(self):
+        runtime_cfg = RuntimeConfig.from_dict({
+            "defaults": {
+                "ttl_seconds": 900,
+                "async_timeout_ms": 12345,
+                "async_capacity": 17,
+            },
+            "llm": {"backend": "mock", "model": "test-model"},
+            "embedding": {"backend": "local_hashing", "dimensions": 48},
+            "operators": {
+                "sem_window": {
+                    "max_window_events": 9,
+                    "window_timeout_ms": 1111,
+                    "boundary_flag": "topic_shift",
+                },
+                "sem_groupby": {
+                    "query_spec": {
+                        "execution_path": "window_owned",
+                        "assign_threshold": 0.85,
+                    },
+                    "kernel": {"max_groups_per_key": 6},
+                },
+                "sem_agg": {
+                    "query_spec": {
+                        "agg_method": "summarize",
+                    },
+                    "kernel": {"flush_interval_ms": 2222},
+                },
+                "sem_search": {
+                    "max_candidates_per_request": 8,
+                },
+                "sem_topk": {
+                    "query_spec": {
+                        "k": 4,
+                        "ranking_method": "pointwise",
+                    },
+                    "kernel": {"max_candidates": 12},
+                },
+            },
+        })
+
+        cfg = ContinuousRAGConfig.from_runtime_config(runtime_cfg)
+
+        assert cfg.window_config.max_window_events == 9
+        assert cfg.window_config.window_timeout_ms == 1111
+        assert cfg.window_config.ttl_seconds == 900
+        assert cfg.groupby_query_spec is not None
+        assert cfg.groupby_query_spec.execution_path == "window_owned"
+        assert cfg.groupby_query_spec.assign_threshold == 0.85
+        assert cfg.groupby_config.max_groups_per_key == 6
+        assert cfg.agg_query_spec is not None
+        assert cfg.agg_query_spec.agg_method == "summarize"
+        assert cfg.agg_config.flush_interval_ms == 2222
+        assert cfg.retrieve_config.max_candidates_per_request == 8
+        assert cfg.topk_query_spec is not None
+        assert cfg.topk_query_spec.k == 4
+        assert cfg.topk_config is not None
+        assert cfg.topk_config.max_candidates == 12
+        assert cfg.topk_llm_config.model == "test-model"
+        assert cfg.topk_embedding_config is not None
+        assert cfg.topk_embedding_config.dimensions == 48
+        assert cfg.async_timeout_ms == 12345
+        assert cfg.async_capacity == 17
+
+    def test_from_runtime_config_allows_explicit_overrides(self):
+        runtime_cfg = RuntimeConfig.from_dict({})
+        custom_window = SemWindowConfig(max_window_events=3)
+        cfg = ContinuousRAGConfig.from_runtime_config(
+            runtime_cfg,
+            window_config=custom_window,
+            answer_prompt_template="Q={query}",
+            answer_output_schema={"answer": str},
+            workflow_version="v0.2.9",
+            config_version="test_override",
+        )
+        assert cfg.window_config is custom_window
+        assert cfg.answer_prompt_template == "Q={query}"
+        assert cfg.answer_output_schema == {"answer": str}
+        assert cfg.workflow_version == "v0.2.9"
+        assert cfg.config_version == "test_override"
+
+    def test_runtime_config_builder_helper_uses_typed_conversion(self):
+        import pyflink.semantic_runtime.stateful.continuous_rag_workflow as rag_workflow
+
+        runtime_cfg = RuntimeConfig.from_dict({})
+
+        sentinel = object()
+
+        def fake_builder(input_ds, config=None):
+            return {"config": config, "input": input_ds}
+
+        original = rag_workflow.build_continuous_rag_workflow
+        rag_workflow.build_continuous_rag_workflow = fake_builder
+        try:
+            out = build_continuous_rag_workflow_from_runtime_config(
+                sentinel,
+                runtime_cfg,
+                config_version="typed_test",
+            )
+        finally:
+            rag_workflow.build_continuous_rag_workflow = original
+
+        assert out["input"] is sentinel
+        built_cfg = out["config"]
+        assert isinstance(built_cfg, ContinuousRAGConfig)
+        assert built_cfg.config_version == "typed_test"
 
 
 class TestStreamRouter:

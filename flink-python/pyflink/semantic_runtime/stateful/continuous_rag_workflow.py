@@ -100,7 +100,7 @@ from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
 )
 from pyflink.semantic_runtime.semantic_spec import AggQuerySpec, GroupbyQuerySpec, TopKQuerySpec
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
+from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig, RuntimeConfig
 from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
     build_sem_topk_pipeline,
 )
@@ -172,6 +172,92 @@ class ContinuousRAGConfig:
     # Audit
     workflow_version: str = "v0.2.0"
     config_version: str = "default"
+
+    @classmethod
+    def from_runtime_config(
+        cls,
+        runtime_config: RuntimeConfig,
+        *,
+        window_config: Optional[SemWindowConfig] = None,
+        answer_prompt_template: Optional[str] = None,
+        answer_output_schema: Optional[Dict[str, type]] = None,
+        key_selector: Callable = simple_key_selector,
+        classify_async_fn: Optional[Any] = None,
+        summarize_async_fn: Optional[Any] = None,
+        retrieve_async_fn: Optional[Any] = None,
+        workflow_version: str = "v0.2.0",
+        config_version: str = "runtime_config",
+    ) -> "ContinuousRAGConfig":
+        """Build a workflow config from typed runtime config bundles.
+
+        This is the main bridge from the V0.2++ typed config shell into the
+        composed continuous RAG workflow.
+        """
+
+        base = cls()
+        topk_bundle = runtime_config.resolve_topk_runtime_bundle()
+        groupby_bundle = runtime_config.resolve_groupby_runtime_bundle(
+            input_kind="window_snapshot",
+        )
+        agg_bundle = runtime_config.resolve_agg_runtime_bundle(
+            input_kind="event_stream",
+        )
+
+        return cls(
+            window_config=window_config or runtime_config.get_window_config(),
+            groupby_config=groupby_bundle.kernel_config,
+            groupby_query_spec=groupby_bundle.query_spec,
+            agg_config=agg_bundle.kernel_config,
+            agg_query_spec=agg_bundle.query_spec,
+            retrieve_config=runtime_config.get_search_config(),
+            topk_config=topk_bundle.kernel_config,
+            topk_query_spec=topk_bundle.query_spec,
+            topk_llm_config=runtime_config.to_llm_client_config(),
+            topk_embedding_config=runtime_config.to_embedding_backend_config(),
+            answer_prompt_template=answer_prompt_template or base.answer_prompt_template,
+            answer_output_schema=answer_output_schema or dict(base.answer_output_schema),
+            key_selector=key_selector,
+            async_timeout_ms=runtime_config.defaults.async_timeout_ms,
+            async_capacity=runtime_config.defaults.async_capacity,
+            classify_async_fn=classify_async_fn,
+            summarize_async_fn=summarize_async_fn,
+            retrieve_async_fn=retrieve_async_fn,
+            workflow_version=workflow_version,
+            config_version=config_version,
+        )
+
+
+def build_continuous_rag_workflow_from_runtime_config(
+    input_ds: DataStream,
+    runtime_config: RuntimeConfig,
+    *,
+    window_config: Optional[SemWindowConfig] = None,
+    answer_prompt_template: Optional[str] = None,
+    answer_output_schema: Optional[Dict[str, type]] = None,
+    key_selector: Callable = simple_key_selector,
+    classify_async_fn: Optional[Any] = None,
+    summarize_async_fn: Optional[Any] = None,
+    retrieve_async_fn: Optional[Any] = None,
+    workflow_version: str = "v0.2.0",
+    config_version: str = "runtime_config",
+) -> Dict[str, DataStream]:
+    """Typed RuntimeConfig entry point for the composed workflow."""
+
+    return build_continuous_rag_workflow(
+        input_ds,
+        ContinuousRAGConfig.from_runtime_config(
+            runtime_config,
+            window_config=window_config,
+            answer_prompt_template=answer_prompt_template,
+            answer_output_schema=answer_output_schema,
+            key_selector=key_selector,
+            classify_async_fn=classify_async_fn,
+            summarize_async_fn=summarize_async_fn,
+            retrieve_async_fn=retrieve_async_fn,
+            workflow_version=workflow_version,
+            config_version=config_version,
+        ),
+    )
 
 
 # ============================================================================

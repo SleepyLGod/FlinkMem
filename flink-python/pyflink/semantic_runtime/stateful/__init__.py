@@ -60,3 +60,8 @@ from pyflink.semantic_runtime.stateful.external_search_backend import (  # noqa:
 from pyflink.semantic_runtime.stateful.simple_text_encoder import (  # noqa: F401
     HashingTextEncoder,
 )
+from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (  # noqa: F401
+    ContinuousRAGConfig,
+    build_continuous_rag_workflow,
+    build_continuous_rag_workflow_from_runtime_config,
+)

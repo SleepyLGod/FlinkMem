@@ -17,13 +17,11 @@
 
 """Planner/builder helpers for ``sem_groupby``.
 
-V0.2++ status
--------------
-- ``operator_owned`` is the only runtime path implemented today.
-- ``window_owned`` is a planned bounded/window-scoped execution path and
-  currently fails explicitly if requested.
-- ``auto`` currently resolves to ``operator_owned`` to avoid pretending the
-  bounded path already exists.
+This planner now resolves both:
+
+- execution path: ``window_owned`` vs ``operator_owned``
+- logical lowering view: ``semantic label + classical group-by`` vs native
+  continuous grouping
 """
 
 from __future__ import annotations
@@ -32,6 +30,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
+from pyflink.semantic_runtime.stateful.semantic_lowering import (
+    SemanticLoweringPlan,
+    resolve_groupby_lowering_plan,
+)
 from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
     SemGroupbyConfig,
     SemGroupbyFunction,
@@ -47,6 +49,7 @@ class GroupbyExecutionPlan:
 
     execution_path: str = "operator_owned"
     input_kind: str = "event_stream"
+    lowering_plan: Optional[SemanticLoweringPlan] = None
 
 
 def resolve_groupby_execution_plan(
@@ -64,7 +67,11 @@ def resolve_groupby_execution_plan(
     path = spec.execution_path
     if path == "auto":
         path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
-    return GroupbyExecutionPlan(execution_path=path, input_kind=input_kind)
+    return GroupbyExecutionPlan(
+        execution_path=path,
+        input_kind=input_kind,
+        lowering_plan=resolve_groupby_lowering_plan(spec, input_kind=input_kind),
+    )
 
 
 def build_sem_groupby_operator(
