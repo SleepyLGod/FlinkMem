@@ -17,11 +17,11 @@
 
 """Planner/builder helpers for ``sem_groupby``.
 
-This planner now resolves both:
+This planner resolves both:
 
-- execution path: ``window_owned`` vs ``operator_owned``
-- logical lowering view: ``semantic label + classical group-by`` vs native
-  continuous grouping
+- the internal physical path: window-owned vs operator-owned
+- the logical lowering view: ``semantic label + classical group-by`` vs
+  native continuous grouping
 """
 
 from __future__ import annotations
@@ -57,16 +57,10 @@ def resolve_groupby_execution_plan(
     *,
     input_kind: str = "event_stream",
 ) -> GroupbyExecutionPlan:
-    """Resolve the current execution plan.
-
-    ``auto`` prefers ``window_owned`` when the input is already a bounded
-    window snapshot; otherwise it falls back to ``operator_owned``.
-    """
+    """Resolve the internal physical path for ``sem_groupby``."""
 
     spec = query_spec or GroupbyQuerySpec()
-    path = spec.execution_path
-    if path == "auto":
-        path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
+    path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
     return GroupbyExecutionPlan(
         execution_path=path,
         input_kind=input_kind,

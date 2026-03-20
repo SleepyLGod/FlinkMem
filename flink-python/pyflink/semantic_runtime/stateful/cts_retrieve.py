@@ -40,7 +40,7 @@ Guardrails:
   - ``max_candidates_per_request``: hard limit on output set size.
   - ``max_cache_entries_per_key``: bounds keyed cache growth.
   - Strict retrieval timeout budget via async bridge.
-  - Deterministic overflow / degrade tagging.
+  - Deterministic overflow handling.
 
 Relationship to V0.1 ``sem_lookup_join`` (formerly ``sem_join_retrieve``):
   - ``sem_search`` is the stateful evolution (keyed cache, continuous).
@@ -204,8 +204,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
                 "query_seq_id": event.seq_id,
                 "candidates": truncated,
                 "candidate_count": len(truncated),
+                "truncated": len(local_candidates) > self._config.max_candidates_per_request,
                 "source": "cache",
-                "degraded": len(local_candidates) > self._config.max_candidates_per_request,
                 "timestamp_ms": now_ms,
             }
         else:
@@ -299,17 +299,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
     ):
         """Merge async retrieval results into cache and emit."""
         if not result_dict.get("success", False):
-            yield {
-                "key": result_dict.get("key", ""),
-                "query": result_dict.get("payload", {}).get("query", ""),
-                "query_seq_id": result_dict.get("payload", {}).get("event_seq_id", 0),
-                "candidates": [],
-                "candidate_count": 0,
-                "source": "async_failed",
-                "degraded": True,
-                "timestamp_ms": now_ms,
-            }
-            return
+            error = result_dict.get("error", "retrieve_async_failed")
+            raise RuntimeError(f"cts_retrieve async retrieval failed: {error}")
 
         candidates = result_dict.get("result", {}).get("candidates", [])
 
@@ -334,8 +325,8 @@ class CtsRetrieveFunction(KeyedProcessFunction):
             "query_seq_id": result_dict.get("payload", {}).get("event_seq_id", 0),
             "candidates": truncated,
             "candidate_count": len(truncated),
+            "truncated": len(candidates) > self._config.max_candidates_per_request,
             "source": "async_store",
-            "degraded": False,
             "timestamp_ms": now_ms,
         }
 
@@ -344,7 +335,6 @@ class CtsRetrieveFunction(KeyedProcessFunction):
 
         - DROP_OLDEST: evict oldest entries beyond the limit.
         - DROP_NEWEST: evict newest entries beyond the limit.
-        - DEGRADE_TAG: keep all but tag the overflow in meta (caller responsibility).
 
         Returns count evicted.
         """
@@ -358,10 +348,6 @@ class CtsRetrieveFunction(KeyedProcessFunction):
             return 0
 
         policy = self._config.overflow_policy
-        if policy == OverflowPolicy.DEGRADE_TAG:
-            # Accept all, but caller should tag output as degraded
-            return 0
-
         to_evict = len(entries) - self._config.max_cache_entries_per_key
         if policy == OverflowPolicy.DROP_NEWEST:
             entries.sort(key=lambda x: x[1], reverse=True)  # newest first
@@ -375,11 +361,3 @@ class CtsRetrieveFunction(KeyedProcessFunction):
     def _evict_cache(self, meta: Dict[str, Any]) -> int:
         """Timer-driven eviction of oldest cache entries beyond limit."""
         return self._enforce_cache_limit()
-
-
-# ── Public aliases (V0.2+) ─────────────────────────────────────────────────
-# The canonical public name is ``sem_search``.  Internal code may still
-# reference ``CtsRetrieveFunction`` / ``CtsRetrieveConfig`` during
-# the transition period.
-SemSearchConfig = CtsRetrieveConfig
-SemSearchFunction = CtsRetrieveFunction

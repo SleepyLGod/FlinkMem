@@ -10,8 +10,8 @@ What this suite covers:
 3) LoCoMo single-user QA correctness evaluation (1 user x N QA, default N=20).
 
 Two-level metrics:
-- Structural/operator hard-gates (count conservation, parseability, degraded tagging,
-  non-degraded schema validity).
+- Structural/operator hard-gates (count conservation, parseability, explicit
+  error tagging, valid-output schema validity).
 - Semantic quality metrics (exact match + relaxed match).
 
 Notes:
@@ -60,7 +60,10 @@ from pyflink.datastream.functions import WindowFunction
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.sem_join_retrieve import SemJoinRetrieveConfig, SemJoinRetrieveFunction
+from pyflink.semantic_runtime.operators.sem_join_retrieve import (
+    SemLookupJoinConfig,
+    SemLookupJoinFunction,
+)
 from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
 
 
@@ -260,8 +263,8 @@ def stage_structural_stats(
     stage_name: str,
     inputs: List[str],
     outputs: List[str],
-    non_degraded_schema: Optional[Dict[str, type]] = None,
-    non_degraded_extra_check: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    valid_output_schema: Optional[Dict[str, type]] = None,
+    valid_output_extra_check: Optional[Callable[[Dict[str, Any]], bool]] = None,
     enforce_one_to_one: bool = True,
     max_allowed_attempts: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -271,10 +274,10 @@ def stage_structural_stats(
         )
 
     parsed_ok = 0
-    degraded_count = 0
-    degraded_tag_errors = 0
-    non_degraded_count = 0
-    non_degraded_schema_invalid = 0
+    error_output_count = 0
+    error_tag_errors = 0
+    valid_output_count = 0
+    valid_output_schema_invalid = 0
     latencies: List[float] = []
     attempts_list: List[int] = []
 
@@ -285,18 +288,18 @@ def stage_structural_stats(
         except Exception:
             continue
 
-        is_degraded = bool(obj.get("_degraded", False))
-        if is_degraded:
-            degraded_count += 1
+        has_error_output = bool(str(obj.get("_error", "")).strip())
+        if has_error_output:
+            error_output_count += 1
             if not str(obj.get("_error", "")).strip():
-                degraded_tag_errors += 1
+                error_tag_errors += 1
             continue
 
-        non_degraded_count += 1
-        if non_degraded_schema is not None and not validate_shallow_schema(obj, non_degraded_schema):
-            non_degraded_schema_invalid += 1
-        if non_degraded_extra_check is not None and not non_degraded_extra_check(obj):
-            non_degraded_schema_invalid += 1
+        valid_output_count += 1
+        if valid_output_schema is not None and not validate_shallow_schema(obj, valid_output_schema):
+            valid_output_schema_invalid += 1
+        if valid_output_extra_check is not None and not valid_output_extra_check(obj):
+            valid_output_schema_invalid += 1
 
         metrics = obj.get("_metrics", {})
         if isinstance(metrics, dict) and isinstance(metrics.get("latency_ms"), (int, float)):
@@ -307,11 +310,11 @@ def stage_structural_stats(
     parse_fail_count = len(outputs) - parsed_ok
     if parse_fail_count != 0:
         raise AssertionError(f"{stage_name}: {parse_fail_count} outputs are not valid JSON objects")
-    if degraded_tag_errors != 0:
-        raise AssertionError(f"{stage_name}: {degraded_tag_errors} degraded outputs missing _error")
-    if non_degraded_schema_invalid != 0:
+    if error_tag_errors != 0:
+        raise AssertionError(f"{stage_name}: {error_tag_errors} error-tagged outputs missing _error")
+    if valid_output_schema_invalid != 0:
         raise AssertionError(
-            f"{stage_name}: {non_degraded_schema_invalid} non-degraded outputs violate schema"
+            f"{stage_name}: {valid_output_schema_invalid} valid outputs violate schema"
         )
     if max_allowed_attempts is not None:
         if attempts_list and max(attempts_list) > max_allowed_attempts:
@@ -324,23 +327,23 @@ def stage_structural_stats(
         sorted_lat = sorted(latencies)
         idx = int(len(sorted_lat) * 0.95)
         p95 = sorted_lat[min(idx, len(sorted_lat) - 1)]
-    schema_valid_output_count = non_degraded_count - non_degraded_schema_invalid
+    schema_valid_output_count = valid_output_count - valid_output_schema_invalid
     schema_valid_output_rate = schema_valid_output_count / max(len(outputs), 1)
 
     return {
         "stage": stage_name,
         "input_count": len(inputs),
         "output_count": len(outputs),
-        "degraded_count": degraded_count,
-        "degraded_rate": degraded_count / max(len(outputs), 1),
+        "error_output_count": error_output_count,
+        "error_output_rate": error_output_count / max(len(outputs), 1),
         "timeout_rate": sum(1 for o in outputs if "flink_timeout" in o) / max(len(outputs), 1),
-        "non_degraded_count": non_degraded_count,
+        "valid_output_count": valid_output_count,
         "schema_valid_output_rate": schema_valid_output_rate,
         "p95_latency_ms": round(p95, 2),
         "avg_attempts": round(sum(attempts_list) / max(len(attempts_list), 1), 2),
         "max_attempts": max(attempts_list) if attempts_list else 0,
         "parse_fail_count": parse_fail_count,
-        "schema_invalid_count": non_degraded_schema_invalid,
+        "schema_invalid_count": valid_output_schema_invalid,
     }
 
 
@@ -424,7 +427,7 @@ def make_qa_prompt() -> str:
     )
 
 
-def extra_check_sem_join_non_degraded(obj: Dict[str, Any]) -> bool:
+def extra_check_sem_join_valid_output(obj: Dict[str, Any]) -> bool:
     if "join_result" not in obj:
         return False
     if not isinstance(obj.get("candidate_count"), int):
@@ -468,12 +471,12 @@ def run_semantic_chain(
         "sem_map_entity",
         inputs,
         s1_out,
-        non_degraded_schema=entity_schema,
+        valid_output_schema=entity_schema,
         max_allowed_attempts=max_allowed_attempts,
     )
 
     # Stage 2: sem_filter(topic continuity)
-    s2_fn = SemFilterFunction(make_topic_filter_prompt(), llm_cfg_filter, default_decision=False)
+    s2_fn = SemFilterFunction(make_topic_filter_prompt(), llm_cfg_filter)
     s2_out = run_async_stage(
         f"{stage_prefix}_sem_filter_topic", s1_out, s2_fn, timeout_s, capacity, ordered=False
     )
@@ -481,18 +484,18 @@ def run_semantic_chain(
         "sem_filter_topic",
         s1_out,
         s2_out,
-        non_degraded_schema={"decision": bool, "confidence": float, "reason": str, "_input": str},
+        valid_output_schema={"decision": bool, "confidence": float, "reason": str, "_input": str},
         max_allowed_attempts=max_allowed_attempts,
     )
 
     # Stage 3: sem_join_retrieve
-    join_cfg = SemJoinRetrieveConfig(
+    join_cfg = SemLookupJoinConfig(
         max_candidates_per_record=min(max(len(retriever_candidates), 1), 32),
         retrieve_timeout_ms=5000.0,
         mock_candidates=retriever_candidates[:32],
         mock_retrieve_delay_s=0.01,
     )
-    s3_fn = SemJoinRetrieveFunction(make_join_prompt(), llm_cfg_join_match, join_cfg)
+    s3_fn = SemLookupJoinFunction(make_join_prompt(), llm_cfg_join_match, join_cfg)
     s3_out = run_async_stage(
         f"{stage_prefix}_sem_join_retrieve", s2_out, s3_fn, timeout_s, capacity, ordered=False
     )
@@ -500,8 +503,8 @@ def run_semantic_chain(
         "sem_join_retrieve",
         s2_out,
         s3_out,
-        non_degraded_schema={"candidate_count": int, "truncated": bool},
-        non_degraded_extra_check=extra_check_sem_join_non_degraded,
+        valid_output_schema={"candidate_count": int, "truncated": bool},
+        valid_output_extra_check=extra_check_sem_join_valid_output,
         max_allowed_attempts=max_allowed_attempts,
     )
 
@@ -515,7 +518,7 @@ def run_semantic_chain(
         "sem_map_action",
         s3_out,
         s4_out,
-        non_degraded_schema=action_schema,
+        valid_output_schema=action_schema,
         max_allowed_attempts=max_allowed_attempts,
     )
 
@@ -645,18 +648,18 @@ def run_qa_evaluation(
         "qa_sem_map",
         inputs,
         outputs,
-        non_degraded_schema={"answer": str},
+        valid_output_schema={"answer": str},
         max_allowed_attempts=max_allowed_attempts,
     )
 
     per_sample = []
     exact = 0
     relaxed = 0
-    degraded = 0
+    failed_output_count = 0
     for req, out in zip(qa_requests, outputs):
         obj = loads_json_or_raise(out)
-        if obj.get("_degraded", False):
-            degraded += 1
+        if str(obj.get("_error", "")).strip():
+            failed_output_count += 1
             pred = ""
         else:
             pred = str(obj.get("answer", "")).strip()
@@ -673,7 +676,7 @@ def run_qa_evaluation(
                 "pred_answer": pred,
                 "exact_match": em,
                 "relaxed_match": rm,
-                "degraded": bool(obj.get("_degraded", False)),
+                "failed": bool(str(obj.get("_error", "")).strip()),
                 "error": obj.get("_error", ""),
             }
         )
@@ -687,7 +690,7 @@ def run_qa_evaluation(
         "relaxed_match": relaxed,
         "exact_match_rate": exact / max(total, 1),
         "relaxed_match_rate": relaxed / max(total, 1),
-        "degraded_count": degraded,
+        "failed_output_count": failed_output_count,
         "failed_examples": failed_examples,
         "samples": per_sample,
     }
@@ -759,7 +762,7 @@ def write_artifacts(summary: Dict[str, Any], artifact_dir: str, run_id: str) -> 
         md_lines.append(f"- total: {qa['total']}")
         md_lines.append(f"- exact_match_rate: {qa['exact_match_rate']:.2%}")
         md_lines.append(f"- relaxed_match_rate: {qa['relaxed_match_rate']:.2%}")
-        md_lines.append(f"- degraded_count: {qa['degraded_count']}")
+        md_lines.append(f"- failed_output_count: {qa['failed_output_count']}")
         md_lines.append("")
         md_lines.append("### Failed Examples (top 5)")
         if qa["failed_examples"]:
@@ -953,7 +956,7 @@ def main() -> None:
         qa = summary["qa_eval"]
         print(
             f"qa_total={qa['total']} em={qa['exact_match_rate']:.2%} "
-            f"relaxed={qa['relaxed_match_rate']:.2%} degraded={qa['degraded_count']}"
+            f"relaxed={qa['relaxed_match_rate']:.2%} failed={qa['failed_output_count']}"
         )
 
 

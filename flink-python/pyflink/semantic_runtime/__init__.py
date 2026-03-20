@@ -17,11 +17,6 @@
 
 """Continuous Prompts (CP) replication on PyFlink."""
 
-from pyflink.semantic_runtime.operators import (  # noqa: F401
-    SemLabelFunction,
-    SemMatchFunction,
-    SemScoreFunction,
-)
 from pyflink.semantic_runtime.semantic_spec import (  # noqa: F401
     SemanticSpec,
     TriggerPolicy,

@@ -795,7 +795,6 @@ class SemGroupbyFunction(KeyedProcessFunction):
         Overflow behaviour depends on ``overflow_policy``:
         - DROP_OLDEST: evict the least-recently-updated group to make room.
         - DROP_NEWEST: refuse to create the group (return None).
-        - DEGRADE_TAG: create the group but tag it as ``_degraded``.
         """
         count = sum(1 for _ in self._group_profiles.keys())
         if count >= self._resolved_max_groups_per_key:
@@ -805,15 +804,12 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 self._evict_n_oldest(1)
             elif policy == OverflowPolicy.DROP_NEWEST:
                 return None
-            # DEGRADE_TAG falls through — we create but mark degraded
 
         import uuid
         group_id = uuid.uuid4().hex[:8]
         label = " ".join(event.payload.split()[:5])
         profile = _new_group_profile(group_id, label, now_ms)
         profile["event_count"] = 1
-        if count >= self._resolved_max_groups_per_key:
-            profile["_degraded"] = True
         self._group_profiles.put(group_id, profile)
         return group_id
 

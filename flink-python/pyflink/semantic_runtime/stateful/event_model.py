@@ -276,7 +276,6 @@ def retrieve_to_topk_items(
     # Envelope-level metadata to propagate to each expanded candidate
     source = retrieve_output.get("source", "")
     query = retrieve_output.get("query", "")
-    degraded = retrieve_output.get("degraded", False)
     error = retrieve_output.get("error", "")
 
     result: List[Dict[str, Any]] = []
@@ -289,7 +288,6 @@ def retrieve_to_topk_items(
         out["query_seq_id"] = query_seq_id
         out.setdefault("source", source)
         out.setdefault("query", query)
-        out.setdefault("degraded", degraded)
         out.setdefault("error", error)
         result.append(out)
     return result
@@ -306,6 +304,7 @@ def retrieve_to_answer_context(
         "query_seq_id": retrieve_output.get("query_seq_id", 0),
         "retrieved_context": items,
         "total_candidates": retrieve_output.get("candidate_count", len(items)),
+        "truncated": bool(retrieve_output.get("truncated", False)),
         "retrieval_changed": True,
         "source": retrieve_output.get("source", ""),
     }
@@ -325,6 +324,7 @@ def topk_to_answer_context(
         "query_seq_id": topk_output.get("query_seq_id", 0),
         "retrieved_context": items,
         "total_candidates": topk_output.get("total_candidates", len(items)),
+        "truncated": bool(topk_output.get("truncated", False)),
         "retrieval_changed": topk_output.get("changed", True),
         "source": topk_output.get("source", ""),
     }

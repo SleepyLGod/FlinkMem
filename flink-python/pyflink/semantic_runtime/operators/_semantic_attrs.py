@@ -15,17 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Public semantic derived-attribute operators.
+"""Internal helpers for lowering-oriented semantic attributes.
 
-These operators make the lowering view explicit at the public API layer:
+These wrappers are used by internal lowering/planning code when a semantic
+operator is implemented as:
 
-- ``sem_score``  -> semantic score attribute
-- ``sem_label``  -> semantic label attribute
-- ``sem_match``  -> semantic match predicate/score attribute
+- derived semantic attribute generation
+- followed by a classical Flink operator
 
-They intentionally reuse ``SemMapFunction`` so the parsing, schema
-validation, timeout handling, and metric behavior stay identical to the rest
-of the V0.1 async operator family.
+They intentionally reuse ``SemMapFunction`` so parsing, schema validation,
+timeout handling, and metric behavior stay consistent with the rest of the
+row-style operator implementation.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
 
 
 class SemScoreFunction(SemMapFunction):
-    """Public semantic score attribute operator.
+    """Internal semantic score attribute helper.
 
     Expected LLM response schema:
 
@@ -53,7 +53,7 @@ class SemScoreFunction(SemMapFunction):
 
 
 class SemLabelFunction(SemMapFunction):
-    """Public semantic label attribute operator.
+    """Internal semantic label attribute helper.
 
     Expected LLM response schema:
 
@@ -71,7 +71,7 @@ class SemLabelFunction(SemMapFunction):
 
 
 class SemMatchFunction(SemMapFunction):
-    """Public semantic match attribute operator.
+    """Internal semantic match attribute helper.
 
     Expected LLM response schema:
 

@@ -35,7 +35,6 @@ from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
     _AnswerSynthesiser,
     _ClassifyAsyncMergeFunction,
     _GroupbyToAggEnvelope,
-    _MissingAsyncFallbackMapper,
     _RetrievalEnvelopeExpander,
     _RetrievalToAnswerEnvelope,
     _RetrieveAsyncMergeFunction,
@@ -661,10 +660,9 @@ def _merge_with_async(
                 merged.extend(list(merge_fn.process_element(async_result, ctx)))
         return merged
 
-    fallback = _MissingAsyncFallbackMapper(fallback_stage)
-    for work in side_work_rows:
-        merged.append(fallback(work))
-    return merged
+    if not side_work_rows:
+        return merged
+    raise ValueError(f"Async bridge not configured for stage {fallback_stage!r}")
 
 
 def _run_memory_path(
@@ -892,14 +890,14 @@ async def _run_real_answer_completion(
                 out = dict(request)
                 out["answer"] = str(parsed.get("answer", ""))
                 out["answer_confidence"] = float(parsed.get("confidence", 0.0))
-                out["answer_degraded"] = False
+                out["answer_failed"] = False
                 out["answer_error"] = ""
                 results.append(out)
             except Exception as exc:
                 out = dict(request)
                 out["answer"] = ""
                 out["answer_confidence"] = 0.0
-                out["answer_degraded"] = True
+                out["answer_failed"] = True
                 out["answer_error"] = str(exc)
                 results.append(out)
         return results
@@ -989,7 +987,7 @@ def _write_run_artifacts(
         "retrieval_output_count": len(retrieval_rows),
         "answer_request_count": len(answer_requests),
         "answer_output_count": len(answer_rows),
-        "answer_degraded_count": sum(1 for row in answer_rows if row.get("answer_degraded")),
+        "answer_failed_count": sum(1 for row in answer_rows if row.get("answer_failed")),
         "memory_rows": memory_rows,
         "retrieval_rows": retrieval_rows,
         "answer_requests": answer_requests,
@@ -1005,7 +1003,7 @@ def _write_run_artifacts(
         f"- retrieval_output_count: `{len(retrieval_rows)}`",
         f"- answer_request_count: `{len(answer_requests)}`",
         f"- answer_output_count: `{len(answer_rows)}`",
-        f"- answer_degraded_count: `{sum(1 for row in answer_rows if row.get('answer_degraded'))}`",
+        f"- answer_failed_count: `{sum(1 for row in answer_rows if row.get('answer_failed'))}`",
         "",
         "## Answer Samples",
     ]
@@ -1156,12 +1154,12 @@ def test_v02_workflow_retrieve_path_pairwise_topk():
     assert retrieval_rows
     budget_rows = [r for r in retrieval_rows if "budget" in str(r.get("query", "")).lower()]
     assert budget_rows
-    assert budget_rows[0].get("degraded") is False
+    assert budget_rows[0].get("truncated") is False
     assert budget_rows[0].get("total_candidates", 0) >= 1
     assert len(budget_rows[0].get("retrieved_context", [])) >= 1
 
 
-def test_v02_workflow_summarize_and_missing_async_fallback():
+def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
     events = _build_use_case_events()
 
     # Summarize async merge-back path
@@ -1173,18 +1171,24 @@ def test_v02_workflow_summarize_and_missing_async_fallback():
     )
     assert any(r.get("mode") == "summarize_async" for r in memory_rows)
 
-    # Missing async worker -> explicit degraded fallback records
-    retrieval_rows_missing = _run_retrieval_path(events, retrieve_async_fn=None)
-    memory_rows_missing = _run_memory_path(
-        events,
-        agg_mode="summarize",
-        classify_async_fn=_DeterministicClassifyAsyncFn(),
-        summarize_async_fn=None,
-    )
+    try:
+        _run_retrieval_path(events, retrieve_async_fn=None)
+    except ValueError as exc:
+        assert "retrieve" in str(exc)
+    else:
+        raise AssertionError("Expected missing retrieve async worker to fail fast")
 
-    assert any(r.get("degraded") is True for r in retrieval_rows_missing)
-    assert any(r.get("error") == "async_retrieve_missing_worker" for r in retrieval_rows_missing)
-    assert any(r.get("mode") == "summarize_missing_worker" for r in memory_rows_missing)
+    try:
+        _run_memory_path(
+            events,
+            agg_mode="summarize",
+            classify_async_fn=_DeterministicClassifyAsyncFn(),
+            summarize_async_fn=None,
+        )
+    except ValueError as exc:
+        assert "summarize" in str(exc)
+    else:
+        raise AssertionError("Expected missing summarize async worker to fail fast")
 
 
 def test_v02_workflow_groupby_llm_refine_window_owned_scope_close():
@@ -1195,7 +1199,6 @@ def test_v02_workflow_groupby_llm_refine_window_owned_scope_close():
         backend="llm",
         assignment_method="llm_refine",
     )
-    groupby_qs.execution_path = "window_owned"
     groupby_qs.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
 
     memory_rows = _run_memory_path(
@@ -1295,7 +1298,7 @@ def main() -> None:
             for row in answer_rows:
                 row["answer"] = row.get("context_str", "")
                 row["answer_confidence"] = 1.0
-                row["answer_degraded"] = False
+                row["answer_failed"] = False
                 row["answer_error"] = ""
             json_path, md_path = _write_run_artifacts(
                 args.artifact_dir,
@@ -1353,8 +1356,8 @@ def main() -> None:
         print(f"retrieval_output_count: {len(retrieval_rows)}")
         print(f"answer_output_count: {len(answer_rows)}")
         print(
-            "answer_degraded_count: "
-            f"{sum(1 for row in answer_rows if row.get('answer_degraded'))}"
+            "answer_failed_count: "
+            f"{sum(1 for row in answer_rows if row.get('answer_failed'))}"
         )
     finally:
         _close_workers(classify_fn, summarize_fn, retrieve_fn)

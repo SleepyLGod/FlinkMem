@@ -22,7 +22,7 @@ SemMapFunction smoke test — through AsyncDataStream.
 Uses MockLLMClient configured to return valid JSON matching the expected schema.
 Verifies:
   1. Normal path: structured output parsed correctly.
-  2. Timeout path: degraded record emitted (via short Flink timeout + long mock delay).
+  2. Timeout path: the job fails fast (via short Flink timeout + long mock delay).
 """
 
 import json
@@ -73,7 +73,7 @@ def run_normal():
 
 
 def run_timeout():
-    """Timeout path: mock delay > Flink timeout -> degraded records."""
+    """Timeout path: mock delay > Flink timeout -> job failure."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
@@ -112,4 +112,3 @@ if __name__ == "__main__":
     else:
         print(f"Unknown test: {test}. Use 'normal' or 'timeout'.")
         sys.exit(1)
-

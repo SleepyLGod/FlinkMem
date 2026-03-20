@@ -254,11 +254,6 @@ VALID_TRIGGER_MODES = {
     "idle_flush",
     "count_threshold",
 }
-VALID_TOPK_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
-VALID_GROUPBY_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
-VALID_AGG_EXECUTION_PATHS = {"auto", "window_owned", "operator_owned"}
-
-
 @dataclass
 class TriggerPolicy:
     """Defines when an operator computes, refreshes, or emits results.
@@ -335,11 +330,6 @@ class TopKQuerySpec:
         backend to score each candidate independently.  ``"pairwise"`` and
         ``"listwise"`` are contextual reranking strategies evaluated on
         bounded candidate pools (Phase C).
-    execution_path : str
-        Execution path selector. ``"window_owned"`` expects bounded pools or
-        window-bounded snapshots. ``"operator_owned"`` expects continuous flat
-        candidate updates. ``"auto"`` chooses the most suitable path for the
-        currently supported semantics.
     trigger_policy : TriggerPolicy
         Defines when the current active candidate set is ranked/refreshed.
     scope_policy : TopKScopePolicy
@@ -351,7 +341,6 @@ class TopKQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     ranking_method: str = "pointwise"
-    execution_path: str = "auto"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: TopKScopePolicy = field(default_factory=TopKScopePolicy)
 
@@ -360,11 +349,6 @@ class TopKQuerySpec:
             raise ValueError(
                 f"Invalid ranking_method={self.ranking_method!r}. "
                 f"Must be one of {VALID_RANKING_METHODS}."
-            )
-        if self.execution_path not in VALID_TOPK_EXECUTION_PATHS:
-            raise ValueError(
-                f"Invalid execution_path={self.execution_path!r}. "
-                f"Must be one of {VALID_TOPK_EXECUTION_PATHS}."
             )
         if self.k < 1:
             raise ValueError(f"k must be >= 1, got {self.k}")
@@ -380,7 +364,6 @@ class TopKQuerySpec:
         backend: str = "external_score",
         ttl_seconds: Optional[int] = None,
         max_candidates: Optional[int] = None,
-        execution_path: str = "auto",
     ) -> "TopKQuerySpec":
         """Quick builder for the common case.
 
@@ -397,7 +380,6 @@ class TopKQuerySpec:
         return cls(
             semantic=SemanticSpec.for_sem_topk(instruction, scorer_backend=backend),
             k=k,
-            execution_path=execution_path,
             trigger_policy=TriggerPolicy(),
             scope_policy=TopKScopePolicy(
                 ttl_seconds=ttl_seconds,
@@ -414,7 +396,6 @@ class TopKQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "ranking_method": self.ranking_method,
-            "execution_path": self.execution_path,
             "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
@@ -427,7 +408,6 @@ class TopKQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             ranking_method=d.get("ranking_method", "pointwise"),
-            execution_path=d.get("execution_path", "auto"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=TopKScopePolicy.from_dict(d.get("scope_policy", {})),
         )
@@ -489,7 +469,6 @@ class GroupbyQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     assignment_method: str = "llm"
-    execution_path: str = "auto"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     maintenance_trigger_policy: Optional[TriggerPolicy] = None
     scope_policy: GroupbyScopePolicy = field(default_factory=GroupbyScopePolicy)
@@ -502,12 +481,6 @@ class GroupbyQuerySpec:
                 f"Invalid assignment_method={self.assignment_method!r}. "
                 f"Must be one of {VALID_ASSIGNMENT_METHODS}."
             )
-        if self.execution_path not in VALID_GROUPBY_EXECUTION_PATHS:
-            raise ValueError(
-                f"Invalid execution_path={self.execution_path!r}. "
-                f"Must be one of {VALID_GROUPBY_EXECUTION_PATHS}."
-            )
-
     @classmethod
     def simple(
         cls,
@@ -515,7 +488,6 @@ class GroupbyQuerySpec:
         *,
         backend: str = "llm",
         assignment_method: str = "llm",
-        execution_path: str = "auto",
         ttl_seconds: Optional[int] = None,
         max_groups_per_key: Optional[int] = None,
     ) -> "GroupbyQuerySpec":
@@ -526,7 +498,6 @@ class GroupbyQuerySpec:
                 output_mode="label",
             ),
             assignment_method=assignment_method,
-            execution_path=execution_path,
             trigger_policy=TriggerPolicy(),
             scope_policy=GroupbyScopePolicy(
                 ttl_seconds=ttl_seconds,
@@ -540,7 +511,6 @@ class GroupbyQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "assignment_method": self.assignment_method,
-            "execution_path": self.execution_path,
             "trigger_policy": self.trigger_policy.to_dict(),
             "maintenance_trigger_policy": (
                 self.maintenance_trigger_policy.to_dict()
@@ -559,7 +529,6 @@ class GroupbyQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             assignment_method=d.get("assignment_method", "llm"),
-            execution_path=d.get("execution_path", "auto"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             maintenance_trigger_policy=(
                 TriggerPolicy.from_dict(d["maintenance_trigger_policy"])
@@ -630,7 +599,6 @@ class AggQuerySpec:
     query_id: str = "default"
     query_version: int = 1
     agg_method: str = "algebraic"
-    execution_path: str = "auto"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: AggScopePolicy = field(default_factory=AggScopePolicy)
 
@@ -640,12 +608,6 @@ class AggQuerySpec:
                 f"Invalid agg_method={self.agg_method!r}. "
                 f"Must be one of {VALID_AGG_METHODS}."
             )
-        if self.execution_path not in VALID_AGG_EXECUTION_PATHS:
-            raise ValueError(
-                f"Invalid execution_path={self.execution_path!r}. "
-                f"Must be one of {VALID_AGG_EXECUTION_PATHS}."
-            )
-
     @classmethod
     def simple(
         cls,
@@ -664,7 +626,6 @@ class AggQuerySpec:
                 output_mode="summary",
             ),
             agg_method=agg_method,
-            execution_path="auto",
             trigger_policy=TriggerPolicy(),
             scope_policy=AggScopePolicy(
                 ttl_seconds=ttl_seconds,
@@ -679,7 +640,6 @@ class AggQuerySpec:
             "query_id": self.query_id,
             "query_version": self.query_version,
             "agg_method": self.agg_method,
-            "execution_path": self.execution_path,
             "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
         }
@@ -691,7 +651,6 @@ class AggQuerySpec:
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             agg_method=d.get("agg_method", "algebraic"),
-            execution_path=d.get("execution_path", "auto"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=AggScopePolicy.from_dict(d.get("scope_policy", {})),
         )

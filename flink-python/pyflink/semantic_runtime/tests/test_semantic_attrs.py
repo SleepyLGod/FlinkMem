@@ -7,7 +7,7 @@ import asyncio
 import json
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.semantic_attrs import (
+from pyflink.semantic_runtime.operators._semantic_attrs import (
     SemLabelFunction,
     SemMatchFunction,
     SemScoreFunction,
@@ -87,8 +87,10 @@ def test_sem_match_function_degrades_on_schema_mismatch():
         ),
     )
     _open(fn)
-    out = asyncio.run(fn.async_invoke({"left": "A", "right": "B"}))
-    parsed = json.loads(out[0])
-    assert parsed["_degraded"] is True
-    assert "schema_validation_error" in parsed["_error"]
+    try:
+        asyncio.run(fn.async_invoke({"left": "A", "right": "B"}))
+    except ValueError as exc:
+        assert "violates output_schema" in str(exc)
+    else:
+        raise AssertionError("Expected schema mismatch to fail fast")
     fn.close()

@@ -24,11 +24,6 @@ list.  The LLM reranks these candidates and returns the top-k.
 This is the **local** V0.1 variant (no keyed state).  The continuous,
 stateful ``sem_topk`` lives in ``stateful/sem_topk_continuous.py``.
 
-.. deprecated::
-    The class ``SemTopKFunction`` in this module is a deprecated alias for
-    ``SemLocalTopKFunction``.  Use ``SemLocalTopKFunction`` for the local
-    variant, and ``stateful.sem_topk_continuous.SemTopKFunction`` for the
-    canonical stream/stateful variant.
 """
 
 from __future__ import annotations
@@ -41,7 +36,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators._common import attach_metrics, make_degraded_json
+from pyflink.semantic_runtime.operators._common import attach_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +98,7 @@ class SemLocalTopKFunction(AsyncFunction):
             logger.warning("sem_topk input parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            return [make_degraded_json(value, f"input_parse_error: {e}")]
+            raise ValueError(f"sem_local_topk input is missing '{self._candidates_field}': {e}") from e
 
         prompt = self._prompt_template.format(
             input=json.dumps(record),
@@ -116,7 +111,7 @@ class SemLocalTopKFunction(AsyncFunction):
             logger.warning("LLM call failed for sem_topk: %s", e)
             if om:
                 om.record_error()
-            return [make_degraded_json(value, f"llm_call_error: {e}")]
+            raise RuntimeError(f"sem_local_topk LLM call failed: {e}") from e
 
         if om:
             om.record_call(metrics.latency_ms, metrics.input_tokens,
@@ -129,13 +124,13 @@ class SemLocalTopKFunction(AsyncFunction):
             logger.warning("sem_topk JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            return [make_degraded_json(value, f"json_parse_error: {e}")]
+            raise ValueError(f"sem_local_topk expected JSON list output: {e}") from e
 
         if not isinstance(ranked, list):
             logger.warning("sem_topk expected list, got %s", type(ranked).__name__)
             if om:
                 om.record_invalid_output()
-            return [make_degraded_json(value, "expected_list_response")]
+            raise ValueError("sem_local_topk expected list response from model")
 
         # Truncate to k
         top = ranked[: self._k]
@@ -150,15 +145,7 @@ class SemLocalTopKFunction(AsyncFunction):
         return [json.dumps(result)]
 
     def timeout(self, value) -> List[str]:
-        """Return degraded record on Flink-level timeout — never throw."""
+        """Fail fast on Flink-level timeout."""
         if self._op_metrics:
             self._op_metrics.record_timeout()
-        return [make_degraded_json(value, "flink_timeout")]
-
-
-# ── Deprecated alias ────────────────────────────────────────────────────────
-# V0.2+: the canonical ``sem_topk`` name now belongs to the stateful/continuous
-# variant in ``stateful.sem_topk_continuous``.  The local variant should be
-# imported as ``SemLocalTopKFunction``.
-SemTopKFunction = SemLocalTopKFunction
-
+        raise TimeoutError(f"sem_local_topk timed out for input: {value!r}")

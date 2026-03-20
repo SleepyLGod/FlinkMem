@@ -236,14 +236,11 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
                 groups.pop(oldest_group_id, None)
             elif policy.name == "DROP_NEWEST":
                 return None
-            # DEGRADE_TAG falls through
 
         group_id = uuid.uuid4().hex[:8]
         label = " ".join(event.payload.split()[:5])
         profile = _new_group_profile(group_id, label, now_ms)
         profile["event_count"] = 1
-        if count >= self._resolved_max_groups_per_key:
-            profile["_degraded"] = True
         groups[group_id] = profile
         return group_id
 

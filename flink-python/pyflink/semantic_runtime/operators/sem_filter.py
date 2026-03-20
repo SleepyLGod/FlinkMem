@@ -36,7 +36,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators._common import attach_metrics, make_degraded_json
+from pyflink.semantic_runtime.operators._common import attach_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -54,19 +54,15 @@ class SemFilterFunction(AsyncFunction):
         the LLM to return JSON ``{decision: bool, confidence: float, reason: str}``.
     llm_config : LLMClientConfig
         Picklable LLM backend configuration.
-    default_decision : bool
-        Decision used in degraded / timeout records (default ``False`` = reject).
     """
 
     def __init__(
         self,
         prompt_template: str,
         llm_config: LLMClientConfig,
-        default_decision: bool = False,
     ) -> None:
         self._prompt_template = prompt_template
         self._llm_config = llm_config
-        self._default_decision = default_decision
         self._client: Optional[LLMClient] = None
         self._op_metrics: Optional[OperatorMetrics] = None
 
@@ -82,20 +78,6 @@ class SemFilterFunction(AsyncFunction):
             self._client.close()
             self._client = None
 
-    # -- helpers -------------------------------------------------------------
-
-    def _degraded_result(self, value, error: str) -> str:
-        """Degraded record preserving 1:1 contract with default decision."""
-        out = {
-            "_input": value,
-            "_error": error,
-            "_degraded": True,
-            "decision": self._default_decision,
-            "confidence": 0.0,
-            "reason": error,
-        }
-        return json.dumps(out)
-
     # -- core ----------------------------------------------------------------
 
     async def async_invoke(self, value) -> List[str]:
@@ -110,7 +92,7 @@ class SemFilterFunction(AsyncFunction):
             logger.warning("LLM call failed for sem_filter: %s", e)
             if om:
                 om.record_error()
-            return [self._degraded_result(value, f"llm_call_error: {e}")]
+            raise RuntimeError(f"sem_filter LLM call failed: {e}") from e
 
         if om:
             om.record_call(metrics.latency_ms, metrics.input_tokens,
@@ -123,14 +105,14 @@ class SemFilterFunction(AsyncFunction):
             logger.warning("sem_filter JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            return [self._degraded_result(value, f"json_parse_error: {e}")]
+            raise ValueError(f"sem_filter expected valid JSON output: {e}") from e
 
         # Validate required keys
         if not isinstance(parsed, dict) or not _FILTER_SCHEMA_KEYS.issubset(parsed):
             logger.warning("sem_filter schema validation failed: %s", parsed)
             if om:
                 om.record_invalid_output()
-            return [self._degraded_result(value, "schema_validation_error")]
+            raise ValueError("sem_filter response violates required schema")
 
         # Normalise types
         parsed["decision"] = bool(parsed["decision"])
@@ -142,8 +124,7 @@ class SemFilterFunction(AsyncFunction):
         return [json.dumps(parsed)]
 
     def timeout(self, value) -> List[str]:
-        """Return degraded record on Flink-level timeout — never throw."""
+        """Fail fast on Flink-level timeout."""
         if self._op_metrics:
             self._op_metrics.record_timeout()
-        return [self._degraded_result(value, "flink_timeout")]
-
+        raise TimeoutError(f"sem_filter timed out for input: {value!r}")

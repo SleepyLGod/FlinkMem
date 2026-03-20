@@ -191,7 +191,6 @@ class SemWindowFunction(KeyedProcessFunction):
                 self._rebuild_buffer_without_last()
                 self._window_meta.update(meta)
                 return
-            # DEGRADE_TAG: accept but tag (handled at snapshot emit)
 
         self._window_meta.update(meta)
 
@@ -283,4 +282,3 @@ class SemWindowFunction(KeyedProcessFunction):
         self._event_buffer.clear()
         for e in events:
             self._event_buffer.add(e)
-

@@ -26,10 +26,10 @@ This module now does more than hold raw dicts:
   configs
 - lowering/runtime decisions can be resolved into internal runtime bundles
 
-Backward compatibility is preserved:
+Operator sections use one canonical shape:
 
-- legacy flat operator dicts still work
-- new nested layout (`query_spec` + `kernel`) is also supported
+- semantic operators: nested `query_spec` + `kernel`
+- runtime helpers without query semantics: nested `kernel`
 """
 
 from __future__ import annotations
@@ -162,14 +162,31 @@ def _coerce_overflow_policy(value: Any) -> OverflowPolicy:
     raise ValueError(f"Unsupported overflow_policy value: {value!r}")
 
 
-def _has_nested_operator_layout(raw: Dict[str, Any]) -> bool:
-    return "query_spec" in raw or "kernel" in raw
-
-
-def _split_operator_section(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    if _has_nested_operator_layout(raw):
-        return dict(raw.get("query_spec", {})), dict(raw.get("kernel", {}))
-    return dict(raw), dict(raw)
+def _split_operator_section(
+    raw: Dict[str, Any],
+    *,
+    operator_name: str,
+    allow_query_spec: bool,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not raw:
+        return {}, {}
+    if not allow_query_spec and "query_spec" in raw:
+        raise ValueError(f"{operator_name} does not accept query_spec")
+    allowed_keys = {"kernel"}
+    if allow_query_spec:
+        allowed_keys.add("query_spec")
+    unknown_keys = set(raw.keys()) - allowed_keys
+    if unknown_keys:
+        expected = "query_spec/kernel" if allow_query_spec else "kernel"
+        raise ValueError(
+            f"{operator_name} config must use nested {expected} layout only; "
+            f"unexpected top-level keys: {sorted(unknown_keys)!r}"
+        )
+    if "kernel" in raw and not isinstance(raw["kernel"], dict):
+        raise ValueError(f"{operator_name}.kernel must be a dict")
+    if allow_query_spec and "query_spec" in raw and not isinstance(raw["query_spec"], dict):
+        raise ValueError(f"{operator_name}.query_spec must be a dict")
+    return dict(raw.get("query_spec", {})), dict(raw.get("kernel", {}))
 
 
 def _inject_scope_defaults(scope: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
@@ -179,7 +196,21 @@ def _inject_scope_defaults(scope: Dict[str, Any], *, defaults_ttl_seconds: int) 
     return out
 
 
+def _reject_execution_path(raw: Dict[str, Any], operator_name: str) -> None:
+    """Reject public execution-path configuration.
+
+    Execution-path selection is an internal planning decision. The public
+    runtime config must not carry physical planning directives.
+    """
+    if "execution_path" in raw:
+        raise ValueError(
+            f"{operator_name} query_spec no longer accepts public execution_path. "
+            "Path selection is internal."
+        )
+
+
 def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
+    _reject_execution_path(raw, "sem_topk")
     if "semantic" in raw:
         out = dict(raw)
         out["scope_policy"] = _inject_scope_defaults(
@@ -206,7 +237,6 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
         "query_id": raw.get("query_id", "default"),
         "query_version": raw.get("query_version", 1),
         "ranking_method": raw.get("ranking_method", "pointwise"),
-        "execution_path": raw.get("execution_path", "auto"),
         "trigger_policy": dict(raw.get("trigger_policy", {})),
         "scope_policy": scope,
     }
@@ -214,6 +244,7 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
 
 
 def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
+    _reject_execution_path(raw, "sem_groupby")
     if "semantic" in raw:
         out = dict(raw)
         out["scope_policy"] = _inject_scope_defaults(
@@ -238,7 +269,6 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
         "query_id": raw.get("query_id", "default"),
         "query_version": raw.get("query_version", 1),
         "assignment_method": raw.get("assignment_method", "llm"),
-        "execution_path": raw.get("execution_path", "auto"),
         "trigger_policy": dict(raw.get("trigger_policy", {})),
         "maintenance_trigger_policy": raw.get("maintenance_trigger_policy"),
         "scope_policy": scope,
@@ -248,6 +278,7 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
 
 
 def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
+    _reject_execution_path(raw, "sem_agg")
     if "semantic" in raw:
         out = dict(raw)
         out["scope_policy"] = _inject_scope_defaults(
@@ -274,7 +305,6 @@ def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) 
         "query_id": raw.get("query_id", "default"),
         "query_version": raw.get("query_version", 1),
         "agg_method": raw.get("agg_method", raw.get("mode", "algebraic")),
-        "execution_path": raw.get("execution_path", "auto"),
         "trigger_policy": dict(raw.get("trigger_policy", {})),
         "scope_policy": scope,
     }
@@ -327,8 +357,7 @@ def _sem_search_operator_name(operators: Dict[str, Dict[str, Any]]) -> str:
 class RuntimeConfig:
     """Unified top-level runtime configuration.
 
-    The shell keeps backward compatibility with raw operator dicts, but now
-    also exposes typed hydration helpers so planner/builder code can resolve:
+    The shell exposes typed hydration helpers so planner/builder code can resolve:
 
     - operator query semantics (`QuerySpec`)
     - kernel/runtime config (`Sem*Config`)
@@ -358,19 +387,20 @@ class RuntimeConfig:
 
     # -- raw access ----------------------------------------------------------
 
-    def get_operator_raw(self, operator_name: str) -> Dict[str, Any]:
-        """Return the raw config dict for an operator, with defaults merged."""
-
-        base = {
-            "ttl_seconds": self.defaults.ttl_seconds,
-            "overflow_policy": self.defaults.overflow_policy,
-        }
-        base.update(self.operators.get(operator_name, {}))
-        return base
-
-    def _get_operator_sections(self, operator_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        raw = self.get_operator_raw(operator_name)
-        return _split_operator_section(raw)
+    def _get_operator_sections(
+        self,
+        operator_name: str,
+        *,
+        allow_query_spec: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        raw = self.operators.get(operator_name, {})
+        if not isinstance(raw, dict):
+            raise ValueError(f"{operator_name} config must be a dict")
+        return _split_operator_section(
+            raw,
+            operator_name=operator_name,
+            allow_query_spec=allow_query_spec,
+        )
 
     def to_llm_client_config(self) -> LLMClientConfig:
         """Best-effort adapter from backend shell config to async client config.
@@ -409,7 +439,10 @@ class RuntimeConfig:
     # -- typed query specs ---------------------------------------------------
 
     def get_topk_query_spec(self) -> TopKQuerySpec:
-        query_raw, _kernel_raw = self._get_operator_sections("sem_topk")
+        query_raw, _kernel_raw = self._get_operator_sections(
+            "sem_topk",
+            allow_query_spec=True,
+        )
         return TopKQuerySpec.from_dict(
             _normalize_topk_query_raw(
                 query_raw,
@@ -418,7 +451,10 @@ class RuntimeConfig:
         )
 
     def get_groupby_query_spec(self) -> GroupbyQuerySpec:
-        query_raw, _kernel_raw = self._get_operator_sections("sem_groupby")
+        query_raw, _kernel_raw = self._get_operator_sections(
+            "sem_groupby",
+            allow_query_spec=True,
+        )
         return GroupbyQuerySpec.from_dict(
             _normalize_groupby_query_raw(
                 query_raw,
@@ -427,7 +463,10 @@ class RuntimeConfig:
         )
 
     def get_agg_query_spec(self) -> AggQuerySpec:
-        query_raw, _kernel_raw = self._get_operator_sections("sem_agg")
+        query_raw, _kernel_raw = self._get_operator_sections(
+            "sem_agg",
+            allow_query_spec=True,
+        )
         return AggQuerySpec.from_dict(
             _normalize_agg_query_raw(
                 query_raw,
@@ -436,7 +475,10 @@ class RuntimeConfig:
         )
 
     def get_join_query_spec(self) -> JoinQuerySpec:
-        query_raw, _kernel_raw = self._get_operator_sections("sem_join")
+        query_raw, _kernel_raw = self._get_operator_sections(
+            "sem_join",
+            allow_query_spec=True,
+        )
         return JoinQuerySpec.from_dict(
             _normalize_join_query_raw(
                 query_raw,
@@ -449,7 +491,10 @@ class RuntimeConfig:
     def get_topk_kernel_config(self) -> SemTopKConfig:
         from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig
 
-        _query_raw, kernel_raw = self._get_operator_sections("sem_topk")
+        _query_raw, kernel_raw = self._get_operator_sections(
+            "sem_topk",
+            allow_query_spec=True,
+        )
         kwargs: Dict[str, Any] = {}
         for field_name in SemTopKConfig.__dataclass_fields__:
             if field_name in kernel_raw:
@@ -461,7 +506,10 @@ class RuntimeConfig:
     def get_groupby_kernel_config(self) -> SemGroupbyConfig:
         from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig
 
-        _query_raw, kernel_raw = self._get_operator_sections("sem_groupby")
+        _query_raw, kernel_raw = self._get_operator_sections(
+            "sem_groupby",
+            allow_query_spec=True,
+        )
         kwargs: Dict[str, Any] = {}
         for field_name in SemGroupbyConfig.__dataclass_fields__:
             if field_name in kernel_raw:
@@ -473,7 +521,10 @@ class RuntimeConfig:
     def get_agg_kernel_config(self) -> SemAggConfig:
         from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig
 
-        _query_raw, kernel_raw = self._get_operator_sections("sem_agg")
+        _query_raw, kernel_raw = self._get_operator_sections(
+            "sem_agg",
+            allow_query_spec=True,
+        )
         kwargs: Dict[str, Any] = {}
         for field_name in SemAggConfig.__dataclass_fields__:
             if field_name in kernel_raw:
@@ -486,13 +537,18 @@ class RuntimeConfig:
         from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig
 
         operator_name = _sem_search_operator_name(self.operators)
-        _query_raw, kernel_raw = self._get_operator_sections(operator_name)
+        _query_raw, kernel_raw = self._get_operator_sections(
+            operator_name,
+            allow_query_spec=False,
+        )
         kwargs: Dict[str, Any] = {}
         for field_name in CtsRetrieveConfig.__dataclass_fields__:
             if field_name in kernel_raw:
                 kwargs[field_name] = kernel_raw[field_name]
         if "ttl_seconds" not in kwargs:
             kwargs["ttl_seconds"] = self.defaults.ttl_seconds
+        if "overflow_policy" not in kwargs:
+            kwargs["overflow_policy"] = self.defaults.overflow_policy
         if "overflow_policy" in kwargs:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return CtsRetrieveConfig(**kwargs)
@@ -500,13 +556,18 @@ class RuntimeConfig:
     def get_window_config(self) -> "SemWindowConfig":
         from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig
 
-        _query_raw, kernel_raw = self._get_operator_sections("sem_window")
+        _query_raw, kernel_raw = self._get_operator_sections(
+            "sem_window",
+            allow_query_spec=False,
+        )
         kwargs: Dict[str, Any] = {}
         for field_name in SemWindowConfig.__dataclass_fields__:
             if field_name in kernel_raw:
                 kwargs[field_name] = kernel_raw[field_name]
         if "ttl_seconds" not in kwargs:
             kwargs["ttl_seconds"] = self.defaults.ttl_seconds
+        if "overflow_policy" not in kwargs:
+            kwargs["overflow_policy"] = self.defaults.overflow_policy
         if "overflow_policy" in kwargs:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return SemWindowConfig(**kwargs)

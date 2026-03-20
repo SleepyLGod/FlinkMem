@@ -50,9 +50,7 @@ def resolve_agg_execution_plan(
     input_kind: str = "event_stream",
 ) -> AggExecutionPlan:
     spec = query_spec or AggQuerySpec()
-    path = spec.execution_path
-    if path == "auto":
-        path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
+    path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
     return AggExecutionPlan(
         execution_path=path,
         input_kind=input_kind,

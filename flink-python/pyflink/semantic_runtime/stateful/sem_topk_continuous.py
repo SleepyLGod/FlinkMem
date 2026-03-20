@@ -322,7 +322,6 @@ class SemTopKFunction(KeyedProcessFunction):
             "last_query": "",
             "last_query_seq_id": 0,
             "last_source": "",
-            "last_degraded": False,
             "last_error": "",
         }
 
@@ -336,14 +335,13 @@ class SemTopKFunction(KeyedProcessFunction):
         meta["update_count"] += 1
 
         # Propagate query + envelope metadata from the flat candidate into
-        # meta so downstream snapshot emissions retain the query context and
-        # degraded/source markers from upstream retrieval/scoring stages.
+        # meta so downstream snapshot emissions retain query, source, and
+        # error context from upstream retrieval/scoring stages.
         meta["last_query"] = value.get("query", meta.get("last_query", ""))
         meta["last_query_seq_id"] = int(
             value.get("query_seq_id", meta.get("last_query_seq_id", 0))
         )
         meta["last_source"] = value.get("source", meta.get("last_source", ""))
-        meta["last_degraded"] = value.get("degraded", False)
         meta["last_error"] = value.get("error", "")
         meta["scope_last_time_ms"] = decision.event_time_ms
         if decision.scope_bucket_id is not None:
@@ -623,7 +621,6 @@ class SemTopKFunction(KeyedProcessFunction):
                 "version": new_snapshot["version"],
                 "changed": changed,
                 "emission_policy": self._config.emission_policy,
-                "degraded": bool(meta.get("last_degraded", False)),
                 "error": str(meta.get("last_error", "")),
                 "timestamp_ms": now_ms,
             }
@@ -687,9 +684,6 @@ class SemTopKFunction(KeyedProcessFunction):
             return 0
 
         policy = self._config.overflow_policy
-        if policy == OverflowPolicy.DEGRADE_TAG:
-            return 0
-
         to_evict = len(entries) - max_cand
         if policy == OverflowPolicy.DROP_NEWEST:
             entries.sort(key=lambda item: item[1], reverse=True)
@@ -812,7 +806,6 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             "last_query": "",
             "last_query_seq_id": 0,
             "last_source": "",
-            "last_degraded": False,
             "last_error": "",
         }
 
@@ -829,7 +822,6 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             value.get("query_seq_id", meta.get("last_query_seq_id", 0))
         )
         meta["last_source"] = value.get("source", meta.get("last_source", ""))
-        meta["last_degraded"] = value.get("degraded", False)
         meta["last_error"] = value.get("error", "")
         meta["scope_last_time_ms"] = decision.event_time_ms
         if decision.scope_bucket_id is not None:
@@ -962,7 +954,6 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             "candidates": candidates,
             "candidate_count": len(candidates),
             "source": meta.get("last_source", ""),
-            "degraded": bool(meta.get("last_degraded", False)),
             "error": str(meta.get("last_error", "")),
             "timestamp_ms": now_ms,
             "scope_epoch": meta.get("scope_epoch", 0),
@@ -1080,9 +1071,6 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             return 0
 
         policy = self._config.overflow_policy
-        if policy == OverflowPolicy.DEGRADE_TAG:
-            return 0
-
         to_evict = len(entries) - max_cand
         if policy == OverflowPolicy.DROP_NEWEST:
             entries.sort(key=lambda x: x[1], reverse=True)  # newest first

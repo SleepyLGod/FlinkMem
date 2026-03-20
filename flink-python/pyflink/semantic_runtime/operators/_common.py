@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, Dict
 
 
@@ -34,21 +33,6 @@ def validate_schema(obj: Any, schema: Dict[str, type]) -> bool:
             return False
     return True
 
-
-def make_degraded(value: Any, error: str) -> dict:
-    """Wrap *value* in a degraded-output envelope."""
-    return {
-        "_input": value,
-        "_error": error,
-        "_degraded": True,
-    }
-
-
-def make_degraded_json(value: Any, error: str) -> str:
-    """JSON-serialised degraded envelope (ready for Types.STRING() output)."""
-    return json.dumps(make_degraded(value, error))
-
-
 def attach_metrics(parsed: dict, metrics) -> dict:
     """Attach LLM call metrics to the parsed result dict."""
     parsed["_metrics"] = {
@@ -58,4 +42,3 @@ def attach_metrics(parsed: dict, metrics) -> dict:
         "attempts": metrics.attempts,
     }
     return parsed
-

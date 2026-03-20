@@ -29,9 +29,6 @@ Hard bounds enforced at this layer:
 
 True two-input ``sem_join`` (dual-side state) is deferred to V0.3a.
 
-.. deprecated::
-    ``SemJoinRetrieveFunction`` and ``SemJoinRetrieveConfig`` are deprecated
-    aliases.  Use ``SemLookupJoinFunction`` and ``SemLookupJoinConfig``.
 """
 
 from __future__ import annotations
@@ -48,7 +45,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators._common import attach_metrics, make_degraded_json
+from pyflink.semantic_runtime.operators._common import attach_metrics
 from pyflink.semantic_runtime.stateful.external_search_backend import (
     ExternalSearchBackend,
     SearchResult,
@@ -205,12 +202,12 @@ class SemLookupJoinFunction(AsyncFunction):
             logger.warning("sem_lookup_join: retrieval timed out for %s", value)
             if om:
                 om.record_timeout()
-            return [make_degraded_json(value, "retrieve_timeout")]
+            raise TimeoutError(f"sem_lookup_join retrieval timed out for input: {value!r}")
         except Exception as e:
             logger.warning("sem_lookup_join: retrieval error: %s", e)
             if om:
                 om.record_error()
-            return [make_degraded_json(value, f"retrieve_error: {e}")]
+            raise RuntimeError(f"sem_lookup_join retrieval failed: {e}") from e
 
         # 2. Enforce hard cap + truncate overflow
         if len(candidates) > cfg.max_candidates_per_record:
@@ -231,7 +228,7 @@ class SemLookupJoinFunction(AsyncFunction):
             logger.warning("LLM call failed for sem_lookup_join: %s", e)
             if om:
                 om.record_error()
-            return [make_degraded_json(value, f"llm_call_error: {e}")]
+            raise RuntimeError(f"sem_lookup_join LLM call failed: {e}") from e
 
         if om:
             om.record_call(metrics.latency_ms, metrics.input_tokens,
@@ -244,7 +241,7 @@ class SemLookupJoinFunction(AsyncFunction):
             logger.warning("sem_lookup_join JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            return [make_degraded_json(value, f"json_parse_error: {e}")]
+            raise ValueError(f"sem_lookup_join expected valid JSON output: {e}") from e
 
         result = {
             "_input": value,
@@ -256,15 +253,7 @@ class SemLookupJoinFunction(AsyncFunction):
         return [json.dumps(result)]
 
     def timeout(self, value) -> List[str]:
-        """Return degraded record on Flink-level timeout — never throw."""
+        """Fail fast on Flink-level timeout."""
         if self._op_metrics:
             self._op_metrics.record_timeout()
-        return [make_degraded_json(value, "flink_timeout")]
-
-
-
-# ── Deprecated aliases ──────────────────────────────────────────────────────
-# V0.2+: ``sem_join_retrieve`` is renamed to ``sem_lookup_join``.  The old
-# names remain importable during the transition period.
-SemJoinRetrieveConfig = SemLookupJoinConfig
-SemJoinRetrieveFunction = SemLookupJoinFunction
+        raise TimeoutError(f"sem_lookup_join timed out for input: {value!r}")

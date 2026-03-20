@@ -48,7 +48,6 @@ from pyflink.semantic_runtime.stateful.semantic_window import (
     _new_window_meta,
 )
 
-
 # ============================================================================
 # Event Model Tests
 # ============================================================================
@@ -117,9 +116,9 @@ class TestStateSafetyConfig:
         assert cfg.overflow_policy == OverflowPolicy.DROP_OLDEST
 
     def test_custom(self):
-        cfg = StateSafetyConfig(ttl_seconds=60, overflow_policy=OverflowPolicy.DEGRADE_TAG)
+        cfg = StateSafetyConfig(ttl_seconds=60, overflow_policy=OverflowPolicy.DROP_NEWEST)
         assert cfg.ttl_seconds == 60
-        assert cfg.overflow_policy == OverflowPolicy.DEGRADE_TAG
+        assert cfg.overflow_policy == OverflowPolicy.DROP_NEWEST
 
 
 class TestDescriptors:
@@ -681,7 +680,6 @@ class TestSemTopKConfig:
         assert qs.k == 10
         assert qs.query_version == 1
         assert qs.ranking_method == "pointwise"
-        assert qs.execution_path == "auto"
         assert qs.scope_policy.ttl_seconds is None
 
     def test_query_spec_simple(self):
@@ -697,11 +695,6 @@ class TestSemTopKConfig:
         with pytest.raises(ValueError, match="Invalid ranking_method"):
             TopKQuerySpec(ranking_method="bogus")
 
-    def test_query_spec_invalid_execution_path(self):
-        import pytest
-        with pytest.raises(ValueError, match="Invalid execution_path"):
-            TopKQuerySpec(execution_path="bogus")
-
     def test_scope_policy_session_gap_validation(self):
         import pytest
         with pytest.raises(ValueError, match="session_gap_ms"):
@@ -714,7 +707,6 @@ class TestSemTopKConfig:
             query_id="topk1",
             query_version=3,
             ranking_method="pointwise",
-            execution_path="operator_owned",
             trigger_policy=TriggerPolicy(mode="periodic", interval_ms=2000),
             scope_policy=TopKScopePolicy(
                 ttl_seconds=600,
@@ -726,7 +718,6 @@ class TestSemTopKConfig:
         )
         restored = TopKQuerySpec.from_dict(spec.to_dict())
         assert restored.query_id == "topk1"
-        assert restored.execution_path == "operator_owned"
         assert restored.trigger_policy.mode == "periodic"
         assert restored.scope_policy.window_kind == "session"
         assert restored.scope_policy.session_gap_ms == 15000
@@ -947,7 +938,6 @@ class TestSemTopKPureStateMachine:
                 "query": "best weather days",
                 "query_seq_id": 42,
                 "source": "async_score",
-                "degraded": True,
                 "error": "partial_score_timeout",
             },
             _FakeContext("k"),
@@ -957,7 +947,6 @@ class TestSemTopKPureStateMachine:
         assert out["query"] == "best weather days"
         assert out["query_seq_id"] == 42
         assert out["source"] == "async_score"
-        assert out["degraded"] is True
         assert out["error"] == "partial_score_timeout"
 
     def test_idle_flush_emits_only_when_flush_timer_fires(self):
@@ -1315,7 +1304,6 @@ class TestGroupbyQuerySpec:
         spec = GroupbyQuerySpec()
         assert spec.semantic.output_mode == "label"
         assert spec.assignment_method == "llm"
-        assert spec.execution_path == "auto"
         assert spec.query_version == 1
         assert spec.trigger_policy.mode == "on_event"
 
@@ -1329,7 +1317,6 @@ class TestGroupbyQuerySpec:
         )
         assert spec.semantic.backend == "embedding"
         assert spec.assignment_method == "embedding"
-        assert spec.execution_path == "auto"
         assert spec.scope_policy.ttl_seconds == 600
         assert spec.scope_policy.max_groups_per_key == 20
 
@@ -1337,11 +1324,6 @@ class TestGroupbyQuerySpec:
         import pytest
         with pytest.raises(ValueError, match="Invalid assignment_method"):
             GroupbyQuerySpec(assignment_method="bogus")
-
-    def test_invalid_execution_path(self):
-        import pytest
-        with pytest.raises(ValueError, match="Invalid execution_path"):
-            GroupbyQuerySpec(execution_path="bogus")
 
     def test_roundtrip(self):
         spec = GroupbyQuerySpec(
@@ -1353,7 +1335,6 @@ class TestGroupbyQuerySpec:
             query_id="g1",
             query_version=2,
             assignment_method="llm_refine",
-            execution_path="operator_owned",
             trigger_policy=TriggerPolicy(mode="periodic", interval_ms=2000),
             maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=5000),
             scope_policy=GroupbyScopePolicy(
@@ -1370,7 +1351,6 @@ class TestGroupbyQuerySpec:
         assert restored.query_id == "g1"
         assert restored.query_version == 2
         assert restored.assignment_method == "llm_refine"
-        assert restored.execution_path == "operator_owned"
         assert restored.trigger_policy.mode == "periodic"
         assert restored.maintenance_trigger_policy.mode == "periodic"
         assert restored.scope_policy.max_groups_per_key == 12
@@ -1456,9 +1436,10 @@ class TestGroupbyQuerySpec:
         assert plan.execution_path == "window_owned"
 
     def test_builder_window_owned_returns_bounded_runtime(self):
+        spec = GroupbyQuerySpec()
         op = build_sem_groupby_operator(
             SemGroupbyConfig(),
-            GroupbyQuerySpec(execution_path="window_owned"),
+            spec,
             input_kind="window_snapshot",
         )
         assert isinstance(op, WindowOwnedSemGroupbyFunction)
@@ -1466,76 +1447,76 @@ class TestGroupbyQuerySpec:
     def test_builder_operator_owned_rejects_non_on_event_trigger(self):
         import pytest
         with pytest.raises(NotImplementedError, match="only .*on_event"):
+            spec = GroupbyQuerySpec(
+                trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
+            )
             build_sem_groupby_operator(
                 SemGroupbyConfig(),
-                GroupbyQuerySpec(
-                    execution_path="operator_owned",
-                    trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
-                ),
+                spec,
             )
 
     def test_builder_operator_owned_rejects_unsupported_maintenance(self):
         import pytest
         with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='periodic' or 'on_scope_close'"):
+            spec = GroupbyQuerySpec(
+                maintenance_trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=1000),
+            )
             build_sem_groupby_operator(
                 SemGroupbyConfig(),
-                GroupbyQuerySpec(
-                    execution_path="operator_owned",
-                    maintenance_trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=1000),
-                ),
+                spec,
             )
 
     def test_builder_operator_owned_rejects_on_scope_close_for_sliding(self):
         import pytest
         with pytest.raises(NotImplementedError, match="close-capable scopes"):
+            spec = GroupbyQuerySpec(
+                scope_policy=GroupbyScopePolicy(window_kind="sliding", window_size_ms=1000),
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            )
             build_sem_groupby_operator(
                 SemGroupbyConfig(),
-                GroupbyQuerySpec(
-                    execution_path="operator_owned",
-                    scope_policy=GroupbyScopePolicy(window_kind="sliding", window_size_ms=1000),
-                    maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
-                ),
+                spec,
             )
 
     def test_builder_operator_owned_accepts_on_scope_close_for_semantic(self):
+        spec = GroupbyQuerySpec(
+            scope_policy=GroupbyScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
+            maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+        )
         op = build_sem_groupby_operator(
             SemGroupbyConfig(),
-            GroupbyQuerySpec(
-                execution_path="operator_owned",
-                scope_policy=GroupbyScopePolicy(window_kind="semantic", boundary_flag="topic_shift"),
-                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
-            ),
+            spec,
         )
         assert isinstance(op, SemGroupbyFunction)
 
-    def test_builder_window_owned_requires_window_snapshot_input(self):
-        import pytest
-        with pytest.raises(NotImplementedError, match="window_snapshot"):
-            build_sem_groupby_operator(
-                SemGroupbyConfig(),
-                GroupbyQuerySpec(execution_path="window_owned"),
-                input_kind="event_stream",
-            )
+    def test_builder_event_stream_defaults_to_operator_owned(self):
+        spec = GroupbyQuerySpec()
+        op = build_sem_groupby_operator(
+            SemGroupbyConfig(),
+            spec,
+            input_kind="event_stream",
+        )
+        assert isinstance(op, SemGroupbyFunction)
 
     def test_builder_window_owned_rejects_maintenance_trigger(self):
         import pytest
         with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='on_scope_close'"):
+            spec = GroupbyQuerySpec(
+                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
+            )
             build_sem_groupby_operator(
                 SemGroupbyConfig(),
-                GroupbyQuerySpec(
-                    execution_path="window_owned",
-                    maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
-                ),
+                spec,
                 input_kind="window_snapshot",
             )
 
     def test_builder_window_owned_accepts_on_scope_close_maintenance(self):
+        spec = GroupbyQuerySpec(
+            maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+        )
         op = build_sem_groupby_operator(
             SemGroupbyConfig(),
-            GroupbyQuerySpec(
-                execution_path="window_owned",
-                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
-            ),
+            spec,
             input_kind="window_snapshot",
         )
         assert isinstance(op, WindowOwnedSemGroupbyFunction)
@@ -1998,7 +1979,7 @@ class TestSemanticLoweringPlans:
 
     def test_groupby_window_owned_lowers_to_label_plus_groupby(self):
         plan = resolve_groupby_lowering_plan(
-            GroupbyQuerySpec(execution_path="window_owned"),
+            GroupbyQuerySpec(),
             input_kind="window_snapshot",
         )
         assert plan.lowering_kind == "derived_attribute_then_classical"
@@ -2009,7 +1990,7 @@ class TestSemanticLoweringPlans:
 
     def test_groupby_operator_owned_stays_native(self):
         plan = resolve_groupby_lowering_plan(
-            GroupbyQuerySpec(execution_path="operator_owned"),
+            GroupbyQuerySpec(),
             input_kind="event_stream",
         )
         assert plan.lowering_kind == "native_runtime"
@@ -2033,7 +2014,6 @@ class TestAggQuerySpec:
         spec = AggQuerySpec()
         assert spec.semantic.output_mode == "summary"
         assert spec.agg_method == "algebraic"
-        assert spec.execution_path == "auto"
         assert spec.trigger_policy.mode == "on_event"
 
     def test_simple_builder(self):
@@ -2047,18 +2027,12 @@ class TestAggQuerySpec:
         )
         assert spec.semantic.backend == "llm"
         assert spec.agg_method == "summarize"
-        assert spec.execution_path == "auto"
         assert spec.scope_policy.max_buffer_events == 50
 
     def test_invalid_agg_method(self):
         import pytest
         with pytest.raises(ValueError, match="Invalid agg_method"):
             AggQuerySpec(agg_method="bogus")
-
-    def test_invalid_execution_path(self):
-        import pytest
-        with pytest.raises(ValueError, match="Invalid execution_path"):
-            AggQuerySpec(execution_path="bogus")
 
     def test_roundtrip(self):
         spec = AggQuerySpec(
@@ -2070,7 +2044,6 @@ class TestAggQuerySpec:
             query_id="agg1",
             query_version=3,
             agg_method="compressive",
-            execution_path="window_owned",
             trigger_policy=TriggerPolicy(mode="count_threshold", count_threshold=16),
             scope_policy=AggScopePolicy(
                 ttl_seconds=1800,
@@ -2082,7 +2055,6 @@ class TestAggQuerySpec:
         assert restored.query_id == "agg1"
         assert restored.query_version == 3
         assert restored.agg_method == "compressive"
-        assert restored.execution_path == "window_owned"
         assert restored.trigger_policy.mode == "count_threshold"
         assert restored.scope_policy.flush_interval_ms == 5000
 
@@ -2112,21 +2084,22 @@ class TestAggQuerySpec:
         assert plan.execution_path == "window_owned"
 
     def test_builder_window_owned_returns_bounded_runtime(self):
+        spec = AggQuerySpec()
         op = build_sem_agg_operator(
             SemAggConfig(),
-            AggQuerySpec(execution_path="window_owned"),
+            spec,
             input_kind="window_snapshot",
         )
         assert isinstance(op, WindowOwnedSemAggFunction)
 
-    def test_builder_window_owned_requires_window_snapshot_input(self):
-        import pytest
-        with pytest.raises(NotImplementedError, match="window_snapshot"):
-            build_sem_agg_operator(
-                SemAggConfig(),
-                AggQuerySpec(execution_path="window_owned"),
-                input_kind="event_stream",
-            )
+    def test_builder_event_stream_defaults_to_operator_owned(self):
+        spec = AggQuerySpec()
+        op = build_sem_agg_operator(
+            SemAggConfig(),
+            spec,
+            input_kind="event_stream",
+        )
+        assert isinstance(op, SemAggFunction)
 
     def test_builder_operator_owned_rejects_on_scope_close(self):
         import pytest
@@ -2157,7 +2130,7 @@ class TestAggQuerySpec:
 
         func = WindowOwnedSemAggFunction(
             SemAggConfig(mode="algebraic", reduce_fn=sum_reduce),
-            AggQuerySpec(execution_path="window_owned", agg_method="algebraic"),
+            AggQuerySpec(agg_method="algebraic"),
         )
         snapshot = {
             "key": "k",
@@ -2177,7 +2150,7 @@ class TestAggQuerySpec:
     def test_window_owned_summarize_emits_async_work(self):
         func = WindowOwnedSemAggFunction(
             SemAggConfig(mode="summarize", max_buffer_events=10),
-            AggQuerySpec(execution_path="window_owned", agg_method="summarize"),
+            AggQuerySpec(agg_method="summarize"),
         )
         snapshot = {
             "key": "k",
@@ -2485,45 +2458,16 @@ class TestRuntimeConfig:
             "defaults": {"ttl_seconds": 7200},
             "llm": {"backend": "openai", "model": "gpt-4"},
             "operators": {
-                "sem_topk": {"k": 5, "scorer_backend": "llm"},
+                "sem_topk": {
+                    "query_spec": {"k": 5},
+                    "kernel": {},
+                },
             },
         })
         assert cfg.defaults.ttl_seconds == 7200
         assert cfg.llm.backend == "openai"
         assert cfg.llm.model == "gpt-4"
-        assert cfg.operators["sem_topk"]["k"] == 5
-
-    def test_get_operator_raw_merges_defaults(self):
-        cfg = RuntimeConfig.from_dict({
-            "defaults": {"ttl_seconds": 600},
-            "operators": {"sem_topk": {"k": 3}},
-        })
-        raw = cfg.get_operator_raw("sem_topk")
-        assert raw["ttl_seconds"] == 600
-        assert raw["k"] == 3
-
-    def test_get_operator_raw_missing(self):
-        cfg = RuntimeConfig()
-        raw = cfg.get_operator_raw("nonexistent")
-        assert raw["ttl_seconds"] == 3600  # from defaults
-
-    def test_typed_topk_query_spec_from_legacy_flat_config(self):
-        cfg = RuntimeConfig.from_dict({
-            "defaults": {"ttl_seconds": 600},
-            "operators": {
-                "sem_topk": {
-                    "k": 3,
-                    "scorer_backend": "embedding",
-                    "ranking_method": "pointwise",
-                    "max_candidates": 25,
-                }
-            },
-        })
-        spec = cfg.get_topk_query_spec()
-        assert spec.k == 3
-        assert spec.semantic.backend == "embedding"
-        assert spec.scope_policy.ttl_seconds == 600
-        assert spec.scope_policy.max_candidates == 25
+        assert cfg.operators["sem_topk"]["query_spec"]["k"] == 5
 
     def test_typed_topk_query_spec_and_kernel_from_nested_config(self):
         cfg = RuntimeConfig.from_dict({
@@ -2538,7 +2482,6 @@ class TestRuntimeConfig:
                         },
                         "k": 5,
                         "ranking_method": "pointwise",
-                        "execution_path": "window_owned",
                         "scope_policy": {"max_candidates": 50},
                     },
                     "kernel": {
@@ -2552,7 +2495,6 @@ class TestRuntimeConfig:
         spec = cfg.get_topk_query_spec()
         kernel = cfg.get_topk_kernel_config()
         assert spec.k == 5
-        assert spec.execution_path == "window_owned"
         assert spec.scope_policy.ttl_seconds == 900
         assert kernel.score_field == "similarity"
         assert kernel.recompute_interval_ms == 2000
@@ -2563,7 +2505,6 @@ class TestRuntimeConfig:
             "operators": {
                 "sem_groupby": {
                     "query_spec": {
-                        "execution_path": "window_owned",
                         "semantic": {
                             "instruction": "label records",
                             "backend": "embedding",
@@ -2574,7 +2515,6 @@ class TestRuntimeConfig:
             }
         })
         bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
-        assert bundle.query_spec.execution_path == "window_owned"
         assert bundle.lowering_plan.lowering_kind == "derived_attribute_then_classical"
         assert bundle.lowering_plan.classical_operator == "groupby"
 
@@ -2584,7 +2524,6 @@ class TestRuntimeConfig:
                 "sem_agg": {
                     "query_spec": {
                         "agg_method": "summarize",
-                        "execution_path": "window_owned",
                     },
                     "kernel": {
                         "max_buffer_events": 12,
@@ -2597,15 +2536,31 @@ class TestRuntimeConfig:
         assert bundle.kernel_config.max_buffer_events == 12
         assert bundle.lowering_plan.lowering_kind == "native_runtime"
 
+    def test_public_execution_path_is_rejected(self):
+        cfg = RuntimeConfig.from_dict({
+            "operators": {
+                "sem_topk": {
+                    "query_spec": {
+                        "execution_path": "window_owned",
+                    }
+                }
+            }
+        })
+        with pytest.raises(ValueError, match="no longer accepts public execution_path"):
+            cfg.get_topk_query_spec()
+
     def test_join_runtime_bundle_uses_match_lowering(self):
         cfg = RuntimeConfig.from_dict({
             "defaults": {"ttl_seconds": 1200},
             "operators": {
                 "sem_join": {
-                    "backend": "embedding",
-                    "pairing_method": "blocking",
-                    "window_kind": "sliding",
-                    "window_size_ms": 3000,
+                    "query_spec": {
+                        "backend": "embedding",
+                        "pairing_method": "blocking",
+                        "window_kind": "sliding",
+                        "window_size_ms": 3000,
+                    },
+                    "kernel": {},
                 }
             },
         })
@@ -2619,9 +2574,11 @@ class TestRuntimeConfig:
             "defaults": {"ttl_seconds": 1800, "overflow_policy": "drop_newest"},
             "operators": {
                 "sem_window": {
-                    "max_window_events": 7,
-                    "window_timeout_ms": 12000,
-                    "boundary_flag": "segment_done",
+                    "kernel": {
+                        "max_window_events": 7,
+                        "window_timeout_ms": 12000,
+                        "boundary_flag": "segment_done",
+                    }
                 }
             },
         })
@@ -2631,6 +2588,30 @@ class TestRuntimeConfig:
         assert window_cfg.boundary_flag == "segment_done"
         assert window_cfg.ttl_seconds == 1800
         assert window_cfg.overflow_policy.value == "drop_newest"
+
+    def test_flat_operator_layout_is_rejected(self):
+        cfg = RuntimeConfig.from_dict({
+            "operators": {
+                "sem_topk": {
+                    "k": 3,
+                    "ranking_method": "pointwise",
+                }
+            },
+        })
+        with pytest.raises(ValueError, match="nested query_spec/kernel layout only"):
+            cfg.get_topk_query_spec()
+
+    def test_window_query_spec_is_rejected(self):
+        cfg = RuntimeConfig.from_dict({
+            "operators": {
+                "sem_window": {
+                    "query_spec": {"foo": "bar"},
+                    "kernel": {},
+                }
+            },
+        })
+        with pytest.raises(ValueError, match="does not accept query_spec"):
+            cfg.get_window_config()
 
 
 # ============================================================================
@@ -2831,10 +2812,10 @@ class TestStateSafetyAudit:
         gid = func._maybe_create_group(event, 300)
         assert gid is None
 
-    def test_retrieve_overflow_degrade_tag(self):
-        """cts_retrieve: DEGRADE_TAG should keep all entries."""
+    def test_retrieve_overflow_drop_newest(self):
+        """cts_retrieve: DROP_NEWEST should evict newest entries first."""
         cfg = CtsRetrieveConfig(max_cache_entries_per_key=2,
-                                overflow_policy=OverflowPolicy.DEGRADE_TAG)
+                                overflow_policy=OverflowPolicy.DROP_NEWEST)
         func = CtsRetrieveFunction(cfg)
         func._cache = _FakeMapState({
             "c1": {"content": "a", "_cached_at_ms": 100},
@@ -2842,8 +2823,9 @@ class TestStateSafetyAudit:
             "c3": {"content": "c", "_cached_at_ms": 300},
         })
         evicted = func._enforce_cache_limit()
-        assert evicted == 0  # DEGRADE_TAG keeps all
-        assert len(func._cache.keys()) == 3
+        assert evicted == 1
+        assert len(func._cache.keys()) == 2
+        assert set(func._cache.keys()) == {"c1", "c2"}
 
 
 # ============================================================================
@@ -2956,13 +2938,14 @@ class TestContinuousRAGConfig:
             "embedding": {"backend": "local_hashing", "dimensions": 48},
             "operators": {
                 "sem_window": {
-                    "max_window_events": 9,
-                    "window_timeout_ms": 1111,
-                    "boundary_flag": "topic_shift",
+                    "kernel": {
+                        "max_window_events": 9,
+                        "window_timeout_ms": 1111,
+                        "boundary_flag": "topic_shift",
+                    },
                 },
                 "sem_groupby": {
                     "query_spec": {
-                        "execution_path": "window_owned",
                         "assign_threshold": 0.85,
                     },
                     "kernel": {"max_groups_per_key": 6},
@@ -2974,7 +2957,9 @@ class TestContinuousRAGConfig:
                     "kernel": {"flush_interval_ms": 2222},
                 },
                 "sem_search": {
-                    "max_candidates_per_request": 8,
+                    "kernel": {
+                        "max_candidates_per_request": 8,
+                    },
                 },
                 "sem_topk": {
                     "query_spec": {
@@ -2992,7 +2977,6 @@ class TestContinuousRAGConfig:
         assert cfg.window_config.window_timeout_ms == 1111
         assert cfg.window_config.ttl_seconds == 900
         assert cfg.groupby_query_spec is not None
-        assert cfg.groupby_query_spec.execution_path == "window_owned"
         assert cfg.groupby_query_spec.assign_threshold == 0.85
         assert cfg.groupby_config.max_groups_per_key == 6
         assert cfg.agg_query_spec is not None

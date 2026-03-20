@@ -52,7 +52,6 @@ class OverflowPolicy(enum.Enum):
     """Action when a state container reaches its hard limit."""
     DROP_OLDEST = "drop_oldest"      # evict oldest entries
     DROP_NEWEST = "drop_newest"      # reject incoming entry
-    DEGRADE_TAG = "degrade_tag"      # accept but tag as degraded
 
 
 @dataclass
@@ -218,4 +217,3 @@ def sem_topk_snapshot_descriptor(
     desc = ValueStateDescriptor("sem_topk_snapshot", Types.PICKLED_BYTE_ARRAY())
     desc.enable_time_to_live(build_ttl_config(ttl_seconds))
     return desc
-

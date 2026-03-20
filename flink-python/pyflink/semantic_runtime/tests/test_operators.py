@@ -2,8 +2,8 @@
 # Licensed under the Apache License, Version 2.0.
 
 """
-Smoke tests for all four semantic operators (sem_map, sem_filter, sem_topk,
-sem_join_retrieve).
+Smoke tests for all four public row-style semantic operators
+(`sem_map`, `sem_filter`, `sem_local_topk`, `sem_lookup_join`).
 
 Each sub-test verifies the normal path with MockLLMClient.
 """
@@ -24,9 +24,9 @@ from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
 from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.sem_topk import SemTopKFunction
+from pyflink.semantic_runtime.operators.sem_topk import SemLocalTopKFunction
 from pyflink.semantic_runtime.operators.sem_join_retrieve import (
-    SemJoinRetrieveFunction, SemJoinRetrieveConfig,
+    SemLookupJoinFunction, SemLookupJoinConfig,
 )
 
 
@@ -64,8 +64,8 @@ def run_sem_filter():
     env.execute("smoke_sem_filter")
 
 
-def run_sem_topk():
-    """Verify sem_topk reranks candidates and returns top-k."""
+def run_sem_local_topk():
+    """Verify sem_local_topk reranks candidates and returns top-k."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
@@ -77,14 +77,14 @@ def run_sem_topk():
 
     mock_resp = json.dumps(["C", "A", "D", "B"])
     config = LLMClientConfig(backend="mock", mock_delay_s=0.05, mock_response=mock_resp)
-    fn = SemTopKFunction("Rank these for '{input}': {candidates}", k=2, llm_config=config)
+    fn = SemLocalTopKFunction("Rank these for '{input}': {candidates}", k=2, llm_config=config)
     result = AsyncDataStream.unordered_wait(ds, fn, Time.seconds(10), 2, Types.STRING())
     result.print()
     env.execute("smoke_sem_topk")
 
 
-def run_sem_join():
-    """Verify sem_join_retrieve fetches candidates and runs LLM matching."""
+def run_sem_lookup_join():
+    """Verify sem_lookup_join fetches candidates and runs LLM matching."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
     ds = env.from_collection(["query_a", "query_b"], type_info=Types.STRING())
@@ -92,13 +92,13 @@ def run_sem_join():
     mock_join_result = json.dumps({"matched": "candidate_1", "score": 0.92})
     llm_config = LLMClientConfig(
         backend="mock", mock_delay_s=0.05, mock_response=mock_join_result)
-    join_config = SemJoinRetrieveConfig(
+    join_config = SemLookupJoinConfig(
         max_candidates_per_record=5,
         retrieve_timeout_ms=3000,
         mock_candidates=["candidate_1", "candidate_2", "candidate_3"],
         mock_retrieve_delay_s=0.02,
     )
-    fn = SemJoinRetrieveFunction(
+    fn = SemLookupJoinFunction(
         "Match {input} with: {candidates}", llm_config, join_config)
     result = AsyncDataStream.unordered_wait(ds, fn, Time.seconds(10), 2, Types.STRING())
     result.print()
@@ -108,8 +108,8 @@ def run_sem_join():
 TESTS = {
     "sem_map": run_sem_map,
     "sem_filter": run_sem_filter,
-    "sem_topk": run_sem_topk,
-    "sem_join": run_sem_join,
+    "sem_local_topk": run_sem_local_topk,
+    "sem_lookup_join": run_sem_lookup_join,
 }
 
 if __name__ == "__main__":
@@ -124,4 +124,3 @@ if __name__ == "__main__":
     else:
         print(f"Unknown: {which}. Options: {list(TESTS.keys())} or 'all'")
         sys.exit(1)
-

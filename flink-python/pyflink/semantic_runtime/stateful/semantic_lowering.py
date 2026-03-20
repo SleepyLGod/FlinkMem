@@ -113,11 +113,7 @@ def resolve_groupby_lowering_plan(
     input_kind: str = "event_stream",
 ) -> SemanticLoweringPlan:
     """Resolve the logical form for ``sem_groupby``."""
-    execution_path = query_spec.execution_path
-    if execution_path == "auto":
-        execution_path = "window_owned" if input_kind == "window_snapshot" else "operator_owned"
-
-    if execution_path == "window_owned":
+    if input_kind == "window_snapshot":
         return SemanticLoweringPlan(
             operator_name="sem_groupby",
             lowering_kind="derived_attribute_then_classical",

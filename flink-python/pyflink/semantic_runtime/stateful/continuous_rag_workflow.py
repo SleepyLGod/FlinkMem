@@ -369,7 +369,6 @@ class _AnswerSynthesiser(KeyedProcessFunction):
                 value.get("changed", False),
             ),
             "source": value.get("source", ""),
-            "degraded": value.get("degraded", False),
             "error": value.get("error", ""),
         }
 
@@ -389,18 +388,8 @@ class _ClassifyAsyncMergeFunction(KeyedProcessFunction):
             return
 
         if not value.get("success", False):
-            yield {
-                "key": value.get("key", str(ctx.get_current_key())),
-                "group_id": "__unclassified__",
-                "confidence": 0.0,
-                "source": "async_classify_failed",
-                "event_seq_id": 0,
-                "payload": "",
-                "_degraded": True,
-                "_error": value.get("error", "classify_async_failed"),
-                "metadata": {"async_task_type": "classify"},
-            }
-            return
+            error = value.get("error", "classify_async_failed")
+            raise RuntimeError(f"classify async bridge failed: {error}")
 
         result = value.get("result", {})
         yield {
@@ -427,17 +416,8 @@ class _SummarizeAsyncMergeFunction(KeyedProcessFunction):
 
         now_ms = int(time.time() * 1000)
         if not value.get("success", False):
-            yield {
-                "key": value.get("key", str(ctx.get_current_key())),
-                "aggregate": None,
-                "version": 0,
-                "mode": "summarize_async_failed",
-                "event_count": 0,
-                "timestamp_ms": now_ms,
-                "_degraded": True,
-                "_error": value.get("error", "summarize_async_failed"),
-            }
-            return
+            error = value.get("error", "summarize_async_failed")
+            raise RuntimeError(f"summarize async bridge failed: {error}")
 
         result = value.get("result", {})
         summary = result.get("summary", "")
@@ -470,18 +450,8 @@ class _RetrieveAsyncMergeFunction(KeyedProcessFunction):
         now_ms = int(time.time() * 1000)
         payload = value.get("payload", {})
         if not value.get("success", False):
-            yield {
-                "key": value.get("key", str(ctx.get_current_key())),
-                "query": payload.get("query", ""),
-                "query_seq_id": int(payload.get("event_seq_id", 0)),
-                "candidates": [],
-                "candidate_count": 0,
-                "source": "async_retrieve_failed",
-                "degraded": True,
-                "error": value.get("error", "retrieve_async_failed"),
-                "timestamp_ms": now_ms,
-            }
-            return
+            error = value.get("error", "retrieve_async_failed")
+            raise RuntimeError(f"retrieve async bridge failed: {error}")
 
         result = value.get("result", {})
         candidates = result.get("candidates", [])
@@ -491,8 +461,8 @@ class _RetrieveAsyncMergeFunction(KeyedProcessFunction):
             "query_seq_id": int(result.get("event_seq_id", payload.get("event_seq_id", 0))),
             "candidates": candidates,
             "candidate_count": len(candidates),
+            "truncated": bool(result.get("truncated", False)),
             "source": "async_retrieve",
-            "degraded": False,
             "timestamp_ms": now_ms,
         }
 
@@ -522,14 +492,12 @@ class _RetrievalToAnswerEnvelope(KeyedProcessFunction):
         if "topk" in value or "top_items" in value:
             out = topk_to_answer_context(value, query_payload=value.get("query", ""))
             out["memory_version"] = value.get("version", 0)
-            out["degraded"] = value.get("degraded", False)
             out["error"] = value.get("error", "")
             yield out
             return
 
         out = retrieve_to_answer_context(value)
         out["memory_version"] = value.get("version", 0)
-        out["degraded"] = value.get("degraded", False)
         out["error"] = value.get("error", "")
         yield out
 
@@ -554,68 +522,12 @@ class _RetrievalEnvelopeExpander(KeyedProcessFunction):
                 for item in items:
                     yield item
             else:
-                # Empty candidates (e.g. degraded fallback) — pass through
-                # so downstream sees degraded/error flags.
+                # Empty candidate pools are passed through for downstream
+                # normalization and auditing.
                 yield value
         else:
             # Already a flat candidate dict — pass through
             yield value
-
-
-class _MissingAsyncFallbackMapper:
-    """Convert dropped async work items into explicit degraded records."""
-
-    def __init__(self, stage_name: str):
-        self._stage_name = stage_name
-
-    def __call__(self, value):
-        if not isinstance(value, dict):
-            return {
-                "stage": self._stage_name,
-                "degraded": True,
-                "error": f"async_{self._stage_name}_missing_worker",
-            }
-
-        if self._stage_name == "classify":
-            payload = value.get("payload", {})
-            event = payload.get("event", {})
-            return {
-                "key": value.get("key", ""),
-                "group_id": payload.get("tentative_group", "__unclassified__"),
-                "confidence": 0.0,
-                "source": "async_classify_missing_worker",
-                "event_seq_id": event.get("seq_id", 0),
-                "payload": event.get("payload", ""),
-                "_degraded": True,
-                "_error": "async_classify_missing_worker",
-                "metadata": {"async_task_type": "classify"},
-            }
-
-        if self._stage_name == "summarize":
-            payload = value.get("payload", {})
-            return {
-                "key": value.get("key", ""),
-                "aggregate": None,
-                "version": int(payload.get("current_version", 0)),
-                "mode": "summarize_missing_worker",
-                "event_count": int(payload.get("event_count", 0)),
-                "timestamp_ms": int(time.time() * 1000),
-                "_degraded": True,
-                "_error": "async_summarize_missing_worker",
-            }
-
-        payload = value.get("payload", {})
-        return {
-            "key": value.get("key", ""),
-            "query": payload.get("query", ""),
-            "query_seq_id": int(payload.get("event_seq_id", 0)),
-            "candidates": [],
-            "candidate_count": 0,
-            "source": "async_retrieve_missing_worker",
-            "degraded": True,
-            "error": "async_retrieve_missing_worker",
-            "timestamp_ms": int(time.time() * 1000),
-        }
 
 
 # ============================================================================
@@ -629,23 +541,14 @@ def _wire_async_bridge_if_configured(
     stage_name: str,
     config: ContinuousRAGConfig,
 ) -> DataStream:
-    """Wire async bridge on an operator's output if an async function is provided.
+    """Wire async bridge on an operator's output.
 
-    If ``async_fn`` is None, logs a warning about unhandled side outputs
-    and emits degraded records from async work items.
+    Missing async workers are treated as configuration errors and fail fast.
     """
     if async_fn is None:
-        logger.warning(
-            "Async bridge not configured for stage '%s'. "
-            "Work items will be converted to degraded fallback records.",
-            stage_name,
+        raise ValueError(
+            f"Async bridge not configured for stage {stage_name!r}"
         )
-        side_ds = operator_ds.get_side_output(ASYNC_WORK_TAG)
-        fallback_ds = side_ds.map(
-            _MissingAsyncFallbackMapper(stage_name),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
-        return operator_ds.union(fallback_ds)
 
     return build_async_bridge(
         main_ds=operator_ds,
@@ -656,6 +559,22 @@ def _wire_async_bridge_if_configured(
         capacity=config.async_capacity,
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
+
+
+def _groupby_needs_classify_bridge(config: ContinuousRAGConfig) -> bool:
+    """Return whether the configured sem_groupby path can emit classify work."""
+    query_spec = config.groupby_query_spec
+    if query_spec is not None:
+        return query_spec.assignment_method in {"llm", "llm_refine"}
+    return False
+
+
+def _agg_needs_summarize_bridge(config: ContinuousRAGConfig) -> bool:
+    """Return whether the configured sem_agg path can emit summarize work."""
+    query_spec = config.agg_query_spec
+    if query_spec is not None:
+        return query_spec.agg_method in {"summarize", "compressive"}
+    return config.agg_config.mode in {"summarize", "compressive"}
 
 
 def _resolve_retrieve_async_fn(config: ContinuousRAGConfig):
@@ -708,13 +627,16 @@ def build_memory_subflow(
     )
 
     # Wire async bridge for sem_groupby classify side outputs
-    grouped = _wire_async_bridge_if_configured(
-        grouped_raw,
-        config.classify_async_fn,
-        _ClassifyAsyncMergeFunction(),
-        "classify",
-        config,
-    )
+    if _groupby_needs_classify_bridge(config):
+        grouped = _wire_async_bridge_if_configured(
+            grouped_raw,
+            config.classify_async_fn,
+            _ClassifyAsyncMergeFunction(),
+            "classify",
+            config,
+        )
+    else:
+        grouped = grouped_raw
 
     grouped_for_agg = grouped.key_by(config.key_selector).process(
         _GroupbyToAggEnvelope(),
@@ -732,13 +654,16 @@ def build_memory_subflow(
     )
 
     # Wire async bridge for sem_agg summarize side outputs
-    aggregated = _wire_async_bridge_if_configured(
-        aggregated_raw,
-        config.summarize_async_fn,
-        _SummarizeAsyncMergeFunction(),
-        "summarize",
-        config,
-    )
+    if _agg_needs_summarize_bridge(config):
+        aggregated = _wire_async_bridge_if_configured(
+            aggregated_raw,
+            config.summarize_async_fn,
+            _SummarizeAsyncMergeFunction(),
+            "summarize",
+            config,
+        )
+    else:
+        aggregated = aggregated_raw
 
     return aggregated
 

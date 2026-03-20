@@ -33,7 +33,8 @@ Design notes
 ------------
 * ``__init__`` stores only picklable config (no live objects).
 * ``LLMClient`` is created in ``open()`` to survive cloudpickle serialisation.
-* ``timeout()`` returns a degraded record with an ``_error`` tag — never throws.
+* Invalid model output and timeout conditions fail fast. The operator does not
+  synthesize fallback records.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMCallMetrics, LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators._common import (
-    attach_metrics, make_degraded_json, validate_schema,
+    attach_metrics, validate_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,7 @@ class SemMapFunction(AsyncFunction):
             logger.warning("LLM call failed for sem_map: %s", e)
             if om:
                 om.record_error()
-            return [make_degraded_json(value, f"llm_call_error: {e}")]
+            raise RuntimeError(f"sem_map LLM call failed: {e}") from e
 
         if om:
             om.record_call(metrics.latency_ms, metrics.input_tokens,
@@ -145,21 +146,20 @@ class SemMapFunction(AsyncFunction):
             logger.warning("sem_map JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            return [make_degraded_json(value, f"json_parse_error: {e}")]
+            raise ValueError(f"sem_map expected valid JSON output: {e}") from e
 
         # Validate schema
         if not validate_schema(parsed, self._output_schema):
             logger.warning("sem_map schema validation failed for: %s", parsed)
             if om:
                 om.record_invalid_output()
-            return [make_degraded_json(value, "schema_validation_error")]
+            raise ValueError("sem_map response violates output_schema")
 
         attach_metrics(parsed, metrics)
         return [json.dumps(parsed)]
 
     def timeout(self, value) -> List[str]:
-        """Return degraded record on Flink-level timeout — never throw."""
+        """Fail fast on Flink-level timeout."""
         if self._op_metrics:
             self._op_metrics.record_timeout()
-        return [make_degraded_json(value, "flink_timeout")]
-
+        raise TimeoutError(f"sem_map timed out for input: {value!r}")
