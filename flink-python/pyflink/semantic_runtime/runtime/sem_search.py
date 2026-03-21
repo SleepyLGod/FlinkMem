@@ -16,10 +16,7 @@
 # under the License.
 
 """
-sem_search (cts_retrieve) — continuous stateful retrieval over keyed state.
-
-Public name: ``sem_search``.  Internal name: ``cts_retrieve`` (kept for
-backward compatibility during transition).
+sem_search — continuous stateful retrieval over keyed state.
 
 Input: keyed ``SemanticEvent`` dicts (query/request records).
 
@@ -33,7 +30,7 @@ State model:
 
 Retrieval flow:
   1. Check keyed cache for locally matching candidates.
-  2. Invoke external store fallback (via side-output async) for cache misses.
+  2. Invoke external store retrieval (via side-output async) for cache misses.
   3. Merge results, truncate to ``max_candidates_per_request``, emit.
 
 Guardrails:
@@ -42,7 +39,7 @@ Guardrails:
   - Strict retrieval timeout budget via async bridge.
   - Deterministic overflow handling.
 
-Relationship to V0.1 ``sem_lookup_join`` (formerly ``sem_join_retrieve``):
+Relationship to V0.1 ``sem_lookup_join``:
   - ``sem_search`` is the stateful evolution (keyed cache, continuous).
   - ``sem_lookup_join`` remains valid for stateless / simple workloads.
 """
@@ -57,28 +54,28 @@ from typing import Any, Callable, Dict, List, Optional
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import MapState, ValueState
 
-from pyflink.semantic_runtime.stateful.state_descriptors import (
+from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
-    cts_retrieve_cache_descriptor,
+    sem_search_cache_descriptor,
     build_ttl_config,
 )
-from pyflink.semantic_runtime.stateful.event_model import SemanticEvent
-from pyflink.semantic_runtime.stateful.async_bridge import (
+from pyflink.semantic_runtime.runtime.event_model import SemanticEvent
+from pyflink.semantic_runtime.runtime.async_bridge import (
     ASYNC_WORK_TAG,
     AsyncWorkItem,
     AsyncResult,
 )
-from pyflink.semantic_runtime.stateful.timer_policy import (
+from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
     register_timer,
     resolve_timer_category,
     clear_timer_registration,
 )
-from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
-from pyflink.semantic_runtime.stateful.external_search_backend import (
+from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.runtime.external_search_backend import (
     ExternalSearchBackend,
 )
-from pyflink.semantic_runtime.stateful.simple_text_encoder import (
+from pyflink.semantic_runtime.runtime.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,
 )
@@ -91,8 +88,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class CtsRetrieveConfig:
-    """Configuration for the continuous retrieval operator."""
+class SemSearchConfig:
+    """Configuration for the continuous semantic search operator."""
     max_candidates_per_request: int = 20
     max_cache_entries_per_key: int = 200
     ttl_seconds: int = 1800              # 30 min default for retrieval cache
@@ -105,22 +102,22 @@ class CtsRetrieveConfig:
 
 
 # ---------------------------------------------------------------------------
-# CtsRetrieveFunction
+# SemSearchFunction
 # ---------------------------------------------------------------------------
 
-class CtsRetrieveFunction(KeyedProcessFunction):
-    """Keyed continuous retrieval state machine.
+class SemSearchFunction(KeyedProcessFunction):
+    """Keyed continuous semantic search state machine.
 
     Usage::
 
         keyed = ds.key_by(simple_key_selector)
-        retrieved = keyed.process(CtsRetrieveFunction(CtsRetrieveConfig(...)))
-        # Wire async bridge for external store fallback:
+        retrieved = keyed.process(SemSearchFunction(SemSearchConfig(...)))
+        # Wire async bridge for external store retrieval:
         merged = build_async_bridge(retrieved, store_fn, merge_fn, ...)
     """
 
-    def __init__(self, config: Optional[CtsRetrieveConfig] = None) -> None:
-        self._config = config or CtsRetrieveConfig()
+    def __init__(self, config: Optional[SemSearchConfig] = None) -> None:
+        self._config = config or SemSearchConfig()
         self._cache: Optional[MapState] = None
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
@@ -131,18 +128,18 @@ class CtsRetrieveFunction(KeyedProcessFunction):
     def open(self, runtime_context: RuntimeContext) -> None:
         ttl = self._config.ttl_seconds
         self._cache = runtime_context.get_map_state(
-            cts_retrieve_cache_descriptor(ttl)
+            sem_search_cache_descriptor(ttl)
         )
         from pyflink.common.typeinfo import Types
         from pyflink.datastream.state import ValueStateDescriptor
-        desc = ValueStateDescriptor("cts_retrieve_meta", Types.PICKLED_BYTE_ARRAY())
+        desc = ValueStateDescriptor("sem_search_meta", Types.PICKLED_BYTE_ARRAY())
         desc.enable_time_to_live(build_ttl_config(ttl))
         self._meta = runtime_context.get_state(desc)
         self._metrics = StatefulOperatorMetrics.from_runtime_context(
-            runtime_context, "cts_retrieve",
+            runtime_context, "sem_search",
         )
         logger.info(
-            "CtsRetrieveFunction opened (max_candidates=%d, cache_limit=%d)",
+            "SemSearchFunction opened (max_candidates=%d, cache_limit=%d)",
             self._config.max_candidates_per_request,
             self._config.max_cache_entries_per_key,
         )
@@ -153,7 +150,7 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         """Process one query event or async retrieval result.
 
         Yields retrieval result dicts on main output.  Yields side-output
-        ``AsyncWorkItem`` dicts for external store fallback.
+        ``AsyncWorkItem`` dicts for external store retrieval on cache miss.
         """
         now_ms = int(time.time() * 1000)
         if self._metrics:
@@ -300,7 +297,7 @@ class CtsRetrieveFunction(KeyedProcessFunction):
         """Merge async retrieval results into cache and emit."""
         if not result_dict.get("success", False):
             error = result_dict.get("error", "retrieve_async_failed")
-            raise RuntimeError(f"cts_retrieve async retrieval failed: {error}")
+            raise RuntimeError(f"sem_search async retrieval failed: {error}")
 
         candidates = result_dict.get("result", {}).get("candidates", [])
 

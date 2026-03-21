@@ -31,7 +31,7 @@ row-style operator implementation.
 from __future__ import annotations
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
 
 
 class SemScoreFunction(SemMapFunction):

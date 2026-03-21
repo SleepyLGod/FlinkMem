@@ -19,7 +19,7 @@
 External search backend — abstract interface stub.
 
 This module defines the pluggable interface for external vector/search
-backends used by ``sem_search`` (``cts_retrieve``) and ``sem_lookup_join``
+backends used by ``sem_search`` (``sem_search``) and ``sem_lookup_join``
 when local cache misses occur.
 
 **Status: interface stub — no concrete implementations yet.**
@@ -47,8 +47,8 @@ Usage (future)::
             # call milvus client
             return [{"candidate_id": ..., "text": ..., "score": ...}, ...]
 
-    # Wire into cts_retrieve / sem_search:
-    retrieve_cfg = CtsRetrieveConfig(search_backend=MilvusSearchBackend(...))
+    # Wire into sem_search / sem_search:
+    retrieve_cfg = SemSearchConfig(search_backend=MilvusSearchBackend(...))
 """
 
 from __future__ import annotations
@@ -60,8 +60,8 @@ from typing import Any, Dict, List, Optional
 
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
-from pyflink.semantic_runtime.stateful.async_bridge import AsyncResult, AsyncWorkItem
-from pyflink.semantic_runtime.stateful.simple_text_encoder import (
+from pyflink.semantic_runtime.runtime.async_bridge import AsyncResult, AsyncWorkItem
+from pyflink.semantic_runtime.runtime.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,
 )
@@ -119,7 +119,7 @@ class ExternalSearchBackend(abc.ABC):
     - ``open()`` / ``close()`` for lifecycle management (optional)
 
     The ``search`` method is called from the async bridge worker when
-    ``cts_retrieve`` / ``sem_search`` encounters a cache miss.
+    ``sem_search`` / ``sem_search`` encounters a cache miss.
     """
 
     def open(self) -> None:

@@ -49,31 +49,31 @@ from typing import Any, Dict, List, Optional, Tuple
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import MapState, ValueState
 
-from pyflink.semantic_runtime.stateful.state_descriptors import (
+from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_groupby_profiles_descriptor,
     sem_window_meta_descriptor,
     build_ttl_config,
 )
-from pyflink.semantic_runtime.stateful.event_model import (
+from pyflink.semantic_runtime.runtime.event_model import (
     SemanticEvent,
     is_window_snapshot,
     window_snapshot_to_semantic_events,
 )
-from pyflink.semantic_runtime.stateful.async_bridge import (
+from pyflink.semantic_runtime.runtime.async_bridge import (
     ASYNC_WORK_TAG,
     AsyncWorkItem,
     AsyncResult,
 )
-from pyflink.semantic_runtime.stateful.timer_policy import (
+from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
     register_timer,
     resolve_timer_category,
     clear_timer_registration,
 )
-from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
 from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
-from pyflink.semantic_runtime.stateful.simple_text_encoder import HashingTextEncoder
+from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +203,9 @@ def _group_profile_text(profile: Dict[str, Any]) -> str:
 def derive_group_label(profile: Dict[str, Any]) -> str:
     """Derive a compact local label from a group profile.
 
-    This is a local fallback used by ``llm_refine`` maintenance until a true
-    async relabel/refine worker exists.
+    This is a local relabel helper used by
+    ``llm_verify_local_refine`` maintenance. No separate LLM-driven
+    relabel worker exists in the current runtime.
     """
     text = _group_profile_text(profile).strip()
     if not text:
@@ -646,7 +647,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
                     "metadata": dict(event.metadata),
                     "boundary_flags": dict(event.boundary_flags),
                 }
-                if self._resolved_assignment_method in {"llm", "llm_refine"}:
+                if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
                     work = AsyncWorkItem(
                         key=event.key,
                         task_type="classify",
@@ -762,7 +763,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             "event": event_dict,
             "tentative_group": tentative_group,
         }
-        if self._resolved_assignment_method in {"llm", "llm_refine"}:
+        if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
             payload["candidate_groups"] = [
                 {
                     "group_id": group_id,
@@ -858,15 +859,15 @@ class SemGroupbyFunction(KeyedProcessFunction):
         return self._evict_n_oldest(count - self._resolved_max_groups_per_key)
 
     def _run_maintenance(self, meta: Dict[str, Any], now_ms: int) -> None:
-        """Maintenance/refinement skeleton for future llm_refine path.
+        """Run local maintenance for operator-owned grouping.
 
-        Current V0.2++ behaviour is intentionally narrow:
+        Current behaviour is intentionally narrow:
         - perform a local greedy merge of highly similar groups
         - record maintenance heartbeat metadata
         - do not reassign historical events
         """
         merge_count = self._merge_similar_groups(now_ms)
-        if self._resolved_assignment_method == "llm_refine":
+        if self._resolved_assignment_method == "llm_verify_local_refine":
             self._refresh_group_labels()
         meta["last_refine_ms"] = now_ms
         meta["refine_count"] = int(meta.get("refine_count", 0)) + 1

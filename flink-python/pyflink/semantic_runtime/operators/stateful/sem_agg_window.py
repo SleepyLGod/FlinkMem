@@ -25,13 +25,13 @@ from typing import Any, Dict, List, Optional
 from pyflink.datastream.functions import KeyedProcessFunction
 
 from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
-from pyflink.semantic_runtime.stateful.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
-from pyflink.semantic_runtime.stateful.event_model import (
+from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
+from pyflink.semantic_runtime.runtime.event_model import (
     SemanticEvent,
     is_window_snapshot,
     window_snapshot_to_semantic_events,
 )
-from pyflink.semantic_runtime.stateful.sem_agg_stateful import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg import (
     SemAggConfig,
     resolve_agg_runtime_params,
 )

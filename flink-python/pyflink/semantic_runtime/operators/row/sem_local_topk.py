@@ -16,14 +16,14 @@
 # under the License.
 
 """
-sem_filter — row-wise semantic filtering with confidence and reason.
+sem_local_topk — local (row-level) LLM-based reranking of a candidate list.
 
-The operator itself is **1:1**: every input produces exactly one output record
-enriched with ``{decision, confidence, reason}``.  Actual filtering is done
-downstream via ``DataStream.filter(lambda x: json.loads(x)["decision"])``.
+The input record is expected to be a JSON string carrying a ``candidates``
+list.  The LLM reranks these candidates and returns the top-k.
 
-This keeps the async operator output count deterministic and filtered-out
-records remain available for quality auditing.
+This is the **local** V0.1 variant (no keyed state).  The continuous,
+stateful ``sem_topk`` lives in ``operators/stateful/sem_topk.py``.
+
 """
 
 from __future__ import annotations
@@ -36,33 +36,38 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators._common import attach_metrics
+from pyflink.semantic_runtime.operators.row._common import attach_metrics
 
 logger = logging.getLogger(__name__)
 
-# Expected LLM response schema for filter decisions.
-_FILTER_SCHEMA_KEYS = {"decision", "confidence", "reason"}
 
-
-class SemFilterFunction(AsyncFunction):
-    """Async semantic filter operator.
+class SemLocalTopKFunction(AsyncFunction):
+    """Async local semantic top-k reranker (V0.1, row-level, no keyed state).
 
     Parameters
     ----------
     prompt_template : str
-        Format-string with ``{input}`` placeholder.  The prompt should instruct
-        the LLM to return JSON ``{decision: bool, confidence: float, reason: str}``.
+        Format-string with ``{input}`` and ``{candidates}`` placeholders.
+    k : int
+        Number of top results to return.
     llm_config : LLMClientConfig
         Picklable LLM backend configuration.
+    candidates_field : str
+        JSON key in the input record that holds the candidate list
+        (default ``"candidates"``).
     """
 
     def __init__(
         self,
         prompt_template: str,
+        k: int,
         llm_config: LLMClientConfig,
+        candidates_field: str = "candidates",
     ) -> None:
         self._prompt_template = prompt_template
+        self._k = k
         self._llm_config = llm_config
+        self._candidates_field = candidates_field
         self._client: Optional[LLMClient] = None
         self._op_metrics: Optional[OperatorMetrics] = None
 
@@ -70,8 +75,9 @@ class SemFilterFunction(AsyncFunction):
 
     def open(self, runtime_context: RuntimeContext) -> None:
         self._client = create_llm_client(self._llm_config)
-        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_filter")
-        logger.info("SemFilterFunction opened (backend=%s)", self._llm_config.backend)
+        self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_local_topk")
+        logger.info("SemLocalTopKFunction opened (backend=%s, k=%d)",
+                     self._llm_config.backend, self._k)
 
     def close(self) -> None:
         if self._client is not None:
@@ -84,47 +90,62 @@ class SemFilterFunction(AsyncFunction):
         assert self._client is not None, "open() was not called"
         om = self._op_metrics
 
-        prompt = self._prompt_template.format(input=value)
+        # Parse input to extract candidates
+        try:
+            record = json.loads(value) if isinstance(value, str) else value
+            candidates = record[self._candidates_field]
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            logger.warning("sem_topk input parse failed: %s", e)
+            if om:
+                om.record_invalid_output()
+            raise ValueError(f"sem_local_topk input is missing '{self._candidates_field}': {e}") from e
+
+        prompt = self._prompt_template.format(
+            input=json.dumps(record),
+            candidates=json.dumps(candidates),
+        )
 
         try:
             text, metrics = await self._client.call(prompt)
         except Exception as e:
-            logger.warning("LLM call failed for sem_filter: %s", e)
+            logger.warning("LLM call failed for sem_topk: %s", e)
             if om:
                 om.record_error()
-            raise RuntimeError(f"sem_filter LLM call failed: {e}") from e
+            raise RuntimeError(f"sem_local_topk LLM call failed: {e}") from e
 
         if om:
             om.record_call(metrics.latency_ms, metrics.input_tokens,
                            metrics.output_tokens, metrics.attempts)
 
-        # Parse JSON
+        # Parse LLM response — expect a JSON list of ranked items
         try:
-            parsed = json.loads(text)
+            ranked = json.loads(text)
         except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("sem_filter JSON parse failed: %s", e)
+            logger.warning("sem_topk JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            raise ValueError(f"sem_filter expected valid JSON output: {e}") from e
+            raise ValueError(f"sem_local_topk expected JSON list output: {e}") from e
 
-        # Validate required keys
-        if not isinstance(parsed, dict) or not _FILTER_SCHEMA_KEYS.issubset(parsed):
-            logger.warning("sem_filter schema validation failed: %s", parsed)
+        if not isinstance(ranked, list):
+            logger.warning("sem_topk expected list, got %s", type(ranked).__name__)
             if om:
                 om.record_invalid_output()
-            raise ValueError("sem_filter response violates required schema")
+            raise ValueError("sem_local_topk expected list response from model")
 
-        # Normalise types
-        parsed["decision"] = bool(parsed["decision"])
-        parsed["confidence"] = float(parsed["confidence"])
-        parsed["reason"] = str(parsed["reason"])
-        parsed["_input"] = value
+        # Truncate to k
+        top = ranked[: self._k]
 
-        attach_metrics(parsed, metrics)
-        return [json.dumps(parsed)]
+        result = {
+            "_input": value,
+            "top_k": top,
+            "k": self._k,
+            "original_count": len(candidates),
+        }
+        attach_metrics(result, metrics)
+        return [json.dumps(result)]
 
     def timeout(self, value) -> List[str]:
         """Fail fast on Flink-level timeout."""
         if self._op_metrics:
             self._op_metrics.record_timeout()
-        raise TimeoutError(f"sem_filter timed out for input: {value!r}")
+        raise TimeoutError(f"sem_local_topk timed out for input: {value!r}")

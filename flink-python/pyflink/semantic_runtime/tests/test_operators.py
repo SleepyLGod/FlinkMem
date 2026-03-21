@@ -22,10 +22,10 @@ from pyflink.common import Time, Types
 from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
-from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.sem_topk import SemLocalTopKFunction
-from pyflink.semantic_runtime.operators.sem_join_retrieve import (
+from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators.row.sem_filter import SemFilterFunction
+from pyflink.semantic_runtime.operators.row.sem_local_topk import SemLocalTopKFunction
+from pyflink.semantic_runtime.operators.row.sem_lookup_join import (
     SemLookupJoinFunction, SemLookupJoinConfig,
 )
 

@@ -49,24 +49,24 @@ from typing import Any, Dict, List, Optional
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import ListState, ValueState
 
-from pyflink.semantic_runtime.stateful.state_descriptors import (
+from pyflink.semantic_runtime.runtime.state_descriptors import (
     StateSafetyConfig,
     OverflowPolicy,
     sem_window_event_buffer_descriptor,
     sem_window_meta_descriptor,
 )
-from pyflink.semantic_runtime.stateful.event_model import (
+from pyflink.semantic_runtime.runtime.event_model import (
     SemanticEvent,
     WindowSnapshot,
 )
-from pyflink.semantic_runtime.stateful.timer_policy import (
+from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
     TimerPolicy,
     register_timer,
     resolve_timer_category,
     clear_timer_registration,
 )
-from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
 
 logger = logging.getLogger(__name__)
 

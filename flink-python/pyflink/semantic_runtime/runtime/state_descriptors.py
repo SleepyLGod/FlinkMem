@@ -138,10 +138,10 @@ def sem_groupby_profiles_descriptor(
 
 
 # ---------------------------------------------------------------------------
-# cts_retrieve descriptors
+# sem_search descriptors
 # ---------------------------------------------------------------------------
 
-def cts_retrieve_cache_descriptor(
+def sem_search_cache_descriptor(
     ttl_seconds: int = 1800,
 ) -> MapStateDescriptor:
     """MapState descriptor for retrieval cache/index hints.
@@ -149,7 +149,7 @@ def cts_retrieve_cache_descriptor(
     Key: candidate_id (str), Value: pickled candidate dict.
     """
     desc = MapStateDescriptor(
-        "cts_retrieve_cache", Types.STRING(), Types.PICKLED_BYTE_ARRAY()
+        "sem_search_cache", Types.STRING(), Types.PICKLED_BYTE_ARRAY()
     )
     desc.enable_time_to_live(build_ttl_config(ttl_seconds))
     return desc

@@ -34,7 +34,7 @@ Design notes
 * ``__init__`` stores only picklable config (no live objects).
 * ``LLMClient`` is created in ``open()`` to survive cloudpickle serialisation.
 * Invalid model output and timeout conditions fail fast. The operator does not
-  synthesize fallback records.
+  synthesize strict output records.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMCallMetrics, LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators._common import (
+from pyflink.semantic_runtime.operators.row._common import (
     attach_metrics, validate_schema,
 )
 

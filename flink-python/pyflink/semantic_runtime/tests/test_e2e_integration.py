@@ -13,6 +13,21 @@ Scenarios:
 2. Flink timeout propagates as job failure.
 3. Invalid model JSON propagates as job failure.
 4. Sustained load succeeds without silent drops.
+5. Optional real-provider path runs only when explicitly selected.
+
+Recommended isolated-runtime invocation:
+
+```bash
+JAVA_HOME=/Users/von/Projects/FlinkMem/.isolation/jdk/jdk-17.0.18+8/Contents/Home \
+PYFLINK_CLIENT_EXECUTABLE=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+PATH=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin:$PATH \
+/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+flink-python/pyflink/semantic_runtime/tests/test_e2e_integration.py all
+```
+
+Do not set `PYTHONPATH=flink-python` for this runtime test. The test injects
+`semantic_runtime` into the installed isolated `pyflink`, and mixing repo
+Python code with the isolated JVM side causes version skew.
 """
 
 from __future__ import annotations
@@ -26,18 +41,24 @@ from typing import Any, Dict, List
 import os
 import pathlib
 import pyflink as _pf  # noqa: E401
+import pytest
 
 from pyflink.common import Time, Types
 from pyflink.datastream import AsyncDataStream, StreamExecutionEnvironment
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators.row.sem_filter import SemFilterFunction
+from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
 
 _SEM_RUNTIME_SRC = pathlib.Path(__file__).resolve().parents[1]
 _SEM_RUNTIME_DST = pathlib.Path(_pf.__file__).parent / "semantic_runtime"
 if not _SEM_RUNTIME_DST.exists():
     os.symlink(_SEM_RUNTIME_SRC, _SEM_RUNTIME_DST)
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("SEM_RUNTIME_RUN_PYTEST_E2E", "0") != "1",
+    reason="Run E2E via the isolated runtime command or set SEM_RUNTIME_RUN_PYTEST_E2E=1.",
+)
 
 
 class SLOReport:
@@ -141,7 +162,7 @@ def test_normal_pipeline() -> None:
 
 
 def test_timeout_pipeline_fails() -> None:
-    """Timeouts should fail the job instead of emitting fallback records."""
+    """Timeouts should fail the job instead of emitting substitute records."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
@@ -160,7 +181,7 @@ def test_timeout_pipeline_fails() -> None:
 
 
 def test_invalid_json_pipeline_fails() -> None:
-    """Invalid model JSON should fail the job instead of emitting fallback records."""
+    """Invalid model JSON should fail the job instead of emitting substitute records."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
@@ -209,11 +230,111 @@ def test_backpressure_pipeline() -> None:
     assert elapsed >= 0.0
 
 
+def _parse_dotenv_line(raw: str) -> tuple[str | None, str | None]:
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None, None
+    key, val = stripped.split("=", 1)
+    key = key.strip()
+    val = val.strip()
+    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+        val = val[1:-1]
+    return key or None, val
+
+
+def _try_load_env_file(env_file: str = ".env") -> str | None:
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
+    candidates = [pathlib.Path.cwd() / env_file, repo_root / env_file]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        loaded = 0
+        with candidate.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                key, val = _parse_dotenv_line(raw)
+                if not key or key in os.environ:
+                    continue
+                os.environ[key] = val or ""
+                loaded += 1
+        return f"{candidate} (loaded={loaded})"
+    return None
+
+
+def test_real_pipeline_if_enabled() -> None:
+    """Run a minimal real-provider pipeline when explicitly enabled.
+
+    This test is gated on environment and is intentionally excluded from the
+    default ``all`` path to avoid accidental network usage and cost.
+    """
+
+    if os.environ.get("SEM_RUNTIME_LOAD_DOTENV", "0") == "1":
+        _try_load_env_file(os.environ.get("SEM_RUNTIME_ENV_FILE", ".env"))
+
+    api_key_env = os.environ.get("SEM_RUNTIME_API_KEY_ENV", "DEEPSEEK_API_KEY")
+    if not os.environ.get(api_key_env):
+        raise RuntimeError(
+            f"Environment variable {api_key_env} is empty. "
+            "Export it first or set SEM_RUNTIME_LOAD_DOTENV=1."
+        )
+
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    inputs = ["The service was excellent and fast."]
+    ds = env.from_collection(inputs, type_info=Types.STRING())
+
+    llm_cfg = LLMClientConfig(
+        backend="openai",
+        model=os.environ.get("SEM_RUNTIME_MODEL", "deepseek-chat"),
+        api_base=os.environ.get("SEM_RUNTIME_API_BASE", "https://api.deepseek.com/v1"),
+        api_key_env=api_key_env,
+        timeout_s=float(os.environ.get("SEM_RUNTIME_LLM_TIMEOUT_S", "30")),
+        max_retries=int(os.environ.get("SEM_RUNTIME_LLM_MAX_RETRIES", "2")),
+        retry_base_delay_s=float(os.environ.get("SEM_RUNTIME_LLM_RETRY_BASE_DELAY_S", "0.5")),
+    )
+
+    map_fn = SemMapFunction(
+        (
+            "Return strict JSON with keys sentiment and confidence. "
+            "sentiment must be one of positive, neutral, negative. "
+            "confidence must be a float in [0,1]. "
+            "Input: {input}"
+        ),
+        {"sentiment": str, "confidence": float},
+        llm_cfg,
+    )
+    mapped = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(60), 2, Types.STRING())
+
+    filter_fn = SemFilterFunction(
+        (
+            "Return strict JSON with keys decision, confidence, reason. "
+            "decision should be true only for clearly positive sentiment. "
+            "Input: {input}"
+        ),
+        llm_cfg,
+    )
+    filtered = AsyncDataStream.unordered_wait(
+        mapped,
+        filter_fn,
+        Time.seconds(60),
+        2,
+        Types.STRING(),
+    )
+
+    results = collect_results(env, filtered, "test_real_pipeline_if_enabled")
+    assert len(results) == 1
+    parsed = json.loads(results[0])
+    assert isinstance(parsed.get("decision"), bool)
+    assert isinstance(parsed.get("confidence"), (int, float))
+    assert isinstance(parsed.get("reason"), str)
+
+
 TESTS = {
     "normal": test_normal_pipeline,
     "timeout": test_timeout_pipeline_fails,
     "invalid_json": test_invalid_json_pipeline_fails,
     "backpressure": test_backpressure_pipeline,
+    "real": test_real_pipeline_if_enabled,
 }
 
 
@@ -222,7 +343,8 @@ if __name__ == "__main__":
     if which == "all":
         passed = 0
         failed = 0
-        for name, fn in TESTS.items():
+        for name in ("normal", "timeout", "invalid_json", "backpressure"):
+            fn = TESTS[name]
             try:
                 fn()
                 passed += 1

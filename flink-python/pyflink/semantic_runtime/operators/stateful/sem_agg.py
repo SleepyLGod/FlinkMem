@@ -32,7 +32,7 @@ Guardrails:
   - TTL via ``StateTtlConfig`` on all state handles.
   - ``overflow_policy``: DROP_OLDEST / DROP_NEWEST.
 
-Reuses the async bridge from ``stateful/async_bridge.py``.
+Reuses the async bridge from ``runtime/async_bridge.py``.
 """
 
 from __future__ import annotations
@@ -46,30 +46,30 @@ from typing import Any, Callable, Dict, List, Optional
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import ListState, ValueState
 
-from pyflink.semantic_runtime.stateful.state_descriptors import (
+from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_agg_buffer_descriptor,
     sem_agg_value_descriptor,
     sem_agg_meta_descriptor,
 )
-from pyflink.semantic_runtime.stateful.event_model import (
+from pyflink.semantic_runtime.runtime.event_model import (
     SemanticEvent,
     is_window_snapshot,
     window_snapshot_to_semantic_events,
 )
-from pyflink.semantic_runtime.stateful.async_bridge import (
+from pyflink.semantic_runtime.runtime.async_bridge import (
     ASYNC_WORK_TAG,
     AsyncWorkItem,
     AsyncResult,
 )
-from pyflink.semantic_runtime.stateful.timer_policy import (
+from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
     encode_timer_key,
     register_timer,
     resolve_timer_category,
     clear_timer_registration,
 )
-from pyflink.semantic_runtime.stateful.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
 from pyflink.semantic_runtime.semantic_spec import (
     AggQuerySpec,
     AggScopePolicy,

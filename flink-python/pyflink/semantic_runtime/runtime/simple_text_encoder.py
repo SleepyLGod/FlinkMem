@@ -26,7 +26,7 @@ This module intentionally provides a tiny, dependency-light encoder:
 
 It is useful for:
 
-- local cache matching in ``sem_search`` / ``cts_retrieve``
+- local cache matching in ``sem_search`` / ``sem_search``
 - FAISS demo indexing without requiring a real embedding model
 
 It is not a production semantic encoder.

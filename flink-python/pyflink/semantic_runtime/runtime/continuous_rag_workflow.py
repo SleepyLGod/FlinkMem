@@ -31,7 +31,7 @@ Subflow A (Memory Build)::
 Subflow B (Query / Retrieval)::
 
     query requests
-      → key_by → cts_retrieve → optional sem_topk rerank
+      → key_by → sem_search → optional sem_topk rerank
       → retrieved context
 
 Subflow C (Answer Synthesis)::
@@ -53,74 +53,45 @@ lightweight router ``KeyedProcessFunction``.
 
 from __future__ import annotations
 
-import json
-import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from pyflink.common import Time, Types
-from pyflink.datastream import AsyncDataStream, DataStream, OutputTag
-from pyflink.datastream.functions import (
-    KeyedProcessFunction,
-    RuntimeContext,
-)
+from pyflink.common import Types
+from pyflink.datastream import DataStream
 
-from pyflink.semantic_runtime.stateful.event_model import (
-    SemanticEvent,
-    group_assignment_to_semantic_event,
-    retrieve_to_answer_context,
-    retrieve_to_topk_items,
-    topk_to_answer_context,
+from pyflink.semantic_runtime.runtime.event_model import (
     simple_key_selector,
 )
-from pyflink.semantic_runtime.stateful.semantic_window import (
+from pyflink.semantic_runtime.runtime import continuous_rag_components as _components
+from pyflink.semantic_runtime.operators.stateful.sem_window import (
     SemWindowConfig,
     SemWindowFunction,
 )
-from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     SemGroupbyConfig,
 )
-from pyflink.semantic_runtime.stateful.sem_groupby_pipeline import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_pipeline import (
     build_sem_groupby_operator,
 )
-from pyflink.semantic_runtime.stateful.sem_agg_stateful import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg import (
     SemAggConfig,
-    SemAggFunction,
 )
-from pyflink.semantic_runtime.stateful.sem_agg_pipeline import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
     build_sem_agg_operator,
 )
-from pyflink.semantic_runtime.stateful.cts_retrieve import (
-    CtsRetrieveConfig,
-    CtsRetrieveFunction,
+from pyflink.semantic_runtime.runtime.sem_search import (
+    SemSearchConfig,
+    SemSearchFunction,
 )
-from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk import (
     SemTopKConfig,
 )
 from pyflink.semantic_runtime.semantic_spec import AggQuerySpec, GroupbyQuerySpec, TopKQuerySpec
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig, RuntimeConfig
-from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (
     build_sem_topk_pipeline,
 )
-from pyflink.semantic_runtime.stateful.external_search_backend import (
-    SearchBackendAsyncFn,
-)
-from pyflink.semantic_runtime.stateful.async_bridge import (
-    ASYNC_WORK_TAG,
-    build_async_bridge,
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# Output tags for stream routing
-# ============================================================================
-
-MEMORY_EVENT_TAG = OutputTag("memory_events", Types.PICKLED_BYTE_ARRAY())
-QUERY_REQUEST_TAG = OutputTag("query_requests", Types.PICKLED_BYTE_ARRAY())
 
 
 # ============================================================================
@@ -142,7 +113,7 @@ class ContinuousRAGConfig:
     agg_query_spec: Optional[AggQuerySpec] = None
 
     # Subflow B configs
-    retrieve_config: CtsRetrieveConfig = field(default_factory=CtsRetrieveConfig)
+    retrieve_config: SemSearchConfig = field(default_factory=SemSearchConfig)
     topk_config: Optional[SemTopKConfig] = None  # None = skip rerank
     topk_query_spec: Optional[TopKQuerySpec] = None  # query-level params (k, version, …)
     topk_llm_config: Optional[LLMClientConfig] = None
@@ -167,7 +138,7 @@ class ContinuousRAGConfig:
     # and return AsyncResult dicts.
     classify_async_fn: Optional[Any] = None    # For sem_groupby side output
     summarize_async_fn: Optional[Any] = None   # For sem_agg side output
-    retrieve_async_fn: Optional[Any] = None    # For cts_retrieve side output
+    retrieve_async_fn: Optional[Any] = None    # For sem_search side output
 
     # Audit
     workflow_version: str = "v0.2.0"
@@ -260,334 +231,6 @@ def build_continuous_rag_workflow_from_runtime_config(
     )
 
 
-# ============================================================================
-# Stream Router — splits input into memory events vs query requests
-# ============================================================================
-
-class _StreamRouter(KeyedProcessFunction):
-    """Lightweight router that splits incoming events by ``stream_type``.
-
-    - ``stream_type == "memory_event"`` → side output ``MEMORY_EVENT_TAG``
-    - ``stream_type == "query_request"`` → side output ``QUERY_REQUEST_TAG``
-    - Unknown types → dropped with warning.
-
-    This is a pure routing function with no state.
-    """
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            logger.warning("StreamRouter: non-dict input dropped: %s", type(value))
-            return
-
-        stream_type = value.get("stream_type", "")
-        if stream_type == "memory_event":
-            yield MEMORY_EVENT_TAG, value
-        elif stream_type == "query_request":
-            yield QUERY_REQUEST_TAG, value
-        else:
-            # Default: treat as memory event
-            logger.debug("StreamRouter: unknown stream_type '%s', routing as memory_event", stream_type)
-            yield MEMORY_EVENT_TAG, value
-
-
-# ============================================================================
-# Answer Synthesiser — wraps retrieved context + query for Subflow C
-# ============================================================================
-
-class _AnswerSynthesiser(KeyedProcessFunction):
-    """Combines retrieved context with the original query for answer synthesis.
-
-    Input: dicts with ``stream_type == "retrieval_result"`` (from Subflow B)
-    containing ``query``, ``retrieved_context``, and audit fields.
-
-    Output: dicts ready for V0.1 ``sem_map`` async answer generation, or
-    direct passthrough if no LLM is configured.
-    """
-
-    def __init__(
-        self,
-        prompt_template: str,
-        workflow_version: str = "v0.2.0",
-        config_version: str = "default",
-    ) -> None:
-        self._prompt_template = prompt_template
-        self._workflow_version = workflow_version
-        self._config_version = config_version
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-
-        now_ms = int(time.time() * 1000)
-        query = value.get("query", value.get("payload", ""))
-        context_items = value.get(
-            "retrieved_context",
-            value.get("topk", value.get("candidates", [])),
-        )
-
-        # Format context
-        if isinstance(context_items, list):
-            context_str = "\n".join(
-                str(item.get("payload", item.get("content", str(item))))
-                for item in context_items
-            )
-        else:
-            context_str = str(context_items)
-
-        # Build prompt
-        prompt = self._prompt_template.format(
-            context=context_str,
-            query=query,
-        )
-
-        # Build audit envelope
-        retrieved_ids = []
-        if isinstance(context_items, list):
-            for item in context_items:
-                cid = item.get("candidate_id", item.get("id", ""))
-                if cid:
-                    retrieved_ids.append(cid)
-
-        yield {
-            "key": value.get("key", str(ctx.get_current_key())),
-            "stream_type": "answer_request",
-            "prompt": prompt,
-            "query": query,
-            "context_str": context_str,
-            "retrieved_ids": retrieved_ids,
-            "memory_version": value.get("memory_version", value.get("version", 0)),
-            "workflow_version": self._workflow_version,
-            "config_version": self._config_version,
-            "timestamp_ms": now_ms,
-            # Carry forward upstream audit fields
-            "total_candidates": value.get(
-                "total_candidates",
-                value.get("candidate_count", 0),
-            ),
-            "retrieval_changed": value.get(
-                "retrieval_changed",
-                value.get("changed", False),
-            ),
-            "source": value.get("source", ""),
-            "error": value.get("error", ""),
-        }
-
-
-# ============================================================================
-# Async merge functions — stage-aware merge-back behavior
-# ============================================================================
-
-class _ClassifyAsyncMergeFunction(KeyedProcessFunction):
-    """Merge classify async results into normalized group assignment envelopes."""
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-        if value.get("task_type") != "classify":
-            yield value
-            return
-
-        if not value.get("success", False):
-            error = value.get("error", "classify_async_failed")
-            raise RuntimeError(f"classify async bridge failed: {error}")
-
-        result = value.get("result", {})
-        yield {
-            "key": value.get("key", str(ctx.get_current_key())),
-            "group_id": result.get("group_id", "__unclassified__"),
-            "confidence": float(result.get("confidence", 0.0)),
-            "source": "async_classify",
-            "event_seq_id": int(result.get("event_seq_id", 0)),
-            "payload": result.get("payload", ""),
-            "request_id": value.get("request_id", ""),
-            "metadata": {"async_task_type": "classify", "async_success": True},
-        }
-
-
-class _SummarizeAsyncMergeFunction(KeyedProcessFunction):
-    """Merge summarize async results into sem_agg-like envelopes."""
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-        if value.get("task_type") != "summarize":
-            yield value
-            return
-
-        now_ms = int(time.time() * 1000)
-        if not value.get("success", False):
-            error = value.get("error", "summarize_async_failed")
-            raise RuntimeError(f"summarize async bridge failed: {error}")
-
-        result = value.get("result", {})
-        summary = result.get("summary", "")
-        version = int(result.get("version", 0))
-        yield {
-            "key": value.get("key", str(ctx.get_current_key())),
-            "aggregate": {
-                "summary": summary,
-                "version": version,
-                "updated_ms": now_ms,
-                "source": "async_summary",
-            },
-            "version": version,
-            "mode": "summarize_async",
-            "event_count": int(result.get("event_count", 0)),
-            "timestamp_ms": now_ms,
-        }
-
-
-class _RetrieveAsyncMergeFunction(KeyedProcessFunction):
-    """Merge retrieve async results into normalized retrieval envelopes."""
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-        if value.get("task_type") != "retrieve":
-            yield value
-            return
-
-        now_ms = int(time.time() * 1000)
-        payload = value.get("payload", {})
-        if not value.get("success", False):
-            error = value.get("error", "retrieve_async_failed")
-            raise RuntimeError(f"retrieve async bridge failed: {error}")
-
-        result = value.get("result", {})
-        candidates = result.get("candidates", [])
-        yield {
-            "key": value.get("key", str(ctx.get_current_key())),
-            "query": result.get("query", payload.get("query", "")),
-            "query_seq_id": int(result.get("event_seq_id", payload.get("event_seq_id", 0))),
-            "candidates": candidates,
-            "candidate_count": len(candidates),
-            "truncated": bool(result.get("truncated", False)),
-            "source": "async_retrieve",
-            "timestamp_ms": now_ms,
-        }
-
-
-class _GroupbyToAggEnvelope(KeyedProcessFunction):
-    """Normalize sem_groupby outputs into SemanticEvent envelopes for sem_agg."""
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-        if {"key", "payload", "seq_id"}.issubset(value.keys()):
-            yield value
-            return
-        yield group_assignment_to_semantic_event(value)
-
-
-class _RetrievalToAnswerEnvelope(KeyedProcessFunction):
-    """Normalize retrieval/top-k outputs into answer-input envelopes."""
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-        if "retrieved_context" in value:
-            yield value
-            return
-
-        if "topk" in value or "top_items" in value:
-            out = topk_to_answer_context(value, query_payload=value.get("query", ""))
-            out["memory_version"] = value.get("version", 0)
-            out["error"] = value.get("error", "")
-            yield out
-            return
-
-        out = retrieve_to_answer_context(value)
-        out["memory_version"] = value.get("version", 0)
-        out["error"] = value.get("error", "")
-        yield out
-
-
-class _RetrievalEnvelopeExpander(KeyedProcessFunction):
-    """Expand retrieval envelopes into flat scored candidate dicts.
-
-    This adapter sits between ``cts_retrieve`` (which emits
-    ``{"candidates": [...], "query": ..., ...}``) and ``SemTopKFunction``
-    (which only accepts individual scored candidate dicts).
-
-    For inputs that are already flat candidate dicts (no ``"candidates"``
-    key), they are yielded through unchanged.
-    """
-
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
-        if not isinstance(value, dict):
-            return
-        if "candidates" in value and isinstance(value["candidates"], list):
-            items = retrieve_to_topk_items(value)
-            if items:
-                for item in items:
-                    yield item
-            else:
-                # Empty candidate pools are passed through for downstream
-                # normalization and auditing.
-                yield value
-        else:
-            # Already a flat candidate dict — pass through
-            yield value
-
-
-# ============================================================================
-# Subflow builders — individually testable composition functions
-# ============================================================================
-
-def _wire_async_bridge_if_configured(
-    operator_ds: DataStream,
-    async_fn,
-    merge_fn: KeyedProcessFunction,
-    stage_name: str,
-    config: ContinuousRAGConfig,
-) -> DataStream:
-    """Wire async bridge on an operator's output.
-
-    Missing async workers are treated as configuration errors and fail fast.
-    """
-    if async_fn is None:
-        raise ValueError(
-            f"Async bridge not configured for stage {stage_name!r}"
-        )
-
-    return build_async_bridge(
-        main_ds=operator_ds,
-        async_fn=async_fn,
-        merge_fn=merge_fn,
-        key_selector=config.key_selector,
-        timeout_ms=config.async_timeout_ms,
-        capacity=config.async_capacity,
-        output_type=Types.PICKLED_BYTE_ARRAY(),
-    )
-
-
-def _groupby_needs_classify_bridge(config: ContinuousRAGConfig) -> bool:
-    """Return whether the configured sem_groupby path can emit classify work."""
-    query_spec = config.groupby_query_spec
-    if query_spec is not None:
-        return query_spec.assignment_method in {"llm", "llm_refine"}
-    return False
-
-
-def _agg_needs_summarize_bridge(config: ContinuousRAGConfig) -> bool:
-    """Return whether the configured sem_agg path can emit summarize work."""
-    query_spec = config.agg_query_spec
-    if query_spec is not None:
-        return query_spec.agg_method in {"summarize", "compressive"}
-    return config.agg_config.mode in {"summarize", "compressive"}
-
-
-def _resolve_retrieve_async_fn(config: ContinuousRAGConfig):
-    """Resolve the retrieve async worker from config."""
-    if config.retrieve_async_fn is not None:
-        return config.retrieve_async_fn
-
-    backend = getattr(config.retrieve_config, "search_backend", None)
-    if backend is not None:
-        return SearchBackendAsyncFn(backend)
-    return None
-
-
 def build_memory_subflow(
     memory_ds: DataStream,
     config: ContinuousRAGConfig,
@@ -627,11 +270,11 @@ def build_memory_subflow(
     )
 
     # Wire async bridge for sem_groupby classify side outputs
-    if _groupby_needs_classify_bridge(config):
-        grouped = _wire_async_bridge_if_configured(
+    if _components._groupby_needs_classify_bridge(config):
+        grouped = _components._wire_async_bridge_if_configured(
             grouped_raw,
             config.classify_async_fn,
-            _ClassifyAsyncMergeFunction(),
+            _components._ClassifyAsyncMergeFunction(),
             "classify",
             config,
         )
@@ -639,7 +282,7 @@ def build_memory_subflow(
         grouped = grouped_raw
 
     grouped_for_agg = grouped.key_by(config.key_selector).process(
-        _GroupbyToAggEnvelope(),
+        _components._GroupbyToAggEnvelope(),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
@@ -654,11 +297,11 @@ def build_memory_subflow(
     )
 
     # Wire async bridge for sem_agg summarize side outputs
-    if _agg_needs_summarize_bridge(config):
-        aggregated = _wire_async_bridge_if_configured(
+    if _components._agg_needs_summarize_bridge(config):
+        aggregated = _components._wire_async_bridge_if_configured(
             aggregated_raw,
             config.summarize_async_fn,
-            _SummarizeAsyncMergeFunction(),
+            _components._SummarizeAsyncMergeFunction(),
             "summarize",
             config,
         )
@@ -674,7 +317,7 @@ def build_retrieval_subflow(
 ) -> DataStream:
     """Subflow B: query/retrieval pipeline.
 
-    ``query_requests → key_by → cts_retrieve (+ async bridge) → optional sem_topk``
+    ``query_requests → key_by → sem_search (+ async bridge) → optional sem_topk``
 
     Parameters
     ----------
@@ -692,15 +335,15 @@ def build_retrieval_subflow(
 
     # Step 1: Continuous retrieval
     retrieved_raw = keyed.process(
-        CtsRetrieveFunction(config.retrieve_config),
+        SemSearchFunction(config.retrieve_config),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
-    # Wire async bridge for cts_retrieve external store fallback
-    retrieved = _wire_async_bridge_if_configured(
+    # Wire async bridge for sem_search external store retrieval
+    retrieved = _components._wire_async_bridge_if_configured(
         retrieved_raw,
-        _resolve_retrieve_async_fn(config),
-        _RetrieveAsyncMergeFunction(),
+        _components._resolve_retrieve_async_fn(config),
+        _components._RetrieveAsyncMergeFunction(),
         "retrieve",
         config,
     )
@@ -714,7 +357,7 @@ def build_retrieval_subflow(
         # while preserving a clear rerank boundary for contextual methods.
         if topk_query_spec.ranking_method == "pointwise":
             topk_input = retrieved.key_by(config.key_selector).process(
-                _RetrievalEnvelopeExpander(),
+                _components._RetrievalEnvelopeExpander(),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             )
         else:
@@ -730,13 +373,13 @@ def build_retrieval_subflow(
             async_capacity=config.async_capacity,
         )
         normalized = reranked_or_passthrough.key_by(config.key_selector).process(
-            _RetrievalToAnswerEnvelope(),
+            _components._RetrievalToAnswerEnvelope(),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
         return normalized
 
     normalized = retrieved.key_by(config.key_selector).process(
-        _RetrievalToAnswerEnvelope(),
+        _components._RetrievalToAnswerEnvelope(),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
     return normalized
@@ -766,7 +409,7 @@ def build_answer_subflow(
     DataStream
         Answer requests with full audit envelope.
     """
-    synthesiser = _AnswerSynthesiser(
+    synthesiser = _components._AnswerSynthesiser(
         prompt_template=config.answer_prompt_template,
         workflow_version=config.workflow_version,
         config_version=config.config_version,
@@ -814,12 +457,12 @@ def build_continuous_rag_workflow(
 
     # 1. Route input stream
     routed = input_ds.key_by(config.key_selector).process(
-        _StreamRouter(),
+        _components._StreamRouter(),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
-    memory_ds = routed.get_side_output(MEMORY_EVENT_TAG)
-    query_ds = routed.get_side_output(QUERY_REQUEST_TAG)
+    memory_ds = routed.get_side_output(_components.MEMORY_EVENT_TAG)
+    query_ds = routed.get_side_output(_components.QUERY_REQUEST_TAG)
 
     # 2. Subflow A: memory build
     memory_out = build_memory_subflow(memory_ds, config)

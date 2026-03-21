@@ -59,12 +59,12 @@ from pyflink.datastream import AsyncDataStream, StreamExecutionEnvironment
 from pyflink.datastream.functions import WindowFunction
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.sem_join_retrieve import (
+from pyflink.semantic_runtime.operators.row.sem_filter import SemFilterFunction
+from pyflink.semantic_runtime.operators.row.sem_lookup_join import (
     SemLookupJoinConfig,
     SemLookupJoinFunction,
 )
-from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
 
 
 EVENT_REQUIRED_FIELDS = (
@@ -745,12 +745,12 @@ def write_artifacts(summary: Dict[str, Any], artifact_dir: str, run_id: str) -> 
             continue
         md_lines.append("")
         md_lines.append(f"### {pipeline_name}")
-        md_lines.append("| stage | in | out | schema_valid_output_rate | degraded_rate | timeout_rate | p95_latency_ms | avg_attempts | max_attempts |")
+        md_lines.append("| stage | in | out | schema_valid_output_rate | error_output_rate | timeout_rate | p95_latency_ms | avg_attempts | max_attempts |")
         md_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for st_name, st in summary["pipelines"][pipeline_name]["stage_stats"].items():
             md_lines.append(
                 f"| {st_name} | {st['input_count']} | {st['output_count']} | "
-                f"{st['schema_valid_output_rate']:.2%} | {st['degraded_rate']:.2%} | "
+                f"{st['schema_valid_output_rate']:.2%} | {st['error_output_rate']:.2%} | "
                 f"{st['timeout_rate']:.2%} | {st['p95_latency_ms']:.2f} | "
                 f"{st['avg_attempts']:.2f} | {st['max_attempts']} |"
             )

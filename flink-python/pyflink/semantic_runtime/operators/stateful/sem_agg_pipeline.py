@@ -29,12 +29,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
-from pyflink.semantic_runtime.stateful.semantic_lowering import (
+from pyflink.semantic_runtime.runtime.semantic_lowering import (
     SemanticLoweringPlan,
     resolve_agg_lowering_plan,
 )
-from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig, SemAggFunction
-from pyflink.semantic_runtime.stateful.sem_agg_window import WindowOwnedSemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg_window import WindowOwnedSemAggFunction
 
 
 @dataclass(frozen=True)

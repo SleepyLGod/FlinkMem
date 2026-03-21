@@ -63,7 +63,7 @@ class OperatorMetrics:
         input_token_counter=None,
         output_token_counter=None,
         call_meter=None,
-        # local fallback accumulators
+        # local accumulators for tests and metric snapshots
         _local: bool = False,
     ):
         self._call_counter = call_counter

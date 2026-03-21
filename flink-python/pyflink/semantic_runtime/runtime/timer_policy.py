@@ -19,7 +19,7 @@
 Reusable timer policy for V0.2 stateful semantic operators.
 
 This module provides a uniform timer registration and dispatch pattern
-used by ``sem_window``, ``sem_groupby``, ``sem_agg``, ``cts_retrieve``,
+used by ``sem_window``, ``sem_groupby``, ``sem_agg``, ``sem_search``,
 and ``sem_topk``.
 
 Timer callback safety rules

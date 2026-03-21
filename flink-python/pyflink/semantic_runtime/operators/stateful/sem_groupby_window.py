@@ -31,13 +31,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from pyflink.datastream.functions import KeyedProcessFunction
 
 from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
-from pyflink.semantic_runtime.stateful.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
-from pyflink.semantic_runtime.stateful.event_model import (
+from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
+from pyflink.semantic_runtime.runtime.event_model import (
     SemanticEvent,
     is_window_snapshot,
     window_snapshot_to_semantic_events,
 )
-from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     SemGroupbyConfig,
     _new_group_profile,
     relabel_group_profiles,
@@ -46,7 +46,7 @@ from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
     resolve_groupby_assignment_method,
     score_group_profile,
 )
-from pyflink.semantic_runtime.stateful.simple_text_encoder import HashingTextEncoder
+from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 
 
 class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
@@ -104,7 +104,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
                 new_group_threshold=self._resolved_new_group_threshold,
                 now_ms=int(time.time() * 1000),
             )
-            if self._resolved_assignment_method == "llm_refine":
+            if self._resolved_assignment_method == "llm_verify_local_refine":
                 groups = relabel_group_profiles(groups)
             if merged_into:
                 for row in assignment_rows:
@@ -163,7 +163,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             outputs: List[Any] = [
                 self._assignment_row(event, created_group_id, 0.0, "new_group")
             ]
-            if self._resolved_assignment_method in {"llm", "llm_refine"}:
+            if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
                 outputs.append(
                     (
                         ASYNC_WORK_TAG,
@@ -273,7 +273,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             "event": event_dict,
             "tentative_group": tentative_group,
         }
-        if self._resolved_assignment_method in {"llm", "llm_refine"}:
+        if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
             payload["candidate_groups"] = [
                 {
                     "group_id": group_id,

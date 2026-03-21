@@ -45,8 +45,8 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators._common import attach_metrics
-from pyflink.semantic_runtime.stateful.external_search_backend import (
+from pyflink.semantic_runtime.operators.row._common import attach_metrics
+from pyflink.semantic_runtime.runtime.external_search_backend import (
     ExternalSearchBackend,
     SearchResult,
 )

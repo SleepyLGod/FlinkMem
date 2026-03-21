@@ -30,8 +30,8 @@ if not _sem_runtime_dst.exists():
 from pyflink.datastream.functions import AsyncFunction
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_client
-from pyflink.semantic_runtime.stateful.async_bridge import AsyncResult, AsyncWorkItem
-from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
+from pyflink.semantic_runtime.runtime.async_bridge import AsyncResult, AsyncWorkItem
+from pyflink.semantic_runtime.runtime.continuous_rag_components import (
     _AnswerSynthesiser,
     _ClassifyAsyncMergeFunction,
     _GroupbyToAggEnvelope,
@@ -40,12 +40,12 @@ from pyflink.semantic_runtime.stateful.continuous_rag_workflow import (
     _RetrieveAsyncMergeFunction,
     _SummarizeAsyncMergeFunction,
 )
-from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig, CtsRetrieveFunction
-from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig, SemAggFunction
-from pyflink.semantic_runtime.stateful.sem_agg_pipeline import build_sem_agg_operator
-from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig, SemGroupbyFunction
-from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig, SemTopKFunction
-from pyflink.semantic_runtime.stateful.external_search_backend import (
+from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig, SemSearchFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import build_sem_agg_operator
+from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig, SemGroupbyFunction
+from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.runtime.external_search_backend import (
     MockSearchBackend,
     SearchBackendAsyncFn,
 )
@@ -56,10 +56,10 @@ from pyflink.semantic_runtime.semantic_spec import (
     TopKQuerySpec,
     TriggerPolicy,
 )
-from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (
     _BoundedPoolExternalScoreRerankerWorker,
 )
-from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig, SemWindowFunction
+from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig, SemWindowFunction
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +602,7 @@ def _build_configs():
         confidence_threshold=0.95,
         new_group_creation_threshold=0.1,
     )
-    retrieve_cfg = CtsRetrieveConfig(max_candidates_per_request=4, max_cache_entries_per_key=32)
+    retrieve_cfg = SemSearchConfig(max_candidates_per_request=4, max_cache_entries_per_key=32)
     topk_cfg = SemTopKConfig(max_candidates=16, recompute_interval_ms=0, emission_policy="snapshot")
     topk_qs = TopKQuerySpec(k=2)
     return window_cfg, groupby_cfg, retrieve_cfg, topk_cfg, topk_qs
@@ -649,7 +649,7 @@ def _merge_with_async(
     side_work_rows: List[Dict[str, Any]],
     merge_fn,
     async_fn: Optional[AsyncFunction],
-    fallback_stage: str,
+    async_stage: str,
     key: str,
 ) -> List[Dict[str, Any]]:
     ctx = _FakeContext(key)
@@ -662,7 +662,7 @@ def _merge_with_async(
 
     if not side_work_rows:
         return merged
-    raise ValueError(f"Async bridge not configured for stage {fallback_stage!r}")
+    raise ValueError(f"Async bridge not configured for stage {async_stage!r}")
 
 
 def _run_memory_path(
@@ -765,7 +765,7 @@ def _run_retrieval_path(
     _, _, retrieve_cfg, topk_cfg, topk_qs = _build_configs()
     topk_qs = topk_query_spec or topk_qs
 
-    retrieve = CtsRetrieveFunction(retrieve_cfg)
+    retrieve = SemSearchFunction(retrieve_cfg)
     retrieve._cache = _FakeMapState()
     retrieve._meta = _FakeValueState(None)
 
@@ -1191,13 +1191,13 @@ def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
         raise AssertionError("Expected missing summarize async worker to fail fast")
 
 
-def test_v02_workflow_groupby_llm_refine_window_owned_scope_close():
+def test_v02_workflow_groupby_llm_verify_local_refine_window_owned_scope_close():
     events = _build_use_case_events()
     classify_fn = _DeterministicClassifyAsyncFn()
     groupby_qs = GroupbyQuerySpec.simple(
         "Group memory events by topic",
         backend="llm",
-        assignment_method="llm_refine",
+        assignment_method="llm_verify_local_refine",
     )
     groupby_qs.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
 

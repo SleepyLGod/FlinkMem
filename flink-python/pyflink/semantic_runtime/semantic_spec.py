@@ -239,7 +239,12 @@ class TopKScopePolicy:
 # ---------------------------------------------------------------------------
 
 VALID_RANKING_METHODS = {"pointwise", "pairwise", "listwise"}
-VALID_ASSIGNMENT_METHODS = {"rule", "embedding", "llm", "llm_refine"}
+VALID_ASSIGNMENT_METHODS = {
+    "rule",
+    "embedding",
+    "llm",
+    "llm_verify_local_refine",
+}
 VALID_AGG_METHODS = {"algebraic", "summarize", "compressive"}
 VALID_JOIN_PAIRING_METHODS = {
     "candidate_pruned",

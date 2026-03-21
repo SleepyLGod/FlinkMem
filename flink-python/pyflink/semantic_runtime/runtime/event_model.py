@@ -263,7 +263,7 @@ def group_assignment_to_semantic_event(
 def retrieve_to_topk_items(
     retrieve_output: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Expand a ``cts_retrieve`` output into individual candidate dicts
+    """Expand a ``sem_search`` output into individual candidate dicts
     suitable for ``sem_topk``'s ``process_element``.
 
     Each candidate dict gets a ``candidate_id`` field (required by
@@ -296,7 +296,7 @@ def retrieve_to_topk_items(
 def retrieve_to_answer_context(
     retrieve_output: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Normalize cts_retrieve output for answer synthesis path."""
+    """Normalize sem_search output for answer synthesis path."""
     items = retrieve_output.get("candidates", [])
     return {
         "key": retrieve_output.get("key", ""),

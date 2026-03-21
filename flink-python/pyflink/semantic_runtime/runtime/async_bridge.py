@@ -19,7 +19,7 @@
 Reusable async bridge: side-output → AsyncDataStream → keyed merge.
 
 This module provides the topology wiring pattern used by ``sem_groupby``,
-``sem_agg``, and ``cts_retrieve`` whenever a ``KeyedProcessFunction`` needs
+``sem_agg``, and ``sem_search`` whenever a ``KeyedProcessFunction`` needs
 to offload work to an async LLM call and merge the result back into keyed
 state.
 
@@ -43,7 +43,7 @@ Usage
 -----
 ::
 
-    from pyflink.semantic_runtime.stateful.async_bridge import (
+    from pyflink.semantic_runtime.runtime.async_bridge import (
         ASYNC_WORK_TAG,
         AsyncWorkItem,
         build_async_bridge,

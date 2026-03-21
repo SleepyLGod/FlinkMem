@@ -46,13 +46,13 @@ from pyflink.semantic_runtime.semantic_spec import (
     TopKQuerySpec,
 )
 if TYPE_CHECKING:
-    from pyflink.semantic_runtime.stateful.semantic_lowering import SemanticLoweringPlan
-    from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig
-    from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig
-    from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig
-    from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig
-    from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig
-    from pyflink.semantic_runtime.stateful.state_descriptors import OverflowPolicy
+    from pyflink.semantic_runtime.runtime.semantic_lowering import SemanticLoweringPlan
+    from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
+    from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig
+    from pyflink.semantic_runtime.runtime.state_descriptors import OverflowPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ class JoinRuntimeBundle:
 
 
 def _coerce_overflow_policy(value: Any) -> OverflowPolicy:
-    from pyflink.semantic_runtime.stateful.state_descriptors import OverflowPolicy
+    from pyflink.semantic_runtime.runtime.state_descriptors import OverflowPolicy
 
     if isinstance(value, OverflowPolicy):
         return value
@@ -343,8 +343,6 @@ def _normalize_join_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
 def _sem_search_operator_name(operators: Dict[str, Dict[str, Any]]) -> str:
     if "sem_search" in operators:
         return "sem_search"
-    if "cts_retrieve" in operators:
-        return "cts_retrieve"
     return "sem_search"
 
 
@@ -489,7 +487,7 @@ class RuntimeConfig:
     # -- typed kernel configs ------------------------------------------------
 
     def get_topk_kernel_config(self) -> SemTopKConfig:
-        from pyflink.semantic_runtime.stateful.sem_topk_continuous import SemTopKConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_topk",
@@ -504,7 +502,7 @@ class RuntimeConfig:
         return SemTopKConfig(**kwargs)
 
     def get_groupby_kernel_config(self) -> SemGroupbyConfig:
-        from pyflink.semantic_runtime.stateful.sem_groupby_stateful import SemGroupbyConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_groupby",
@@ -519,7 +517,7 @@ class RuntimeConfig:
         return SemGroupbyConfig(**kwargs)
 
     def get_agg_kernel_config(self) -> SemAggConfig:
-        from pyflink.semantic_runtime.stateful.sem_agg_stateful import SemAggConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_agg",
@@ -533,8 +531,8 @@ class RuntimeConfig:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return SemAggConfig(**kwargs)
 
-    def get_search_config(self) -> "CtsRetrieveConfig":
-        from pyflink.semantic_runtime.stateful.cts_retrieve import CtsRetrieveConfig
+    def get_search_config(self) -> "SemSearchConfig":
+        from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig
 
         operator_name = _sem_search_operator_name(self.operators)
         _query_raw, kernel_raw = self._get_operator_sections(
@@ -542,7 +540,7 @@ class RuntimeConfig:
             allow_query_spec=False,
         )
         kwargs: Dict[str, Any] = {}
-        for field_name in CtsRetrieveConfig.__dataclass_fields__:
+        for field_name in SemSearchConfig.__dataclass_fields__:
             if field_name in kernel_raw:
                 kwargs[field_name] = kernel_raw[field_name]
         if "ttl_seconds" not in kwargs:
@@ -551,10 +549,10 @@ class RuntimeConfig:
             kwargs["overflow_policy"] = self.defaults.overflow_policy
         if "overflow_policy" in kwargs:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
-        return CtsRetrieveConfig(**kwargs)
+        return SemSearchConfig(**kwargs)
 
     def get_window_config(self) -> "SemWindowConfig":
-        from pyflink.semantic_runtime.stateful.semantic_window import SemWindowConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_window",
@@ -575,7 +573,7 @@ class RuntimeConfig:
     # -- resolved bundles ----------------------------------------------------
 
     def resolve_topk_runtime_bundle(self) -> TopKRuntimeBundle:
-        from pyflink.semantic_runtime.stateful.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.semantic_lowering import (
             resolve_topk_lowering_plan,
         )
 
@@ -587,7 +585,7 @@ class RuntimeConfig:
         )
 
     def resolve_groupby_runtime_bundle(self, *, input_kind: str = "event_stream") -> GroupbyRuntimeBundle:
-        from pyflink.semantic_runtime.stateful.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.semantic_lowering import (
             resolve_groupby_lowering_plan,
         )
 
@@ -599,7 +597,7 @@ class RuntimeConfig:
         )
 
     def resolve_agg_runtime_bundle(self, *, input_kind: str = "event_stream") -> AggRuntimeBundle:
-        from pyflink.semantic_runtime.stateful.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.semantic_lowering import (
             resolve_agg_lowering_plan,
         )
 
@@ -611,7 +609,7 @@ class RuntimeConfig:
         )
 
     def resolve_join_runtime_bundle(self) -> JoinRuntimeBundle:
-        from pyflink.semantic_runtime.stateful.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.semantic_lowering import (
             resolve_join_lowering_plan,
         )
 

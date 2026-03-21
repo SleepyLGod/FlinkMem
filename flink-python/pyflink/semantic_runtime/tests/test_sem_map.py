@@ -39,7 +39,7 @@ from pyflink.common import Time, Types
 from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
 
 
 def run_normal():

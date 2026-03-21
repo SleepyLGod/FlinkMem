@@ -30,15 +30,15 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
-from pyflink.semantic_runtime.stateful.semantic_lowering import (
+from pyflink.semantic_runtime.runtime.semantic_lowering import (
     SemanticLoweringPlan,
     resolve_groupby_lowering_plan,
 )
-from pyflink.semantic_runtime.stateful.sem_groupby_stateful import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     SemGroupbyConfig,
     SemGroupbyFunction,
 )
-from pyflink.semantic_runtime.stateful.sem_groupby_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_window import (
     WindowOwnedSemGroupbyFunction,
 )
 

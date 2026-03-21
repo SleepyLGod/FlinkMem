@@ -21,13 +21,9 @@ from typing import Any, Dict, List
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
-from pyflink.semantic_runtime.stateful.event_model import retrieve_to_topk_items
-from pyflink.semantic_runtime.stateful.sem_topk_continuous import (
-    SemTopKConfig,
-    SemTopKFunction,
-    SemTopKScopeSnapshotFunction,
-)
-from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
+from pyflink.semantic_runtime.runtime.event_model import retrieve_to_topk_items
+from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (
     _BoundedPoolExternalTopKSnapshotWorker,
     _BoundedPoolLLMTopKSnapshotWorker,
     _BoundedPoolEmbeddingTopKSnapshotWorker,
@@ -41,6 +37,7 @@ from pyflink.semantic_runtime.stateful.sem_topk_pipeline import (
     topk_candidate_has_score,
     topk_candidate_needs_scoring,
 )
+from pyflink.semantic_runtime.operators.stateful.sem_topk_scope_runtime import SemTopKScopeSnapshotFunction
 
 
 class _FakeMapState:
