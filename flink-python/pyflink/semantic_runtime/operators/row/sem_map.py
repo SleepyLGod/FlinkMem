@@ -35,22 +35,29 @@ Design notes
 * ``LLMClient`` is created in ``open()`` to survive cloudpickle serialisation.
 * Invalid model output and timeout conditions fail fast. The operator does not
   synthesize strict output records.
+* Public callers should use ``build_sem_map_operator(...)`` so semantic intent
+  stays separate from internal backend configuration.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
-from pyflink.semantic_runtime.llm_client import LLMCallMetrics, LLMClient, LLMClientConfig, create_llm_client
+from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators.row._common import (
-    attach_metrics, validate_schema,
+    attach_metrics,
+    validate_generic_semantic_spec,
+    validate_schema,
 )
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+
+if TYPE_CHECKING:
+    from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -163,3 +170,32 @@ class SemMapFunction(AsyncFunction):
         if self._op_metrics:
             self._op_metrics.record_timeout()
         raise TimeoutError(f"sem_map timed out for input: {value!r}")
+
+
+def build_sem_map_operator(
+    semantic: SemanticSpec,
+    runtime_config: "RuntimeConfig",
+) -> SemMapFunction:
+    """Build a public row-style semantic map operator."""
+    validate_generic_semantic_spec(
+        semantic,
+        operator_name="sem_map",
+        allowed_output_modes={"json", "text"},
+    )
+    from pyflink.semantic_runtime.public_api import sem_map
+    from pyflink.semantic_runtime.runtime.operator_plans import lower_sem_map_request
+
+    plan = lower_sem_map_request(
+        sem_map(
+            intent=semantic.instruction,
+            output_schema=semantic.schema,
+            output_mode=semantic.output_mode,
+        ),
+        runtime_config,
+    )
+    return SemMapFunction(
+        prompt_template=plan.intent,
+        output_schema=plan.output_schema,
+        llm_config=plan.llm_config,
+        return_mode=plan.output_mode,
+    )

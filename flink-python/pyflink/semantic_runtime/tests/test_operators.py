@@ -21,13 +21,32 @@ if not _sem_runtime_dst.exists():
 from pyflink.common import Time, Types
 from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream
 
-from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
-from pyflink.semantic_runtime.operators.row.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.row.sem_local_topk import SemLocalTopKFunction
+from pyflink.semantic_runtime.operators import (
+    build_sem_filter_operator,
+    build_sem_local_topk_operator,
+    build_sem_map_operator,
+)
 from pyflink.semantic_runtime.operators.row.sem_lookup_join import (
     SemLookupJoinFunction, SemLookupJoinConfig,
 )
+from pyflink.semantic_runtime.runtime_config import RuntimeConfig
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+
+
+def _mock_runtime_config(operator_name: str, *, response: str, delay_s: float = 0.05) -> RuntimeConfig:
+    return RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                operator_name: {
+                    "kernel": {
+                        "mock_delay_s": delay_s,
+                        "mock_response": response,
+                    }
+                }
+            },
+        }
+    )
 
 
 def run_sem_map():
@@ -36,12 +55,17 @@ def run_sem_map():
     env.set_parallelism(1)
     ds = env.from_collection(["hello", "world"], type_info=Types.STRING())
 
-    config = LLMClientConfig(
-        backend="mock", mock_delay_s=0.05,
-        mock_response=json.dumps({"sentiment": "positive", "confidence": 0.9}),
+    runtime_config = _mock_runtime_config(
+        "sem_map",
+        response=json.dumps({"sentiment": "positive", "confidence": 0.9}),
     )
-    fn = SemMapFunction("Classify: {input}",
-                        {"sentiment": str, "confidence": float}, config)
+    fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
+    )
     result = AsyncDataStream.unordered_wait(ds, fn, Time.seconds(10), 2, Types.STRING())
     result.print()
     env.execute("smoke_sem_map")
@@ -57,8 +81,11 @@ def run_sem_filter():
     )
 
     mock_resp = json.dumps({"decision": True, "confidence": 0.85, "reason": "positive"})
-    config = LLMClientConfig(backend="mock", mock_delay_s=0.05, mock_response=mock_resp)
-    fn = SemFilterFunction("Is this positive? {input}", config)
+    runtime_config = _mock_runtime_config("sem_filter", response=mock_resp)
+    fn = build_sem_filter_operator(
+        SemanticSpec.for_sem_filter("Is this positive? {input}"),
+        runtime_config,
+    )
     result = AsyncDataStream.unordered_wait(ds, fn, Time.seconds(10), 2, Types.STRING())
     result.print()
     env.execute("smoke_sem_filter")
@@ -76,8 +103,12 @@ def run_sem_local_topk():
     ds = env.from_collection(records, type_info=Types.STRING())
 
     mock_resp = json.dumps(["C", "A", "D", "B"])
-    config = LLMClientConfig(backend="mock", mock_delay_s=0.05, mock_response=mock_resp)
-    fn = SemLocalTopKFunction("Rank these for '{input}': {candidates}", k=2, llm_config=config)
+    runtime_config = _mock_runtime_config("sem_local_topk", response=mock_resp)
+    fn = build_sem_local_topk_operator(
+        SemanticSpec.for_sem_topk("Rank these for '{input}': {candidates}"),
+        k=2,
+        runtime_config=runtime_config,
+    )
     result = AsyncDataStream.unordered_wait(ds, fn, Time.seconds(10), 2, Types.STRING())
     result.print()
     env.execute("smoke_sem_topk")
@@ -90,6 +121,8 @@ def run_sem_lookup_join():
     ds = env.from_collection(["query_a", "query_b"], type_info=Types.STRING())
 
     mock_join_result = json.dumps({"matched": "candidate_1", "score": 0.92})
+    from pyflink.semantic_runtime.llm_client import LLMClientConfig
+
     llm_config = LLMClientConfig(
         backend="mock", mock_delay_s=0.05, mock_response=mock_join_result)
     join_config = SemLookupJoinConfig(

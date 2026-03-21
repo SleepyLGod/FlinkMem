@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Shared helpers for CP semantic operators."""
+"""Shared helpers for row-style semantic operators."""
 
 from __future__ import annotations
 
 from typing import Any, Dict
+
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
 
 
 def validate_schema(obj: Any, schema: Dict[str, type]) -> bool:
@@ -42,3 +44,26 @@ def attach_metrics(parsed: dict, metrics) -> dict:
         "attempts": metrics.attempts,
     }
     return parsed
+
+
+def validate_generic_semantic_spec(
+    spec: SemanticSpec,
+    *,
+    operator_name: str,
+    allowed_output_modes: set[str],
+) -> None:
+    """Validate a public generic semantic spec.
+
+    Generic semantic operators expose semantic intent only. Backend selection
+    remains internal and must not be set on the public spec.
+    """
+    if spec.backend != "hybrid":
+        raise ValueError(
+            f"{operator_name} does not expose backend selection. "
+            "Use internal runtime/kernel config for backend planning."
+        )
+    if spec.output_mode not in allowed_output_modes:
+        raise ValueError(
+            f"{operator_name} requires output_mode in {sorted(allowed_output_modes)!r}; "
+            f"got {spec.output_mode!r}."
+        )

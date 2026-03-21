@@ -38,8 +38,25 @@ if not _sem_runtime_dst.exists():
 from pyflink.common import Time, Types
 from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream
 
-from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators import build_sem_map_operator
+from pyflink.semantic_runtime.runtime_config import RuntimeConfig
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+
+
+def _mock_runtime_config(*, response: str, delay_s: float) -> RuntimeConfig:
+    return RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_map": {
+                    "kernel": {
+                        "mock_delay_s": delay_s,
+                        "mock_response": response,
+                    }
+                }
+            },
+        }
+    )
 
 
 def run_normal():
@@ -53,16 +70,13 @@ def run_normal():
     )
 
     mock_response = json.dumps({"sentiment": "positive", "confidence": 0.95})
-    config = LLMClientConfig(
-        backend="mock",
-        mock_delay_s=0.05,
-        mock_response=mock_response,
-    )
-
-    sem_map_fn = SemMapFunction(
-        prompt_template="Classify sentiment: {input}",
-        output_schema={"sentiment": str, "confidence": float},
-        llm_config=config,
+    runtime_config = _mock_runtime_config(response=mock_response, delay_s=0.05)
+    sem_map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify sentiment: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
     )
 
     result = AsyncDataStream.unordered_wait(
@@ -82,16 +96,16 @@ def run_timeout():
         type_info=Types.STRING(),
     )
 
-    config = LLMClientConfig(
-        backend="mock",
-        mock_delay_s=30.0,  # will exceed Flink timeout
-        mock_response=json.dumps({"sentiment": "x", "confidence": 0.0}),
+    runtime_config = _mock_runtime_config(
+        response=json.dumps({"sentiment": "x", "confidence": 0.0}),
+        delay_s=30.0,
     )
-
-    sem_map_fn = SemMapFunction(
-        prompt_template="Classify: {input}",
-        output_schema={"sentiment": str, "confidence": float},
-        llm_config=config,
+    sem_map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
     )
 
     result = AsyncDataStream.unordered_wait(

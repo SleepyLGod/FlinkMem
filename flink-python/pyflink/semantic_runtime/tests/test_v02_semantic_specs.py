@@ -200,14 +200,22 @@ class TestSemanticSpec:
             "Extract sentiment", output_schema={"sentiment": str}
         )
         assert spec.instruction == "Extract sentiment"
-        assert spec.backend == "llm"
+        assert spec.backend == "hybrid"
         assert spec.output_mode == "json"
         assert spec.schema == {"sentiment": str}
 
     def test_for_sem_map_text_mode(self):
         spec = SemanticSpec.for_sem_map("Summarize", return_mode="text")
+        assert spec.backend == "hybrid"
         assert spec.output_mode == "text"
         assert spec.schema is None
+
+    def test_for_sem_filter(self):
+        spec = SemanticSpec.for_sem_filter("Keep weather-related events", threshold=0.8)
+        assert spec.instruction == "Keep weather-related events"
+        assert spec.backend == "hybrid"
+        assert spec.output_mode == "bool"
+        assert spec.threshold == 0.8
 
     def test_for_sem_topk(self):
         spec = SemanticSpec.for_sem_topk(

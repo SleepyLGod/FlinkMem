@@ -1,4 +1,4 @@
-"""Public stateful semantic operators."""
+"""Low-level stateful semantic operator implementations."""
 
 from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig, SemWindowFunction
 from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction

@@ -1,11 +1,16 @@
-"""Public semantic operators."""
+"""Low-level semantic operator implementations.
+
+This package exposes runtime kernels and low-level builders. It is kept
+available for internal assembly and expert usage, but it is not the primary
+user-facing API.
+"""
 
 from pyflink.semantic_runtime.operators.row import (
-    SemFilterFunction,
-    SemLocalTopKFunction,
     SemLookupJoinConfig,
     SemLookupJoinFunction,
-    SemMapFunction,
+    build_sem_filter_operator,
+    build_sem_local_topk_operator,
+    build_sem_map_operator,
 )
 from pyflink.semantic_runtime.operators.stateful import (
     SemAggConfig,
@@ -22,11 +27,11 @@ from pyflink.semantic_runtime.operators.stateful import (
 )
 
 __all__ = [
-    "SemFilterFunction",
-    "SemLocalTopKFunction",
+    "build_sem_filter_operator",
+    "build_sem_local_topk_operator",
     "SemLookupJoinConfig",
     "SemLookupJoinFunction",
-    "SemMapFunction",
+    "build_sem_map_operator",
     "SemAggConfig",
     "SemAggFunction",
     "SemGroupbyConfig",

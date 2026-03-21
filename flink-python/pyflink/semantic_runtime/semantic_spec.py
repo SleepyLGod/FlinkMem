@@ -28,6 +28,7 @@ and versioning.
 
 Currently serves:
   - ``sem_map``: instruction + output_mode + schema
+  - ``sem_filter``: instruction + output_mode(bool)
   - ``sem_topk``: instruction + output_mode(score) + threshold + scope
 
 V0.2+ extends this pattern to ``sem_groupby``, ``sem_agg``, and future ``sem_join``.
@@ -108,15 +109,29 @@ class SemanticSpec:
         *,
         output_schema: Optional[Dict[str, Any]] = None,
         return_mode: str = "json",
-        backend: str = "llm",
     ) -> "SemanticSpec":
         """Build a SemanticSpec suited for ``sem_map``."""
         output_mode = return_mode  # "json" or "text"
         return cls(
             instruction=instruction,
-            backend=backend,
+            backend="hybrid",
             output_mode=output_mode,
             schema=output_schema,
+        )
+
+    @classmethod
+    def for_sem_filter(
+        cls,
+        instruction: str,
+        *,
+        threshold: Optional[float] = None,
+    ) -> "SemanticSpec":
+        """Build a SemanticSpec suited for ``sem_filter``."""
+        return cls(
+            instruction=instruction,
+            backend="hybrid",
+            output_mode="bool",
+            threshold=threshold,
         )
 
     @classmethod

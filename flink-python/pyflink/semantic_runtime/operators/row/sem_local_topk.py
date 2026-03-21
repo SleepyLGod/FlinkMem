@@ -24,19 +24,26 @@ list.  The LLM reranks these candidates and returns the top-k.
 This is the **local** V0.1 variant (no keyed state).  The continuous,
 stateful ``sem_topk`` lives in ``operators/stateful/sem_topk.py``.
 
+Public callers should use ``build_sem_local_topk_operator(...)`` so ranking
+intent stays separate from internal backend configuration.
+
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators.row._common import attach_metrics
+from pyflink.semantic_runtime.operators.row._common import attach_metrics, validate_generic_semantic_spec
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+
+if TYPE_CHECKING:
+    from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -149,3 +156,34 @@ class SemLocalTopKFunction(AsyncFunction):
         if self._op_metrics:
             self._op_metrics.record_timeout()
         raise TimeoutError(f"sem_local_topk timed out for input: {value!r}")
+
+
+def build_sem_local_topk_operator(
+    semantic: SemanticSpec,
+    *,
+    k: int,
+    runtime_config: "RuntimeConfig",
+    candidates_field: str = "candidates",
+) -> SemLocalTopKFunction:
+    """Build a public row-style semantic local top-k operator."""
+    validate_generic_semantic_spec(
+        semantic,
+        operator_name="sem_local_topk",
+        allowed_output_modes={"score"},
+    )
+    if k <= 0:
+        raise ValueError("sem_local_topk requires k > 0")
+    from pyflink.semantic_runtime.public_api import sem_local_topk
+    from pyflink.semantic_runtime.runtime.operator_plans import lower_sem_local_topk_request
+
+    plan = lower_sem_local_topk_request(
+        sem_local_topk(intent=semantic.instruction, k=k),
+        runtime_config,
+        candidates_field=candidates_field,
+    )
+    return SemLocalTopKFunction(
+        prompt_template=plan.intent,
+        k=plan.k,
+        llm_config=plan.llm_config,
+        candidates_field=plan.candidates_field,
+    )

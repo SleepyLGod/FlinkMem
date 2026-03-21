@@ -386,6 +386,45 @@ def _sem_search_operator_name(operators: Dict[str, Dict[str, Any]]) -> str:
     return "sem_search"
 
 
+def _build_llm_client_config(
+    base: LLMBackendConfig,
+    overrides: Dict[str, Any],
+) -> LLMClientConfig:
+    """Build an operator-scoped LLM client config.
+
+    Operator kernel values override runtime-global defaults. This keeps
+    backend planning internal while allowing per-operator execution tuning.
+    """
+    extra = dict(base.extra)
+    api_base = overrides.get("api_base", overrides.get("endpoint", base.endpoint or None))
+    api_key_env = str(overrides.get("api_key_env", extra.get("api_key_env", "OPENAI_API_KEY")))
+    timeout_s = float(overrides.get("timeout_s", extra.get("timeout_s", 30.0)))
+    max_retries = int(overrides.get("max_retries", extra.get("max_retries", 3)))
+    retry_base_delay_s = float(
+        overrides.get("retry_base_delay_s", extra.get("retry_base_delay_s", 0.5))
+    )
+    mock_delay_s = float(overrides.get("mock_delay_s", extra.get("mock_delay_s", 0.1)))
+    mock_response = overrides.get("mock_response", extra.get("mock_response"))
+    mock_fail_first_n = int(overrides.get("mock_fail_first_n", extra.get("mock_fail_first_n", 0)))
+    mock_bad_json_first_n = int(
+        overrides.get("mock_bad_json_first_n", extra.get("mock_bad_json_first_n", 0))
+    )
+
+    return LLMClientConfig(
+        backend=str(overrides.get("backend", base.backend or "mock")),
+        model=str(overrides.get("model", base.model or "gpt-4o-mini")),
+        api_base=api_base,
+        api_key_env=api_key_env,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        retry_base_delay_s=retry_base_delay_s,
+        mock_delay_s=mock_delay_s,
+        mock_response=mock_response,
+        mock_fail_first_n=mock_fail_first_n,
+        mock_bad_json_first_n=mock_bad_json_first_n,
+    )
+
+
 # ---------------------------------------------------------------------------
 # RuntimeConfig — top-level shell
 # ---------------------------------------------------------------------------
@@ -450,20 +489,44 @@ class RuntimeConfig:
           client config because the current client contract uses `api_key_env`
         """
 
-        extra = dict(self.llm.extra)
-        return LLMClientConfig(
-            backend=self.llm.backend or "mock",
-            model=self.llm.model or "gpt-4o-mini",
-            api_base=self.llm.endpoint or None,
-            api_key_env=str(extra.get("api_key_env", "OPENAI_API_KEY")),
-            timeout_s=float(extra.get("timeout_s", 30.0)),
-            max_retries=int(extra.get("max_retries", 3)),
-            retry_base_delay_s=float(extra.get("retry_base_delay_s", 0.5)),
-            mock_delay_s=float(extra.get("mock_delay_s", 0.1)),
-            mock_response=extra.get("mock_response"),
-            mock_fail_first_n=int(extra.get("mock_fail_first_n", 0)),
-            mock_bad_json_first_n=int(extra.get("mock_bad_json_first_n", 0)),
+        return _build_llm_client_config(self.llm, {})
+
+    def get_row_llm_client_config(self, operator_name: str) -> LLMClientConfig:
+        """Return the operator-scoped LLM client config for a row-style operator."""
+        _query_raw, kernel_raw = self._get_operator_sections(
+            operator_name,
+            allow_query_spec=False,
         )
+        return _build_llm_client_config(self.llm, kernel_raw)
+
+    def get_lookup_join_config(self, *, candidate_source: Any):
+        """Return the operator-scoped lookup join config."""
+        from pyflink.semantic_runtime.operators.row.sem_lookup_join import (
+            SemLookupJoinConfig,
+        )
+        from pyflink.semantic_runtime.runtime.external_search_backend import (
+            ExternalSearchBackend,
+        )
+
+        _query_raw, kernel_raw = self._get_operator_sections(
+            "sem_lookup_join",
+            allow_query_spec=False,
+        )
+        kwargs: Dict[str, Any] = {}
+        for field_name in SemLookupJoinConfig.__dataclass_fields__:
+            if field_name in kernel_raw:
+                kwargs[field_name] = kernel_raw[field_name]
+
+        if isinstance(candidate_source, ExternalSearchBackend):
+            kwargs["search_backend"] = candidate_source
+        elif isinstance(candidate_source, list):
+            kwargs["mock_candidates"] = candidate_source
+        else:
+            raise TypeError(
+                "sem_lookup_join candidate_source must be an ExternalSearchBackend "
+                "or a bounded candidate list."
+            )
+        return SemLookupJoinConfig(**kwargs)
 
     def to_embedding_backend_config(self) -> EmbeddingBackendConfig:
         return EmbeddingBackendConfig(

@@ -24,19 +24,26 @@ downstream via ``DataStream.filter(lambda x: json.loads(x)["decision"])``.
 
 This keeps the async operator output count deterministic and filtered-out
 records remain available for quality auditing.
+
+Public callers should use ``build_sem_filter_operator(...)`` so semantic
+intent stays separate from internal backend configuration.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators.row._common import attach_metrics
+from pyflink.semantic_runtime.operators.row._common import attach_metrics, validate_generic_semantic_spec
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+
+if TYPE_CHECKING:
+    from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -128,3 +135,26 @@ class SemFilterFunction(AsyncFunction):
         if self._op_metrics:
             self._op_metrics.record_timeout()
         raise TimeoutError(f"sem_filter timed out for input: {value!r}")
+
+
+def build_sem_filter_operator(
+    semantic: SemanticSpec,
+    runtime_config: "RuntimeConfig",
+) -> SemFilterFunction:
+    """Build a public row-style semantic filter operator."""
+    validate_generic_semantic_spec(
+        semantic,
+        operator_name="sem_filter",
+        allowed_output_modes={"bool"},
+    )
+    from pyflink.semantic_runtime.public_api import sem_filter
+    from pyflink.semantic_runtime.runtime.operator_plans import lower_sem_filter_request
+
+    plan = lower_sem_filter_request(
+        sem_filter(intent=semantic.instruction),
+        runtime_config,
+    )
+    return SemFilterFunction(
+        prompt_template=plan.intent,
+        llm_config=plan.llm_config,
+    )

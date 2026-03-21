@@ -46,9 +46,12 @@ import pytest
 from pyflink.common import Time, Types
 from pyflink.datastream import AsyncDataStream, StreamExecutionEnvironment
 
-from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.row.sem_filter import SemFilterFunction
-from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
+from pyflink.semantic_runtime.operators import (
+    build_sem_filter_operator,
+    build_sem_map_operator,
+)
+from pyflink.semantic_runtime.runtime_config import RuntimeConfig
+from pyflink.semantic_runtime.semantic_spec import SemanticSpec
 
 _SEM_RUNTIME_SRC = pathlib.Path(__file__).resolve().parents[1]
 _SEM_RUNTIME_DST = pathlib.Path(_pf.__file__).parent / "semantic_runtime"
@@ -116,6 +119,34 @@ def assert_job_fails(env: StreamExecutionEnvironment, result_stream, job_name: s
     raise AssertionError(f"Expected job {job_name!r} to fail")
 
 
+def _runtime_config_with_mock_rows(
+    *,
+    map_response: str,
+    map_delay_s: float,
+    filter_response: str,
+    filter_delay_s: float,
+) -> RuntimeConfig:
+    return RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_map": {
+                    "kernel": {
+                        "mock_delay_s": map_delay_s,
+                        "mock_response": map_response,
+                    }
+                },
+                "sem_filter": {
+                    "kernel": {
+                        "mock_delay_s": filter_delay_s,
+                        "mock_response": filter_response,
+                    }
+                },
+            },
+        }
+    )
+
+
 def test_normal_pipeline() -> None:
     """Normal path should succeed with schema-valid outputs."""
     env = StreamExecutionEnvironment.get_execution_environment()
@@ -125,23 +156,28 @@ def test_normal_pipeline() -> None:
     ds = env.from_collection(inputs, type_info=Types.STRING())
 
     map_resp = json.dumps({"sentiment": "positive", "confidence": 0.95})
-    map_cfg = LLMClientConfig(backend="mock", mock_delay_s=0.05, mock_response=map_resp)
-    map_fn = SemMapFunction(
-        "Classify: {input}",
-        {"sentiment": str, "confidence": float},
-        map_cfg,
-    )
-    mapped = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(10), 5, Types.STRING())
-
     filter_resp = json.dumps(
         {"decision": True, "confidence": 0.9, "reason": "positive sentiment"}
     )
-    filter_cfg = LLMClientConfig(
-        backend="mock",
-        mock_delay_s=0.05,
-        mock_response=filter_resp,
+    runtime_config = _runtime_config_with_mock_rows(
+        map_response=map_resp,
+        map_delay_s=0.05,
+        filter_response=filter_resp,
+        filter_delay_s=0.05,
     )
-    filter_fn = SemFilterFunction("Keep positive? {input}", filter_cfg)
+    map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
+    )
+    mapped = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(10), 5, Types.STRING())
+
+    filter_fn = build_sem_filter_operator(
+        SemanticSpec.for_sem_filter("Keep positive? {input}"),
+        runtime_config,
+    )
     filtered = AsyncDataStream.unordered_wait(
         mapped,
         filter_fn,
@@ -169,12 +205,18 @@ def test_timeout_pipeline_fails() -> None:
     inputs = ["item1", "item2"]
     ds = env.from_collection(inputs, type_info=Types.STRING())
 
-    map_resp = json.dumps({"sentiment": "positive", "confidence": 0.9})
-    map_cfg = LLMClientConfig(backend="mock", mock_delay_s=10.0, mock_response=map_resp)
-    map_fn = SemMapFunction(
-        "Classify: {input}",
-        {"sentiment": str, "confidence": float},
-        map_cfg,
+    runtime_config = _runtime_config_with_mock_rows(
+        map_response=json.dumps({"sentiment": "positive", "confidence": 0.9}),
+        map_delay_s=10.0,
+        filter_response=json.dumps({"decision": True, "confidence": 0.9, "reason": "unused"}),
+        filter_delay_s=0.05,
+    )
+    map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
     )
     result = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(1), 2, Types.STRING())
     assert_job_fails(env, result, "test_timeout_pipeline_fails")
@@ -188,15 +230,18 @@ def test_invalid_json_pipeline_fails() -> None:
     inputs = ["item1", "item2", "item3"]
     ds = env.from_collection(inputs, type_info=Types.STRING())
 
-    map_cfg = LLMClientConfig(
-        backend="mock",
-        mock_delay_s=0.05,
-        mock_response="this is not json at all",
+    runtime_config = _runtime_config_with_mock_rows(
+        map_response="this is not json at all",
+        map_delay_s=0.05,
+        filter_response=json.dumps({"decision": True, "confidence": 0.9, "reason": "unused"}),
+        filter_delay_s=0.05,
     )
-    map_fn = SemMapFunction(
-        "Classify: {input}",
-        {"sentiment": str, "confidence": float},
-        map_cfg,
+    map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
     )
     result = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(10), 5, Types.STRING())
     assert_job_fails(env, result, "test_invalid_json_pipeline_fails")
@@ -212,12 +257,18 @@ def test_backpressure_pipeline() -> None:
     inputs = [f"record_{i}" for i in range(n_records)]
     ds = env.from_collection(inputs, type_info=Types.STRING())
 
-    map_resp = json.dumps({"sentiment": "positive", "confidence": 0.9})
-    map_cfg = LLMClientConfig(backend="mock", mock_delay_s=2.0, mock_response=map_resp)
-    map_fn = SemMapFunction(
-        "Classify: {input}",
-        {"sentiment": str, "confidence": float},
-        map_cfg,
+    runtime_config = _runtime_config_with_mock_rows(
+        map_response=json.dumps({"sentiment": "positive", "confidence": 0.9}),
+        map_delay_s=2.0,
+        filter_response=json.dumps({"decision": True, "confidence": 0.9, "reason": "unused"}),
+        filter_delay_s=0.05,
+    )
+    map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            "Classify: {input}",
+            output_schema={"sentiment": str, "confidence": float},
+        ),
+        runtime_config,
     )
     result = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(30), 10, Types.STRING())
 
@@ -283,35 +334,50 @@ def test_real_pipeline_if_enabled() -> None:
     inputs = ["The service was excellent and fast."]
     ds = env.from_collection(inputs, type_info=Types.STRING())
 
-    llm_cfg = LLMClientConfig(
-        backend="openai",
-        model=os.environ.get("SEM_RUNTIME_MODEL", "deepseek-chat"),
-        api_base=os.environ.get("SEM_RUNTIME_API_BASE", "https://api.deepseek.com/v1"),
-        api_key_env=api_key_env,
-        timeout_s=float(os.environ.get("SEM_RUNTIME_LLM_TIMEOUT_S", "30")),
-        max_retries=int(os.environ.get("SEM_RUNTIME_LLM_MAX_RETRIES", "2")),
-        retry_base_delay_s=float(os.environ.get("SEM_RUNTIME_LLM_RETRY_BASE_DELAY_S", "0.5")),
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {
+                "backend": "openai",
+                "model": os.environ.get("SEM_RUNTIME_MODEL", "deepseek-chat"),
+                "endpoint": os.environ.get("SEM_RUNTIME_API_BASE", "https://api.deepseek.com/v1"),
+                "extra": {
+                    "api_key_env": api_key_env,
+                    "timeout_s": float(os.environ.get("SEM_RUNTIME_LLM_TIMEOUT_S", "30")),
+                    "max_retries": int(os.environ.get("SEM_RUNTIME_LLM_MAX_RETRIES", "2")),
+                    "retry_base_delay_s": float(
+                        os.environ.get("SEM_RUNTIME_LLM_RETRY_BASE_DELAY_S", "0.5")
+                    ),
+                },
+            },
+            "operators": {
+                "sem_map": {"kernel": {}},
+                "sem_filter": {"kernel": {}},
+            },
+        }
     )
-
-    map_fn = SemMapFunction(
-        (
-            "Return strict JSON with keys sentiment and confidence. "
-            "sentiment must be one of positive, neutral, negative. "
-            "confidence must be a float in [0,1]. "
-            "Input: {input}"
+    map_fn = build_sem_map_operator(
+        SemanticSpec.for_sem_map(
+            (
+                "Return strict JSON with keys sentiment and confidence. "
+                "sentiment must be one of positive, neutral, negative. "
+                "confidence must be a float in [0,1]. "
+                "Input: {input}"
+            ),
+            output_schema={"sentiment": str, "confidence": float},
         ),
-        {"sentiment": str, "confidence": float},
-        llm_cfg,
+        runtime_config,
     )
     mapped = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(60), 2, Types.STRING())
 
-    filter_fn = SemFilterFunction(
-        (
-            "Return strict JSON with keys decision, confidence, reason. "
-            "decision should be true only for clearly positive sentiment. "
-            "Input: {input}"
+    filter_fn = build_sem_filter_operator(
+        SemanticSpec.for_sem_filter(
+            (
+                "Return strict JSON with keys decision, confidence, reason. "
+                "decision should be true only for clearly positive sentiment. "
+                "Input: {input}"
+            )
         ),
-        llm_cfg,
+        runtime_config,
     )
     filtered = AsyncDataStream.unordered_wait(
         mapped,
