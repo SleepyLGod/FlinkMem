@@ -137,6 +137,19 @@ def sem_groupby_profiles_descriptor(
     return desc
 
 
+def sem_groupby_pending_events_descriptor(
+    ttl_seconds: int = 3600,
+) -> ListStateDescriptor:
+    """ListState descriptor for operator-owned pending groupby events.
+
+    Each element is a pickled event dict waiting for chunk-level async
+    assignment.
+    """
+    desc = ListStateDescriptor("sem_groupby_pending_events", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 # ---------------------------------------------------------------------------
 # sem_search descriptors
 # ---------------------------------------------------------------------------

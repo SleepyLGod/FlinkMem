@@ -239,12 +239,6 @@ class TopKScopePolicy:
 # ---------------------------------------------------------------------------
 
 VALID_RANKING_METHODS = {"pointwise", "pairwise", "listwise"}
-VALID_ASSIGNMENT_METHODS = {
-    "rule",
-    "embedding",
-    "llm",
-    "llm_verify_local_refine",
-}
 VALID_AGG_METHODS = {"algebraic", "summarize", "compressive"}
 VALID_JOIN_PAIRING_METHODS = {
     "candidate_pruned",
@@ -462,47 +456,42 @@ class GroupbyScopePolicy:
 
 @dataclass
 class GroupbyQuerySpec:
-    """Continuous query definition for ``sem_groupby``."""
+    """Continuous query definition for ``sem_groupby``.
+
+    ``sem_groupby`` expresses the semantic grouping intent, not the execution
+    backend. Internal planner/kernel code may use embedding, LLM, or other
+    strategies to decide whether one event should join an existing group or
+    create a new group, but those choices are not part of the public query
+    contract.
+    """
 
     semantic: SemanticSpec = field(
         default_factory=lambda: SemanticSpec(
             instruction="Assign tuples to semantic groups.",
-            backend="llm",
+            backend="hybrid",
             output_mode="label",
         )
     )
     query_id: str = "default"
     query_version: int = 1
-    assignment_method: str = "llm"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     maintenance_trigger_policy: Optional[TriggerPolicy] = None
     scope_policy: GroupbyScopePolicy = field(default_factory=GroupbyScopePolicy)
-    new_group_threshold: float = 0.3
-    assign_threshold: float = 0.7
 
-    def __post_init__(self):
-        if self.assignment_method not in VALID_ASSIGNMENT_METHODS:
-            raise ValueError(
-                f"Invalid assignment_method={self.assignment_method!r}. "
-                f"Must be one of {VALID_ASSIGNMENT_METHODS}."
-            )
     @classmethod
     def simple(
         cls,
         instruction: str = "Assign tuples to semantic groups.",
         *,
-        backend: str = "llm",
-        assignment_method: str = "llm",
         ttl_seconds: Optional[int] = None,
         max_groups_per_key: Optional[int] = None,
     ) -> "GroupbyQuerySpec":
         return cls(
             semantic=SemanticSpec(
                 instruction=instruction,
-                backend=backend,
+                backend="hybrid",
                 output_mode="label",
             ),
-            assignment_method=assignment_method,
             trigger_policy=TriggerPolicy(),
             scope_policy=GroupbyScopePolicy(
                 ttl_seconds=ttl_seconds,
@@ -515,7 +504,6 @@ class GroupbyQuerySpec:
             "semantic": self.semantic.to_dict(),
             "query_id": self.query_id,
             "query_version": self.query_version,
-            "assignment_method": self.assignment_method,
             "trigger_policy": self.trigger_policy.to_dict(),
             "maintenance_trigger_policy": (
                 self.maintenance_trigger_policy.to_dict()
@@ -523,8 +511,6 @@ class GroupbyQuerySpec:
                 else None
             ),
             "scope_policy": self.scope_policy.to_dict(),
-            "new_group_threshold": self.new_group_threshold,
-            "assign_threshold": self.assign_threshold,
         }
 
     @classmethod
@@ -533,7 +519,6 @@ class GroupbyQuerySpec:
             semantic=SemanticSpec.from_dict(d.get("semantic", {})),
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
-            assignment_method=d.get("assignment_method", "llm"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             maintenance_trigger_policy=(
                 TriggerPolicy.from_dict(d["maintenance_trigger_policy"])
@@ -541,8 +526,6 @@ class GroupbyQuerySpec:
                 else None
             ),
             scope_policy=GroupbyScopePolicy.from_dict(d.get("scope_policy", {})),
-            new_group_threshold=d.get("new_group_threshold", 0.3),
-            assign_threshold=d.get("assign_threshold", 0.7),
         )
 
 

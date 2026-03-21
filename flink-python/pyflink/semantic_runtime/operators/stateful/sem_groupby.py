@@ -15,42 +15,33 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""
-sem_groupby — dynamic semantic category assignment over keyed state.
+"""Stateful semantic grouping over keyed state.
 
-Input: keyed ``SemanticEvent`` dicts or ``WindowSnapshot`` dicts.
+``sem_groupby`` maintains a set of semantic groups for one keyed scope.
+For each incoming event, the operator decides one of two outcomes:
 
-State model:
-  - ``MapState[group_id -> group_profile]`` for semantic bucket summaries.
-  - ``ValueState[meta]`` for counters and eviction bookkeeping.
+1. assign the event to one existing group
+2. create one new group
 
-Assignment flow:
-  1. Local candidate-group proposal from current state (keyword / embedding match).
-  2. If confidence is below threshold → emit side-output ``AsyncWorkItem``
-     for async semantic classification.
-  3. On async result merge-back → update group profile.
-
-Guardrails:
-  - ``max_groups_per_key``: hard cap on distinct groups per key.
-  - Per-group TTL via ``StateTtlConfig``.
-  - Overflow evicts least-recently-updated group.
-
-V0.2 boundary:
-  - No retroactive full reassignment over historical records.
+The decision backend is an internal execution concern. Local methods such as
+keyword overlap or embedding similarity can assign synchronously. Expensive
+semantic methods such as LLM-based assignment can emit async work and only
+produce the final assignment after merge-back.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
-from pyflink.datastream.state import MapState, ValueState
+from pyflink.datastream.state import ListState, MapState, ValueState
 
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
+    sem_groupby_pending_events_descriptor,
     sem_groupby_profiles_descriptor,
     sem_window_meta_descriptor,
     build_ttl_config,
@@ -76,6 +67,10 @@ from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_ASSIGNMENT_METHODS = {"rule", "embedding"}
+_ASYNC_ASSIGNMENT_METHODS = {"llm"}
+_VALID_INTERNAL_ASSIGNMENT_METHODS = _LOCAL_ASSIGNMENT_METHODS | _ASYNC_ASSIGNMENT_METHODS
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +156,26 @@ class _GroupbyScopeRuntime:
 
 @dataclass
 class SemGroupbyConfig:
-    """Configuration for the semantic groupby operator."""
+    """Internal configuration for the semantic groupby operator."""
+
     max_groups_per_key: int = 50
-    confidence_threshold: float = 0.7   # below this → async classify
+    assignment_method: str = "rule"
+    scope_chunk_size: int = 1
+    confidence_threshold: float = 0.7
     ttl_seconds: int = 3600
-    evict_interval_ms: int = 60_000     # timer-driven stale group eviction
-    new_group_creation_threshold: float = 0.3  # min similarity to reuse a group
+    evict_interval_ms: int = 60_000
+    new_group_creation_threshold: float = 0.3
+    refresh_labels_during_maintenance: bool = False
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
+
+    def __post_init__(self) -> None:
+        if self.assignment_method not in _VALID_INTERNAL_ASSIGNMENT_METHODS:
+            raise ValueError(
+                f"Invalid internal groupby assignment_method={self.assignment_method!r}. "
+                f"Must be one of {_VALID_INTERNAL_ASSIGNMENT_METHODS}."
+            )
+        if self.scope_chunk_size <= 0:
+            raise ValueError("scope_chunk_size must be a positive integer.")
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +194,12 @@ def _new_group_profile(group_id: str, label: str, now_ms: int) -> Dict[str, Any]
 
 
 def resolve_groupby_assignment_method(
+    config: SemGroupbyConfig,
     query_spec: Optional[GroupbyQuerySpec] = None,
 ) -> str:
-    """Resolve the local assignment strategy."""
-    if query_spec is None:
-        return "rule"
-    return str(query_spec.assignment_method or "rule")
+    """Resolve the internal assignment strategy."""
+    _ = query_spec
+    return str(config.assignment_method or "rule")
 
 
 def _group_profile_text(profile: Dict[str, Any]) -> str:
@@ -203,9 +211,9 @@ def _group_profile_text(profile: Dict[str, Any]) -> str:
 def derive_group_label(profile: Dict[str, Any]) -> str:
     """Derive a compact local label from a group profile.
 
-    This is a local relabel helper used by
-    ``llm_verify_local_refine`` maintenance. No separate LLM-driven
-    relabel worker exists in the current runtime.
+    This is a local relabel helper used by maintenance when label refresh is
+    enabled. No separate LLM-driven relabel worker exists in the current
+    runtime.
     """
     text = _group_profile_text(profile).strip()
     if not text:
@@ -432,17 +440,12 @@ def resolve_groupby_runtime_params(
         if query_spec and query_spec.scope_policy.max_groups_per_key is not None
         else config.max_groups_per_key
     )
-    assign_threshold = float(
-        query_spec.assign_threshold
-        if query_spec is not None
-        else config.confidence_threshold
+    return (
+        ttl_seconds,
+        max_groups_per_key,
+        float(config.confidence_threshold),
+        float(config.new_group_creation_threshold),
     )
-    new_group_threshold = float(
-        query_spec.new_group_threshold
-        if query_spec is not None
-        else config.new_group_creation_threshold
-    )
-    return ttl_seconds, max_groups_per_key, assign_threshold, new_group_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +471,14 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._config = config or SemGroupbyConfig()
         self._query_spec = query_spec
         self._group_profiles: Optional[MapState] = None
+        self._pending_events: Optional[ListState] = None
+        self._pending_events_buffer: List[Dict[str, Any]] = []
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
-        self._resolved_assignment_method = resolve_groupby_assignment_method(query_spec)
+        self._resolved_assignment_method = resolve_groupby_assignment_method(
+            self._config,
+            query_spec,
+        )
         self._maintenance_trigger_policy = (
             query_spec.maintenance_trigger_policy if query_spec is not None else None
         )
@@ -488,6 +496,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._resolved_assign_threshold,
             self._resolved_new_group_threshold,
         ) = resolve_groupby_runtime_params(self._config, self._query_spec)
+        self._resolved_scope_chunk_size = int(self._config.scope_chunk_size)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -495,6 +504,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
         ttl = self._resolved_ttl_seconds
         self._group_profiles = runtime_context.get_map_state(
             sem_groupby_profiles_descriptor(ttl)
+        )
+        self._pending_events = runtime_context.get_list_state(
+            sem_groupby_pending_events_descriptor(ttl)
         )
         # Reuse a generic ValueState for counters/eviction bookkeeping
         from pyflink.common.typeinfo import Types
@@ -506,7 +518,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             runtime_context, "sem_groupby",
         )
         logger.info(
-            "SemGroupbyFunction opened (max_groups=%d, assign_threshold=%.2f, new_group_threshold=%.2f, assignment_method=%s)",
+            "SemGroupbyFunction opened (max_groups=%d, reuse_threshold=%.2f, maintenance_merge_threshold=%.2f, assignment_method=%s)",
             self._resolved_max_groups_per_key,
             self._resolved_assign_threshold,
             self._resolved_new_group_threshold,
@@ -515,7 +527,11 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
     # -- core ----------------------------------------------------------------
 
-    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+    def process_element(
+        self,
+        value: Any,
+        ctx: "KeyedProcessFunction.Context",
+    ) -> Iterable[Any]:
         """Process one incoming event or async merge-back result.
 
         Yields assignment dicts on main output.  Yields side-output
@@ -539,7 +555,12 @@ class SemGroupbyFunction(KeyedProcessFunction):
         # Single event path
         yield from self._process_single_event(value, ctx, now_ms)
 
-    def _process_single_event(self, value, ctx, now_ms: int):
+    def _process_single_event(
+        self,
+        value: Any,
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> Iterable[Any]:
         """Process a single SemanticEvent-shaped dict."""
         # Parse as SemanticEvent
         if isinstance(value, dict):
@@ -567,8 +588,12 @@ class SemGroupbyFunction(KeyedProcessFunction):
         )
 
         if decision.pre_reset_reason:
-            self._run_maintenance(meta, now_ms)
-            self._reset_scope_state(meta, reason=decision.pre_reset_reason)
+            yield from self._close_scope(
+                meta,
+                now_ms=now_ms,
+                reason=decision.pre_reset_reason,
+                key=event.key,
+            )
 
         # Register eviction timer on first event
         if meta.get("total_assigned", 0) == 0 and self._config.evict_interval_ms > 0:
@@ -592,99 +617,48 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if decision.scope_bucket_id is not None:
             meta["scope_bucket_id"] = decision.scope_bucket_id
 
-        # Local assignment: find best matching group
-        best_group_id, confidence = self._local_assign(event)
-
-        if confidence >= self._resolved_assign_threshold and best_group_id:
-            # High confidence → direct assignment
-            self._update_group(best_group_id, event, now_ms)
-            meta["total_assigned"] = meta.get("total_assigned", 0) + 1
+        if self._resolved_assignment_method in _LOCAL_ASSIGNMENT_METHODS:
+            assignment_row = self._assign_locally(event, now_ms)
+            meta["total_assigned"] = int(meta.get("total_assigned", 0)) + 1
             self._meta.update(meta)
-            yield {
-                "key": event.key, "group_id": best_group_id,
-                "confidence": confidence, "source": "local",
-                "event_seq_id": event.seq_id,
-                "payload": event.payload,
-                "event_time_ms": event.event_time_ms,
-                "metadata": dict(event.metadata),
-                "boundary_flags": dict(event.boundary_flags),
-            }
-        elif confidence >= self._resolved_new_group_threshold and best_group_id:
-            # Medium confidence → assign but also emit for async verification
-            self._update_group(best_group_id, event, now_ms)
-            meta["total_assigned"] = meta.get("total_assigned", 0) + 1
-            self._meta.update(meta)
-            yield {
-                "key": event.key, "group_id": best_group_id,
-                "confidence": confidence, "source": "tentative",
-                "event_seq_id": event.seq_id,
-                "payload": event.payload,
-                "event_time_ms": event.event_time_ms,
-                "metadata": dict(event.metadata),
-                "boundary_flags": dict(event.boundary_flags),
-            }
-            # Emit side-output async classification request
-            work = AsyncWorkItem(
-                key=event.key,
-                task_type="classify",
-                payload=self._classify_payload(event_dict, best_group_id),
+            yield assignment_row
+        elif self._resolved_assignment_method in _ASYNC_ASSIGNMENT_METHODS:
+            yield from self._enqueue_async_assignment(
+                event_dict=event_dict,
+                event=event,
+                meta=meta,
             )
-            if self._metrics:
-                self._metrics.record_async_emit()
-            yield ASYNC_WORK_TAG, work.to_dict()
         else:
-            # Low confidence → create new group or emit async
-            new_group_id = self._maybe_create_group(event, now_ms)
-            if new_group_id:
-                meta["total_assigned"] = meta.get("total_assigned", 0) + 1
-                self._meta.update(meta)
-                yield {
-                    "key": event.key, "group_id": new_group_id,
-                    "confidence": 0.0, "source": "new_group",
-                    "event_seq_id": event.seq_id,
-                    "payload": event.payload,
-                    "event_time_ms": event.event_time_ms,
-                    "metadata": dict(event.metadata),
-                    "boundary_flags": dict(event.boundary_flags),
-                }
-                if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
-                    work = AsyncWorkItem(
-                        key=event.key,
-                        task_type="classify",
-                        payload=self._classify_payload(event_dict, new_group_id),
-                    )
-                    if self._metrics:
-                        self._metrics.record_async_emit()
-                    yield ASYNC_WORK_TAG, work.to_dict()
-            else:
-                # At group limit → emit async for best-effort classification
-                self._meta.update(meta)
-                work = AsyncWorkItem(
-                    key=event.key,
-                    task_type="classify",
-                    payload=self._classify_payload(event_dict, None),
-                )
-                if self._metrics:
-                    self._metrics.record_async_emit()
-                yield ASYNC_WORK_TAG, work.to_dict()
+            raise ValueError(
+                f"Unsupported internal groupby assignment_method={self._resolved_assignment_method!r}."
+            )
 
         if (
             self._maintenance_trigger_policy is not None
             and self._maintenance_trigger_policy.mode == "on_scope_close"
         ):
             if decision.post_reset_reason:
-                self._run_maintenance(meta, now_ms)
-                self._reset_scope_state(meta, reason=decision.post_reset_reason)
+                yield from self._close_scope(
+                    meta,
+                    now_ms=now_ms,
+                    reason=decision.post_reset_reason,
+                    key=event.key,
+                )
             else:
                 self._register_scope_close_timer(ctx, meta, decision, now_ms)
             self._meta.update(meta)
             return
 
-    def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
+    def on_timer(
+        self,
+        timestamp: int,
+        ctx: "KeyedProcessFunction.OnTimerContext",
+    ) -> List[Any]:
         """Timer-driven stale group eviction."""
+        outputs: List[Any] = []
         meta = self._meta.value()
         if meta is None:
-            return
+            return outputs
         if self._metrics:
             self._metrics.record_timer_fire()
 
@@ -692,10 +666,15 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if category == TimerCategory.FLUSH:
             clear_timer_registration(meta, TimerCategory.FLUSH)
             reason = str(meta.pop("pending_scope_close_reason", "") or "scope_close")
-            self._run_maintenance(meta, timestamp)
-            self._reset_scope_state(meta, reason=reason)
-            self._meta.update(meta)
-            return
+            outputs.extend(
+                self._close_scope(
+                    meta,
+                    now_ms=timestamp,
+                    reason=reason,
+                    key=str(ctx.get_current_key()),
+                )
+            )
+            return outputs
         if category == TimerCategory.RECOMPUTE:
             clear_timer_registration(meta, TimerCategory.RECOMPUTE)
             self._run_maintenance(meta, timestamp)
@@ -710,9 +689,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
                     int(time.time() * 1000) + int(self._maintenance_trigger_policy.interval_ms),
                 )
             self._meta.update(meta)
-            return
+            return outputs
         if category != TimerCategory.EVICT:
-            return
+            return outputs
 
         clear_timer_registration(meta, TimerCategory.EVICT)
         evicted = self._evict_stale_groups(meta)
@@ -728,14 +707,12 @@ class SemGroupbyFunction(KeyedProcessFunction):
             now_ms + self._config.evict_interval_ms,
         )
         self._meta.update(meta)
+        return outputs
 
     # -- internals -----------------------------------------------------------
 
-    def _local_assign(self, event: SemanticEvent) -> tuple:
-        """Find best matching group by simple keyword overlap.
-
-        Returns (group_id, confidence) or (None, 0.0).
-        """
+    def _local_assign(self, event: SemanticEvent) -> Tuple[Optional[str], float]:
+        """Return the best local candidate group and its score."""
         best_id, best_score = None, 0.0
 
         for group_id in self._group_profiles.keys():
@@ -754,28 +731,155 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
         return best_id, best_score
 
-    def _classify_payload(
+    def _pending_event_values(self) -> List[Dict[str, Any]]:
+        """Return the current pending async chunk as plain event dicts."""
+        if self._pending_events is None:
+            return list(self._pending_events_buffer)
+        return list(self._pending_events.get())
+
+    def _replace_pending_events(self, events: List[Dict[str, Any]]) -> None:
+        """Replace the pending async chunk."""
+        normalized = list(events)
+        self._pending_events_buffer = normalized
+        if self._pending_events is not None:
+            self._pending_events.update(normalized)
+
+    def _clear_pending_events(self) -> None:
+        """Clear the pending async chunk."""
+        self._pending_events_buffer = []
+        if self._pending_events is not None:
+            self._pending_events.clear()
+
+    def _append_pending_event(self, event_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Append one event to the pending async chunk and return the chunk."""
+        pending = self._pending_event_values()
+        pending.append(dict(event_dict))
+        self._replace_pending_events(pending)
+        return pending
+
+    def _build_async_assignment_payload(
         self,
-        event_dict: Dict[str, Any],
-        tentative_group: Optional[str],
+        events: List[Dict[str, Any]],
+        *,
+        scope_epoch: int,
+        scope_close_pending: bool,
+        scope_close_reason: str = "",
     ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "event": event_dict,
-            "tentative_group": tentative_group,
+        """Build one async assignment payload for one event chunk."""
+        existing_groups = self._existing_groups_payload()
+        if len(events) == 1:
+            event = dict(events[0])
+            semantic_event = SemanticEvent.from_dict(event)
+            suggested_group_id, suggested_score = self._local_assign(semantic_event)
+            return {
+                "event": event,
+                "existing_groups": existing_groups,
+                "scope_chunk_size": self._resolved_scope_chunk_size,
+                "scope_epoch": scope_epoch,
+                "scope_close_pending": scope_close_pending,
+                "scope_close_reason": scope_close_reason,
+                "planner_hints": {
+                    "suggested_group_id": suggested_group_id,
+                    "suggested_score": suggested_score,
+                },
+            }
+        return {
+            "events": [dict(item) for item in events],
+            "existing_groups": existing_groups,
+            "scope_chunk_size": self._resolved_scope_chunk_size,
+            "scope_epoch": scope_epoch,
+            "scope_close_pending": scope_close_pending,
+            "scope_close_reason": scope_close_reason,
         }
-        if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
-            payload["candidate_groups"] = [
-                {
-                    "group_id": group_id,
-                    "label": profile.get("label", ""),
-                    "summary": profile.get("summary", ""),
-                    "event_count": int(profile.get("event_count", 0)),
-                }
-                for group_id in self._group_profiles.keys()
-                for profile in [self._group_profiles.get(group_id)]
-                if profile is not None
-            ]
-        return payload
+
+    def _emit_async_assignment_work(
+        self,
+        *,
+        key: str,
+        events: List[Dict[str, Any]],
+        meta: Dict[str, Any],
+        scope_close_pending: bool,
+        scope_close_reason: str = "",
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Build one async assignment work item for the current chunk."""
+        work = AsyncWorkItem(
+            key=key,
+            task_type="classify",
+            payload=self._build_async_assignment_payload(
+                events,
+                scope_epoch=int(meta.get("scope_epoch", 0) or 0),
+                scope_close_pending=scope_close_pending,
+                scope_close_reason=scope_close_reason,
+            ),
+        )
+        if self._metrics:
+            self._metrics.record_async_emit()
+        return ASYNC_WORK_TAG, work.to_dict()
+
+    def _enqueue_async_assignment(
+        self,
+        *,
+        event_dict: Dict[str, Any],
+        event: SemanticEvent,
+        meta: Dict[str, Any],
+    ) -> Iterable[Any]:
+        """Append one event to the async chunk and emit work when full."""
+        pending = self._append_pending_event(event_dict)
+        self._meta.update(meta)
+        if len(pending) < self._resolved_scope_chunk_size:
+            return
+        chunk = list(pending)
+        self._clear_pending_events()
+        yield self._emit_async_assignment_work(
+            key=event.key,
+            events=chunk,
+            meta=meta,
+            scope_close_pending=False,
+        )
+
+    def _existing_groups_payload(self) -> List[Dict[str, Any]]:
+        """Return a serializable view of current groups for async assignment."""
+        return [
+            {
+                "group_id": group_id,
+                "label": profile.get("label", ""),
+                "summary": profile.get("summary", ""),
+                "event_count": int(profile.get("event_count", 0)),
+            }
+            for group_id in self._group_profiles.keys()
+            for profile in [self._group_profiles.get(group_id)]
+            if profile is not None
+        ]
+
+    def _assign_locally(self, event: SemanticEvent, now_ms: int) -> Dict[str, Any]:
+        """Assign one event using the configured local method."""
+        best_group_id, confidence = self._local_assign(event)
+        if best_group_id and confidence >= self._resolved_assign_threshold:
+            self._update_group(best_group_id, event, now_ms)
+            return self._assignment_row(event, best_group_id, confidence, "local")
+
+        new_group_id = self._create_group_or_raise(event, now_ms)
+        return self._assignment_row(event, new_group_id, confidence, "new_group")
+
+    @staticmethod
+    def _assignment_row(
+        event: SemanticEvent,
+        group_id: str,
+        confidence: float,
+        source: str,
+    ) -> Dict[str, Any]:
+        """Build one normalized group assignment row."""
+        return {
+            "key": event.key,
+            "group_id": group_id,
+            "confidence": confidence,
+            "source": source,
+            "event_seq_id": event.seq_id,
+            "payload": event.payload,
+            "event_time_ms": event.event_time_ms,
+            "metadata": dict(event.metadata),
+            "boundary_flags": dict(event.boundary_flags),
+        }
 
     def _update_group(
         self, group_id: str, event: SemanticEvent, now_ms: int
@@ -814,28 +918,98 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._group_profiles.put(group_id, profile)
         return group_id
 
+    def _create_group_or_raise(self, event: SemanticEvent, now_ms: int) -> str:
+        """Create a new group or fail when policy forbids it."""
+        group_id = self._maybe_create_group(event, now_ms)
+        if group_id is None:
+            raise RuntimeError(
+                "sem_groupby could not create a new group under the current overflow policy."
+            )
+        return group_id
+
+    def _merge_one_async_assignment(
+        self,
+        payload: Dict[str, Any],
+        *,
+        now_ms: int,
+        scope_close_pending: bool,
+        stale_scope_result: bool,
+    ) -> Dict[str, Any]:
+        """Merge one async assignment or emit it without state mutation."""
+        group_id = str(payload.get("group_id", "") or "")
+        if not group_id:
+            raise RuntimeError("sem_groupby async classify returned no group_id")
+
+        event = SemanticEvent(
+            key=str(payload.get("key", "") or ""),
+            payload=str(payload.get("payload", "") or ""),
+            seq_id=int(payload.get("event_seq_id", 0)),
+            event_time_ms=payload.get("event_time_ms"),
+            metadata=dict(payload.get("metadata", {}) or {}),
+            boundary_flags=dict(payload.get("boundary_flags", {}) or {}),
+        )
+        confidence = float(payload.get("confidence", 0.0))
+        label = str(payload.get("label", "") or "")
+
+        meta = self._meta.value() or {}
+        meta["total_assigned"] = int(meta.get("total_assigned", 0)) + 1
+        self._meta.update(meta)
+
+        if not scope_close_pending and not stale_scope_result:
+            if self._group_profiles.contains(group_id):
+                self._update_group(group_id, event, now_ms)
+                if label:
+                    profile = self._group_profiles.get(group_id)
+                    if profile is not None:
+                        profile["label"] = label
+                        self._group_profiles.put(group_id, profile)
+            else:
+                profile = _new_group_profile(
+                    group_id,
+                    label or " ".join(event.payload.split()[:5]),
+                    now_ms,
+                )
+                profile["event_count"] = 1
+                self._group_profiles.put(group_id, profile)
+
+        return self._assignment_row(event, group_id, confidence, "async_assign")
+
     def _handle_async_result(
         self, result_dict: Dict[str, Any], now_ms: int
-    ):
-        """Merge an async classification result back into state."""
+    ) -> Iterable[Dict[str, Any]]:
+        """Merge one async assignment result back into state."""
         result = AsyncResult.from_dict(result_dict) if "success" in result_dict else None
-        if result is None or not result_dict.get("success", False):
+        if result is None or not result.success:
+            error = result_dict.get("error", "async_classify_failed")
+            raise RuntimeError(f"sem_groupby async classify failed: {error}")
+
+        payload = result.result or {}
+        scope_close_pending = bool(payload.get("scope_close_pending", False))
+        result_scope_epoch = int(payload.get("scope_epoch", 0) or 0)
+        current_scope_epoch = int((self._meta.value() or {}).get("scope_epoch", 0) or 0)
+        stale_scope_result = result_scope_epoch != current_scope_epoch
+
+        assignments = payload.get("assignments")
+        if isinstance(assignments, list):
+            for assignment in assignments:
+                assignment_payload = dict(assignment)
+                assignment_payload.setdefault("key", str(result_dict.get("key", "")))
+                yield self._merge_one_async_assignment(
+                    assignment_payload,
+                    now_ms=now_ms,
+                    scope_close_pending=scope_close_pending,
+                    stale_scope_result=stale_scope_result,
+                )
             return
-        group_id = result_dict.get("result", {}).get("group_id")
-        if group_id and self._group_profiles.contains(group_id):
-            profile = self._group_profiles.get(group_id)
-            profile["last_update_ms"] = now_ms
-            # Update label if provided
-            new_label = result_dict.get("result", {}).get("label")
-            if new_label:
-                profile["label"] = new_label
-            self._group_profiles.put(group_id, profile)
-        yield {
-            "key": result_dict.get("key", ""),
-            "group_id": group_id,
-            "source": "async_classify",
-            "request_id": result_dict.get("request_id", ""),
-        }
+
+        single_payload = dict(payload)
+        single_payload.setdefault("key", str(result_dict.get("key", "")))
+        yield self._merge_one_async_assignment(
+            single_payload,
+            now_ms=now_ms,
+            scope_close_pending=scope_close_pending,
+            stale_scope_result=stale_scope_result,
+        )
 
     def _evict_n_oldest(self, n: int) -> int:
         """Evict the *n* least-recently-updated groups. Returns count evicted."""
@@ -867,13 +1041,40 @@ class SemGroupbyFunction(KeyedProcessFunction):
         - do not reassign historical events
         """
         merge_count = self._merge_similar_groups(now_ms)
-        if self._resolved_assignment_method == "llm_verify_local_refine":
+        if self._config.refresh_labels_during_maintenance:
             self._refresh_group_labels()
         meta["last_refine_ms"] = now_ms
         meta["refine_count"] = int(meta.get("refine_count", 0)) + 1
         meta["last_merge_count"] = merge_count
         if self._metrics:
             self._metrics.record_recompute()
+
+    def _close_scope(
+        self,
+        meta: Dict[str, Any],
+        *,
+        now_ms: int,
+        reason: str,
+        key: str,
+    ) -> Iterable[Any]:
+        """Finalize one scope and optionally flush pending async assignments."""
+        self._run_maintenance(meta, now_ms)
+        pending = self._pending_event_values()
+        if pending:
+            output = self._emit_async_assignment_work(
+                key=key,
+                events=pending,
+                meta=meta,
+                scope_close_pending=True,
+                scope_close_reason=reason,
+            )
+            self._clear_pending_events()
+            self._reset_scope_state(meta, reason=reason)
+            self._meta.update(meta)
+            yield output
+            return
+        self._reset_scope_state(meta, reason=reason)
+        self._meta.update(meta)
 
     def _maintenance_merge_threshold(self) -> float:
         return resolve_groupby_maintenance_merge_threshold(

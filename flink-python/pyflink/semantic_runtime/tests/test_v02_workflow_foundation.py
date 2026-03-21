@@ -75,13 +75,14 @@ class TestContinuousRAGConfig:
     def test_custom_configs(self) -> None:
         cfg = ContinuousRAGConfig(
             window_config=SemWindowConfig(max_window_events=10),
-            groupby_query_spec=GroupbyQuerySpec(assign_threshold=0.8),
+            groupby_query_spec=GroupbyQuerySpec(),
+            groupby_config=SemGroupbyConfig(confidence_threshold=0.8),
             topk_config=SemTopKConfig(max_candidates=50),
             topk_query_spec=TopKQuerySpec(k=5),
             workflow_version="v0.2.1",
         )
         assert cfg.window_config.max_window_events == 10
-        assert cfg.groupby_query_spec.assign_threshold == 0.8
+        assert cfg.groupby_config.confidence_threshold == 0.8
         assert cfg.topk_query_spec.k == 5
         assert cfg.topk_config.max_candidates == 50
         assert cfg.workflow_version == "v0.2.1"
@@ -105,10 +106,11 @@ class TestContinuousRAGConfig:
                         },
                     },
                     "sem_groupby": {
-                        "query_spec": {
-                            "assign_threshold": 0.85,
+                        "query_spec": {},
+                        "kernel": {
+                            "max_groups_per_key": 6,
+                            "confidence_threshold": 0.85,
                         },
-                        "kernel": {"max_groups_per_key": 6},
                     },
                     "sem_agg": {
                         "query_spec": {
@@ -138,7 +140,7 @@ class TestContinuousRAGConfig:
         assert cfg.window_config.window_timeout_ms == 1111
         assert cfg.window_config.ttl_seconds == 900
         assert cfg.groupby_query_spec is not None
-        assert cfg.groupby_query_spec.assign_threshold == 0.85
+        assert cfg.groupby_config.confidence_threshold == 0.85
         assert cfg.groupby_config.max_groups_per_key == 6
         assert cfg.agg_query_spec is not None
         assert cfg.agg_query_spec.agg_method == "summarize"

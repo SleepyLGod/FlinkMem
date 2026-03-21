@@ -245,6 +245,12 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
 
 def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
     _reject_execution_path(raw, "sem_groupby")
+    for legacy_key in ("assignment_method", "assign_threshold", "new_group_threshold"):
+        if legacy_key in raw:
+            raise ValueError(
+                f"sem_groupby query_spec no longer accepts {legacy_key!r}; "
+                "move execution/backend tuning into operators.sem_groupby.kernel."
+            )
     if "semantic" in raw:
         out = dict(raw)
         out["scope_policy"] = _inject_scope_defaults(
@@ -263,17 +269,14 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
     return {
         "semantic": SemanticSpec(
             instruction=raw.get("instruction", "Assign tuples to semantic groups."),
-            backend=raw.get("backend", "llm"),
+            backend=raw.get("backend", "hybrid"),
             output_mode="label",
         ).to_dict(),
         "query_id": raw.get("query_id", "default"),
         "query_version": raw.get("query_version", 1),
-        "assignment_method": raw.get("assignment_method", "llm"),
         "trigger_policy": dict(raw.get("trigger_policy", {})),
         "maintenance_trigger_policy": raw.get("maintenance_trigger_policy"),
         "scope_policy": scope,
-        "new_group_threshold": raw.get("new_group_threshold", 0.3),
-        "assign_threshold": raw.get("assign_threshold", 0.7),
     }
 
 

@@ -44,6 +44,7 @@ from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig, SemSear
 from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import build_sem_agg_operator
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig, SemGroupbyFunction
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_pipeline import build_sem_groupby_operator
 from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
 from pyflink.semantic_runtime.runtime.external_search_backend import (
     MockSearchBackend,
@@ -145,17 +146,62 @@ class _FakeValueState:
 
 
 class _DeterministicClassifyAsyncFn(AsyncFunction):
+    @staticmethod
+    def _chunk_items(items: List[Dict[str, Any]], chunk_size: int) -> List[List[Dict[str, Any]]]:
+        size = max(1, int(chunk_size))
+        return [items[index:index + size] for index in range(0, len(items), size)]
+
     async def async_invoke(self, value):
         work = AsyncWorkItem.from_dict(value)
         payload = work.payload or {}
-        event = payload.get("event", {})
+        event = payload.get("event")
+        events = payload.get("events")
+        if isinstance(events, list):
+            assignments: List[Dict[str, Any]] = []
+            for chunk in self._chunk_items(events, int(payload.get("scope_chunk_size", len(events) or 1))):
+                for item in chunk:
+                    text = str(item.get("payload", "")).lower()
+                    if "travel" in text or "flight" in text or "hotel" in text:
+                        group_id = "topic_travel"
+                    elif "budget" in text or "project" in text or "risk" in text:
+                        group_id = "topic_project"
+                    else:
+                        group_id = "topic_general"
+                    assignments.append(
+                        {
+                            "group_id": group_id,
+                            "confidence": 0.88,
+                            "event_seq_id": int(item.get("seq_id", 0)),
+                            "payload": str(item.get("payload", "")),
+                            "event_time_ms": item.get("event_time_ms"),
+                            "boundary_flags": dict(item.get("boundary_flags", {}) or {}),
+                        }
+                    )
+            return [
+                AsyncResult(
+                    key=work.key,
+                    task_type="classify",
+                    request_id=work.request_id,
+                    success=True,
+                    result={
+                        "assignments": assignments,
+                        "scope_chunk_size": int(payload.get("scope_chunk_size", len(events) or 1)),
+                        "scope_epoch": int(payload.get("scope_epoch", 0)),
+                        "scope_close_pending": bool(payload.get("scope_close_pending", False)),
+                    },
+                ).to_dict()
+            ]
+
+        if not isinstance(event, dict):
+            raise RuntimeError("classify payload missing event or events")
+
         text = str(event.get("payload", "")).lower()
         if "travel" in text or "flight" in text or "hotel" in text:
             group_id = "topic_travel"
         elif "budget" in text or "project" in text or "risk" in text:
             group_id = "topic_project"
         else:
-            group_id = payload.get("tentative_group") or "topic_general"
+            group_id = "topic_general"
         return [
             AsyncResult(
                 key=work.key,
@@ -167,6 +213,10 @@ class _DeterministicClassifyAsyncFn(AsyncFunction):
                     "confidence": 0.88,
                     "event_seq_id": int(event.get("seq_id", 0)),
                     "payload": str(event.get("payload", "")),
+                    "event_time_ms": event.get("event_time_ms"),
+                    "boundary_flags": dict(event.get("boundary_flags", {}) or {}),
+                    "scope_epoch": int(payload.get("scope_epoch", 0)),
+                    "scope_close_pending": bool(payload.get("scope_close_pending", False)),
                 },
             ).to_dict()
         ]
@@ -329,19 +379,64 @@ class _JsonLLMAsyncFn(AsyncFunction):
 
 
 class _RealClassifyAsyncFn(_JsonLLMAsyncFn):
+    @staticmethod
+    def _chunk_items(items: List[Dict[str, Any]], chunk_size: int) -> List[List[Dict[str, Any]]]:
+        size = max(1, int(chunk_size))
+        return [items[index:index + size] for index in range(0, len(items), size)]
+
     async def async_invoke(self, value):
         work = AsyncWorkItem.from_dict(value)
         payload = work.payload or {}
         event = payload.get("event", {})
-        prompt = (
-            "You assign a conversational event to one semantic group.\n"
-            "Allowed group_id values: topic_project, topic_travel, topic_general.\n"
-            "Return JSON only with keys group_id, confidence, label.\n"
-            f"Event payload: {event.get('payload', '')}\n"
-            f"Tentative group: {payload.get('tentative_group', '')}\n"
-        )
+        events = payload.get("events")
+        if isinstance(events, list):
+            rendered_chunks = self._chunk_items(
+                events,
+                int(payload.get("scope_chunk_size", len(events) or 1)),
+            )
+            prompt = (
+                "You assign each conversational event to one semantic group.\n"
+                "Allowed group_id values: topic_project, topic_travel, topic_general.\n"
+                "Return JSON only with key assignments, whose value is a list of "
+                "objects with keys group_id, confidence, event_seq_id, payload.\n"
+                f"Event chunks: {json.dumps(rendered_chunks, ensure_ascii=False)}\n"
+            )
+        else:
+            prompt = (
+                "You assign a conversational event to one semantic group.\n"
+                "Allowed group_id values: topic_project, topic_travel, topic_general.\n"
+                "Return JSON only with keys group_id, confidence, label.\n"
+                f"Event payload: {event.get('payload', '')}\n"
+                f"Existing groups: {json.dumps(payload.get('existing_groups', []), ensure_ascii=False)}\n"
+            )
         try:
             parsed = await self._call_json(prompt)
+            if isinstance(events, list):
+                assignments = []
+                for item in parsed.get("assignments", []):
+                    assignments.append(
+                        {
+                            "group_id": str(item.get("group_id", "topic_general")),
+                            "confidence": float(item.get("confidence", 0.5)),
+                            "event_seq_id": int(item.get("event_seq_id", 0)),
+                            "payload": str(item.get("payload", "")),
+                        }
+                    )
+                return [
+                    AsyncResult(
+                        key=work.key,
+                        task_type="classify",
+                        request_id=work.request_id,
+                        success=True,
+                        result={
+                            "assignments": assignments,
+                            "scope_chunk_size": int(payload.get("scope_chunk_size", len(events) or 1)),
+                            "scope_epoch": int(payload.get("scope_epoch", 0)),
+                            "scope_close_pending": bool(payload.get("scope_close_pending", False)),
+                        },
+                    ).to_dict()
+                ]
+
             group_id = str(parsed.get("group_id", "topic_general"))
             if group_id not in {"topic_project", "topic_travel", "topic_general"}:
                 group_id = "topic_general"
@@ -357,6 +452,10 @@ class _RealClassifyAsyncFn(_JsonLLMAsyncFn):
                         "label": str(parsed.get("label", group_id)),
                         "event_seq_id": int(event.get("seq_id", 0)),
                         "payload": str(event.get("payload", "")),
+                        "event_time_ms": event.get("event_time_ms"),
+                        "boundary_flags": dict(event.get("boundary_flags", {}) or {}),
+                        "scope_epoch": int(payload.get("scope_epoch", 0)),
+                        "scope_close_pending": bool(payload.get("scope_close_pending", False)),
                     },
                 ).to_dict()
             ]
@@ -598,6 +697,7 @@ def _build_use_case_events() -> List[Dict[str, Any]]:
 def _build_configs():
     window_cfg = SemWindowConfig(max_window_events=4, window_timeout_ms=60_000)
     groupby_cfg = SemGroupbyConfig(
+        assignment_method="llm",
         max_groups_per_key=16,
         confidence_threshold=0.95,
         new_group_creation_threshold=0.1,
@@ -671,20 +771,28 @@ def _run_memory_path(
     classify_async_fn: Optional[AsyncFunction],
     summarize_async_fn: Optional[AsyncFunction],
     *,
+    groupby_config: Optional[SemGroupbyConfig] = None,
     groupby_query_spec: Optional[GroupbyQuerySpec] = None,
     agg_query_spec: Optional[AggQuerySpec] = None,
 ) -> List[Dict[str, Any]]:
     key = "user_001"
     window_cfg, groupby_cfg, _, _, _ = _build_configs()
+    if groupby_config is not None:
+        groupby_cfg = groupby_config
     agg_cfg = SemAggConfig(mode=agg_mode, max_buffer_events=2, flush_interval_ms=0)
 
     sem_window = SemWindowFunction(window_cfg)
     sem_window._event_buffer = _FakeListState()
     sem_window._window_meta = _FakeValueState(None)
 
-    sem_groupby = SemGroupbyFunction(groupby_cfg, query_spec=groupby_query_spec)
-    sem_groupby._group_profiles = _FakeMapState()
-    sem_groupby._meta = _FakeValueState(None)
+    sem_groupby = build_sem_groupby_operator(
+        groupby_cfg,
+        query_spec=groupby_query_spec,
+        input_kind="window_snapshot",
+    )
+    if isinstance(sem_groupby, SemGroupbyFunction):
+        sem_groupby._group_profiles = _FakeMapState()
+        sem_groupby._meta = _FakeValueState(None)
 
     sem_agg = build_sem_agg_operator(
         agg_cfg,
@@ -1086,7 +1194,7 @@ def test_v02_workflow_lotus_inspired_contract_and_counts():
                 src = metadata.get("group_source")
                 if src:
                     group_sources.add(src)
-    assert "async_classify" in group_sources
+    assert "async_assign" in group_sources
     assert any(str(r.get("source", "")).startswith("async_retrieve") for r in retrieval_rows)
 
 
@@ -1191,21 +1299,25 @@ def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
         raise AssertionError("Expected missing summarize async worker to fail fast")
 
 
-def test_v02_workflow_groupby_llm_verify_local_refine_window_owned_scope_close():
+def test_v02_workflow_groupby_async_assignment_window_owned_scope_close():
     events = _build_use_case_events()
     classify_fn = _DeterministicClassifyAsyncFn()
     groupby_qs = GroupbyQuerySpec.simple(
         "Group memory events by topic",
-        backend="llm",
-        assignment_method="llm_verify_local_refine",
     )
     groupby_qs.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
+    groupby_cfg = SemGroupbyConfig(
+        assignment_method="llm",
+        scope_chunk_size=2,
+        refresh_labels_during_maintenance=True,
+    )
 
     memory_rows = _run_memory_path(
         events,
         agg_mode="algebraic",
         classify_async_fn=classify_fn,
         summarize_async_fn=None,
+        groupby_config=groupby_cfg,
         groupby_query_spec=groupby_qs,
     )
 

@@ -17,9 +17,10 @@
 
 """Window-owned bounded semantic grouping.
 
-This A-path runtime processes a closed/bounded ``WindowSnapshot`` as a single
-grouping scope. It does not keep cross-scope group state. Assignments emitted
-from one snapshot do not influence later snapshots.
+This runtime processes one closed ``WindowSnapshot`` as one grouping scope.
+It does not keep cross-scope state. Local assignment methods group events
+inside the snapshot directly. Async semantic methods emit one scope-level
+classification request and only output final assignments after merge-back.
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ from pyflink.semantic_runtime.runtime.event_model import (
     window_snapshot_to_semantic_events,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+    _ASYNC_ASSIGNMENT_METHODS,
+    _LOCAL_ASSIGNMENT_METHODS,
     SemGroupbyConfig,
     _new_group_profile,
     relabel_group_profiles,
@@ -65,7 +68,10 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             self._resolved_assign_threshold,
             self._resolved_new_group_threshold,
         ) = resolve_groupby_runtime_params(self._config, self._query_spec)
-        self._resolved_assignment_method = resolve_groupby_assignment_method(query_spec)
+        self._resolved_assignment_method = resolve_groupby_assignment_method(
+            self._config,
+            query_spec,
+        )
         self._maintenance_trigger_policy = (
             query_spec.maintenance_trigger_policy if query_spec is not None else None
         )
@@ -81,16 +87,21 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
         if not events:
             return
 
+        if self._resolved_assignment_method in _ASYNC_ASSIGNMENT_METHODS:
+            yield (
+                ASYNC_WORK_TAG,
+                AsyncWorkItem(
+                    key=events[0].key,
+                    task_type="classify",
+                    payload=self._build_scope_async_payload(events),
+                ).to_dict(),
+            )
+            return
+
         groups: Dict[str, Dict[str, Any]] = {}
         assignment_rows: List[Dict[str, Any]] = []
-        side_outputs: List[Any] = []
         for event in events:
-            outs = self._assign_within_scope(groups, event)
-            for out in outs:
-                if isinstance(out, tuple):
-                    side_outputs.append(out)
-                else:
-                    assignment_rows.append(out)
+            assignment_rows.extend(self._assign_within_scope(groups, event))
 
         if (
             self._maintenance_trigger_policy is not None
@@ -104,7 +115,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
                 new_group_threshold=self._resolved_new_group_threshold,
                 now_ms=int(time.time() * 1000),
             )
-            if self._resolved_assignment_method == "llm_verify_local_refine":
+            if self._config.refresh_labels_during_maintenance:
                 groups = relabel_group_profiles(groups)
             if merged_into:
                 for row in assignment_rows:
@@ -112,80 +123,28 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
                         str(row.get("group_id", "")),
                         merged_into,
                     )
-                remapped_side_outputs: List[Any] = []
-                for item in side_outputs:
-                    tag, payload = item
-                    if isinstance(payload, dict):
-                        work_payload = dict(payload.get("payload", {}))
-                        tentative_group = work_payload.get("tentative_group")
-                        if tentative_group:
-                            work_payload["tentative_group"] = self._resolve_merged_group_id(
-                                str(tentative_group), merged_into
-                            )
-                            payload = dict(payload)
-                            payload["payload"] = work_payload
-                    remapped_side_outputs.append((tag, payload))
-                side_outputs = remapped_side_outputs
 
         for row in assignment_rows:
             yield row
-        for item in side_outputs:
-            yield item
 
     def _assign_within_scope(
         self,
         groups: Dict[str, Dict[str, Any]],
         event: SemanticEvent,
-    ) -> List[Any]:
+    ) -> List[Dict[str, Any]]:
         now_ms = int(time.time() * 1000)
-        best_group_id, confidence = self._local_assign(groups, event)
+        if self._resolved_assignment_method not in _LOCAL_ASSIGNMENT_METHODS:
+            raise ValueError(
+                f"WindowOwnedSemGroupbyFunction received unsupported local assignment_method={self._resolved_assignment_method!r}."
+            )
 
-        if confidence >= self._resolved_assign_threshold and best_group_id:
+        best_group_id, confidence = self._local_assign(groups, event)
+        if best_group_id and confidence >= self._resolved_assign_threshold:
             self._update_group(groups, best_group_id, event, now_ms)
             return [self._assignment_row(event, best_group_id, confidence, "local")]
 
-        if confidence >= self._resolved_new_group_threshold and best_group_id:
-            self._update_group(groups, best_group_id, event, now_ms)
-            return [
-                self._assignment_row(event, best_group_id, confidence, "tentative"),
-                (
-                    ASYNC_WORK_TAG,
-                    AsyncWorkItem(
-                        key=event.key,
-                        task_type="classify",
-                        payload=self._classify_payload(groups, event.to_dict(), best_group_id),
-                    ).to_dict(),
-                ),
-            ]
-
-        created_group_id = self._maybe_create_group(groups, event, now_ms)
-        if created_group_id is not None:
-            outputs: List[Any] = [
-                self._assignment_row(event, created_group_id, 0.0, "new_group")
-            ]
-            if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
-                outputs.append(
-                    (
-                        ASYNC_WORK_TAG,
-                        AsyncWorkItem(
-                            key=event.key,
-                            task_type="classify",
-                            payload=self._classify_payload(groups, event.to_dict(), created_group_id),
-                        ).to_dict(),
-                    )
-                )
-            return outputs
-
-        return [
-            (
-                ASYNC_WORK_TAG,
-                AsyncWorkItem(
-                    key=event.key,
-                    task_type="classify",
-                    payload=self._classify_payload(groups, event.to_dict(), None),
-                ).to_dict(),
-            )
-        ]
+        created_group_id = self._create_group_or_raise(groups, event, now_ms)
+        return [self._assignment_row(event, created_group_id, confidence, "new_group")]
 
     def _local_assign(
         self,
@@ -244,6 +203,20 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
         groups[group_id] = profile
         return group_id
 
+    def _create_group_or_raise(
+        self,
+        groups: Dict[str, Dict[str, Any]],
+        event: SemanticEvent,
+        now_ms: int,
+    ) -> str:
+        """Create a new group or fail when policy forbids it."""
+        group_id = self._maybe_create_group(groups, event, now_ms)
+        if group_id is None:
+            raise RuntimeError(
+                "sem_groupby window-owned path could not create a new group under the current overflow policy."
+            )
+        return group_id
+
     @staticmethod
     def _assignment_row(
         event: SemanticEvent,
@@ -263,27 +236,15 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             "boundary_flags": dict(event.boundary_flags),
         }
 
-    def _classify_payload(
-        self,
-        groups: Dict[str, Dict[str, Any]],
-        event_dict: Dict[str, Any],
-        tentative_group: Optional[str],
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "event": event_dict,
-            "tentative_group": tentative_group,
+    def _build_scope_async_payload(self, events: List[SemanticEvent]) -> Dict[str, Any]:
+        """Build one scope-level async assignment payload."""
+        return {
+            "events": [event.to_dict() for event in events],
+            "existing_groups": [],
+            "scope_chunk_size": int(self._config.scope_chunk_size),
+            "scope_epoch": 0,
+            "scope_close_pending": True,
         }
-        if self._resolved_assignment_method in {"llm", "llm_verify_local_refine"}:
-            payload["candidate_groups"] = [
-                {
-                    "group_id": group_id,
-                    "label": profile.get("label", ""),
-                    "summary": profile.get("summary", ""),
-                    "event_count": int(profile.get("event_count", 0)),
-                }
-                for group_id, profile in groups.items()
-            ]
-        return payload
 
     @staticmethod
     def _resolve_merged_group_id(group_id: str, merged_into: Dict[str, str]) -> str:

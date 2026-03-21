@@ -149,13 +149,32 @@ class _ClassifyAsyncMergeFunction(KeyedProcessFunction):
             raise RuntimeError(f"classify async bridge failed: {error}")
 
         result = value.get("result", {})
+        assignments = result.get("assignments")
+        if isinstance(assignments, list):
+            for assignment in assignments:
+                yield {
+                    "key": value.get("key", str(ctx.get_current_key())),
+                    "group_id": assignment.get("group_id", "__unclassified__"),
+                    "confidence": float(assignment.get("confidence", 0.0)),
+                    "source": "async_assign",
+                    "event_seq_id": int(assignment.get("event_seq_id", 0)),
+                    "payload": assignment.get("payload", ""),
+                    "event_time_ms": assignment.get("event_time_ms"),
+                    "boundary_flags": dict(assignment.get("boundary_flags", {}) or {}),
+                    "request_id": value.get("request_id", ""),
+                    "metadata": {"async_task_type": "classify", "async_success": True},
+                }
+            return
+
         yield {
             "key": value.get("key", str(ctx.get_current_key())),
             "group_id": result.get("group_id", "__unclassified__"),
             "confidence": float(result.get("confidence", 0.0)),
-            "source": "async_classify",
+            "source": "async_assign",
             "event_seq_id": int(result.get("event_seq_id", 0)),
             "payload": result.get("payload", ""),
+            "event_time_ms": result.get("event_time_ms"),
+            "boundary_flags": dict(result.get("boundary_flags", {}) or {}),
             "request_id": value.get("request_id", ""),
             "metadata": {"async_task_type": "classify", "async_success": True},
         }
@@ -297,10 +316,7 @@ def _wire_async_bridge_if_configured(
 def _groupby_needs_classify_bridge(config: ContinuousRAGConfig) -> bool:
     """Return whether the configured sem_groupby path can emit classify work."""
 
-    query_spec = config.groupby_query_spec
-    if query_spec is not None:
-        return query_spec.assignment_method in {"llm", "llm_verify_local_refine"}
-    return False
+    return config.groupby_config.assignment_method == "llm"
 
 
 def _agg_needs_summarize_bridge(config: ContinuousRAGConfig) -> bool:
