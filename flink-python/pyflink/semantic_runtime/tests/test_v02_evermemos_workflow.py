@@ -1250,7 +1250,6 @@ def test_v02_workflow_retrieve_path_pairwise_topk():
     topk_qs = TopKQuerySpec.simple(
         "Rank the best matching memories for the query",
         k=2,
-        backend="external_score",
     )
     topk_qs.ranking_method = "pairwise"
     retrieval_rows = _run_retrieval_path(

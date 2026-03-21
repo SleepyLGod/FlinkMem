@@ -80,6 +80,8 @@ from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
 
 logger = logging.getLogger(__name__)
 
+_VALID_INTERNAL_TOPK_SCORERS = {"llm", "embedding", "external_score"}
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -108,6 +110,8 @@ class SemTopKConfig:
         ``"delta"`` (emit only on change) or ``"snapshot"`` (emit every update).
     score_field : str
         Name of the score field in candidate records.
+    scorer_backend : str
+        Internal scoring backend chosen by planner/runtime.
     """
     max_candidates: int = 100
     recompute_interval_ms: int = 10_000  # timer-driven recompute
@@ -115,6 +119,14 @@ class SemTopKConfig:
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     emission_policy: str = "delta"       # "delta" | "snapshot"
     score_field: str = "score"           # field name in candidate record
+    scorer_backend: str = "external_score"
+
+    def __post_init__(self) -> None:
+        if self.scorer_backend not in _VALID_INTERNAL_TOPK_SCORERS:
+            raise ValueError(
+                f"Invalid scorer_backend={self.scorer_backend!r}. "
+                f"Must be one of {_VALID_INTERNAL_TOPK_SCORERS}."
+            )
 
 # ---------------------------------------------------------------------------
 # SemTopKFunction
@@ -359,7 +371,7 @@ class SemTopKFunction(KeyedProcessFunction):
             value,
             score_field=self._config.score_field,
             query_version=self._query_spec.query_version,
-            score_backend=self._query_spec.semantic.backend,
+            score_backend=self._config.scorer_backend,
             now_ms=now_ms,
             scope_time_ms=scope_time_ms,
         )

@@ -88,7 +88,7 @@ def resolve_topk_lowering_plan(query_spec: TopKQuerySpec) -> SemanticLoweringPla
             derived_attribute=SemanticDerivedAttributePlan(
                 attribute_kind="score",
                 output_field="score",
-                backend=query_spec.semantic.backend,
+                backend="planner_selected",
                 stable_per_record=True,
                 bounded_context=False,
             ),
@@ -121,7 +121,7 @@ def resolve_groupby_lowering_plan(
             derived_attribute=SemanticDerivedAttributePlan(
                 attribute_kind="label",
                 output_field="group_id",
-                backend=query_spec.semantic.backend,
+                backend="planner_selected",
                 stable_per_record=True,
                 bounded_context=False,
             ),

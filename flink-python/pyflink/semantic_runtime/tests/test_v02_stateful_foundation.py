@@ -730,10 +730,10 @@ class TestSemTopKConfig:
         assert qs.scope_policy.ttl_seconds is None
 
     def test_query_spec_simple(self):
-        qs = TopKQuerySpec.simple("rank by relevance", k=5, backend="llm",
+        qs = TopKQuerySpec.simple("rank by relevance", k=5,
                                   ttl_seconds=600, max_candidates=50)
         assert qs.k == 5
-        assert qs.semantic.backend == "llm"
+        assert qs.semantic.backend == "hybrid"
         assert qs.scope_policy.ttl_seconds == 600
         assert qs.scope_policy.max_candidates == 50
 
@@ -749,7 +749,7 @@ class TestSemTopKConfig:
 
     def test_topk_query_spec_roundtrip_with_session_scope(self):
         spec = TopKQuerySpec(
-            semantic=SemanticSpec.for_sem_topk("rank best weather days", scorer_backend="embedding"),
+            semantic=SemanticSpec.for_sem_topk("rank best weather days"),
             k=4,
             query_id="topk1",
             query_version=3,
@@ -769,6 +769,18 @@ class TestSemTopKConfig:
         assert restored.scope_policy.window_kind == "session"
         assert restored.scope_policy.session_gap_ms == 15000
         assert restored.scope_policy.boundary_flag == "topic_shift"
+
+    def test_public_topk_backend_is_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="does not expose backend selection"):
+            TopKQuerySpec(
+                semantic=SemanticSpec(
+                    instruction="rank best weather days",
+                    backend="embedding",
+                    output_mode="score",
+                )
+            )
 
 
 class TestSemTopKRecompute:

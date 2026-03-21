@@ -212,23 +212,24 @@ def topk_candidate_has_score(value: Dict[str, Any], score_field: str = "score") 
 
 def topk_candidate_needs_scoring(
     value: Dict[str, Any],
-    query_spec: TopKQuerySpec,
+    *,
+    query_version: int,
+    score_backend: str,
     score_field: str = "score",
 ) -> bool:
     """Decide whether the candidate must be re-scored for the active query."""
     if not is_topk_candidate_record(value):
         return False
 
-    backend = query_spec.semantic.backend
-    if backend == "external_score":
+    if score_backend == "external_score":
         return not topk_candidate_has_score(value, score_field)
 
     if not topk_candidate_has_score(value, score_field):
         return True
 
     return (
-        value.get("_query_version") != query_spec.query_version
-        or value.get("_score_backend") != backend
+        value.get("_query_version") != query_version
+        or value.get("_score_backend") != score_backend
     )
 
 
@@ -257,6 +258,7 @@ def build_scored_topk_candidate(
     *,
     score: float,
     query_spec: TopKQuerySpec,
+    score_backend: str,
     score_field: str,
     source: str,
 ) -> Dict[str, Any]:
@@ -267,7 +269,7 @@ def build_scored_topk_candidate(
     out[score_field] = float(score)
     out["_score_version"] = prev_score_version + 1
     out["_query_version"] = query_spec.query_version
-    out["_score_backend"] = query_spec.semantic.backend
+    out["_score_backend"] = score_backend
     out["_updated_ms"] = now_ms
     out["source"] = source
     out["error"] = ""
@@ -340,10 +342,12 @@ class _BaseTopKScorerWorker(AsyncFunction):
     def __init__(
         self,
         query_spec: TopKQuerySpec,
+        score_backend: str,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
         self._query_spec = query_spec
+        self._score_backend = score_backend
         self._score_field = score_field
         self._candidate_text_fields = tuple(candidate_text_fields)
 
@@ -360,10 +364,12 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
     def __init__(
         self,
         query_spec: TopKQuerySpec,
+        score_backend: str,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
         self._query_spec = query_spec
+        self._score_backend = score_backend
         self._score_field = score_field
         self._candidate_text_fields = tuple(candidate_text_fields)
 
@@ -395,13 +401,14 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
         total = len(ranked)
         for idx, (candidate, score) in enumerate(ranked):
             final_score = float(score)
-            if self._query_spec.semantic.backend == "llm":
+            if self._score_backend == "llm":
                 final_score = _position_score(idx, total)
             out.append(
                 build_scored_topk_candidate(
                     candidate,
                     score=final_score,
                     query_spec=self._query_spec,
+                    score_backend=self._score_backend,
                     score_field=self._score_field,
                     source=source,
                 )
@@ -426,6 +433,7 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
                     candidate,
                     score=float(score),
                     query_spec=self._query_spec,
+                    score_backend=self._score_backend,
                     score_field=self._score_field,
                     source=source,
                 )
@@ -461,7 +469,7 @@ class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
-        super().__init__(query_spec, score_field, candidate_text_fields)
+        super().__init__(query_spec, "llm", score_field, candidate_text_fields)
         self._llm_config = llm_config
         self._client = None
 
@@ -526,6 +534,7 @@ class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
                     value,
                     score=max(0.0, min(1.0, score)),
                     query_spec=self._query_spec,
+                    score_backend=self._score_backend,
                     score_field=self._score_field,
                     source="topk_llm_pointwise",
                 )
@@ -553,7 +562,7 @@ class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
-        super().__init__(query_spec, score_field, candidate_text_fields)
+        super().__init__(query_spec, "embedding", score_field, candidate_text_fields)
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
         dim = int(self._embedding_config.dimensions or 128)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
@@ -582,6 +591,7 @@ class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
                 value,
                 score=score,
                 query_spec=self._query_spec,
+                score_backend=self._score_backend,
                 score_field=self._score_field,
                 source="topk_embedding_pointwise",
             )
@@ -601,7 +611,7 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
-        super().__init__(query_spec, score_field, candidate_text_fields)
+        super().__init__(query_spec, "llm", score_field, candidate_text_fields)
         self._llm_config = llm_config
         self._client = None
 
@@ -688,7 +698,7 @@ class _BoundedPoolEmbeddingRerankerWorker(_BaseBoundedPoolRerankerWorker):
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
-        super().__init__(query_spec, score_field, candidate_text_fields)
+        super().__init__(query_spec, "embedding", score_field, candidate_text_fields)
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
         dim = int(self._embedding_config.dimensions or 128)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
@@ -734,6 +744,14 @@ class _BoundedPoolEmbeddingRerankerWorker(_BaseBoundedPoolRerankerWorker):
 class _BoundedPoolExternalScoreRerankerWorker(_BaseBoundedPoolRerankerWorker):
     """Bounded-pool reranker using existing candidate scores."""
 
+    def __init__(
+        self,
+        query_spec: TopKQuerySpec,
+        score_field: str = "score",
+        candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+    ) -> None:
+        super().__init__(query_spec, "external_score", score_field, candidate_text_fields)
+
     async def async_invoke(self, value):
         if not is_topk_candidate_pool(value):
             raise ValueError("topk_contextual_reranker_requires_bounded_pool")
@@ -765,7 +783,7 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
-        super().__init__(query_spec, score_field, candidate_text_fields)
+        super().__init__(query_spec, "llm", score_field, candidate_text_fields)
         self._llm_config = llm_config
         self._client = None
 
@@ -842,7 +860,7 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
                 ranked = await self._rank_pointwise(value)
             else:
                 ranked = await self._rank_contextual(value)
-                if self._query_spec.semantic.backend == "llm":
+                if self._score_backend == "llm":
                     total = len(ranked)
                     ranked = [
                         (candidate, _position_score(idx, total))
@@ -875,7 +893,7 @@ class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
     ) -> None:
-        super().__init__(query_spec, score_field, candidate_text_fields)
+        super().__init__(query_spec, "embedding", score_field, candidate_text_fields)
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
         dim = int(self._embedding_config.dimensions or 128)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
@@ -921,6 +939,14 @@ class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
 
 class _BoundedPoolExternalTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
     """Window-owned bounded-pool external-score executor with final-only emission."""
+
+    def __init__(
+        self,
+        query_spec: TopKQuerySpec,
+        score_field: str = "score",
+        candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+    ) -> None:
+        super().__init__(query_spec, "external_score", score_field, candidate_text_fields)
 
     async def async_invoke(self, value):
         if not is_topk_candidate_pool(value):

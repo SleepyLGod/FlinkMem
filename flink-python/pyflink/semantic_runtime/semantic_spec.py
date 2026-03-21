@@ -27,8 +27,8 @@ continuous semantics such as scope policy, trigger policy, method selection,
 and versioning.
 
 Currently serves:
-  - ``sem_map``: instruction + backend + output_mode + schema
-  - ``sem_topk``: instruction + backend (scorer) + output_mode(score) + threshold + scope
+  - ``sem_map``: instruction + output_mode + schema
+  - ``sem_topk``: instruction + output_mode(score) + threshold + scope
 
 V0.2+ extends this pattern to ``sem_groupby``, ``sem_agg``, and future ``sem_join``.
 """
@@ -124,13 +124,12 @@ class SemanticSpec:
         cls,
         instruction: str = "",
         *,
-        scorer_backend: str = "external_score",
         threshold: Optional[float] = None,
     ) -> "SemanticSpec":
         """Build a SemanticSpec suited for ``sem_topk`` scoring/reranking."""
         return cls(
             instruction=instruction,
-            backend=scorer_backend,
+            backend="hybrid",
             output_mode="score",
             threshold=threshold,
         )
@@ -305,25 +304,24 @@ class TriggerPolicy:
 class TopKQuerySpec:
     """Complete specification for a continuous top-k query.
 
-    Wraps a :class:`SemanticSpec` (criterion / backend / prompt) and adds
+    Wraps a :class:`SemanticSpec` (criterion / prompt) and adds
     the top-k-specific parameters: *k*, query versioning, scope policy,
     ranking method, and trigger policy.
 
     Parameters
     ----------
     semantic : SemanticSpec
-        The semantic criterion (instruction, backend, output_mode, …).
+        The semantic criterion (instruction, output_mode, …).
         ``semantic.instruction`` is the ranking prompt / predicate.
-        ``semantic.backend`` is the scorer backend
-        (``"external_score"``, ``"llm"``, ``"embedding"``).
+        The scoring backend is an internal planner/kernel concern.
     k : int
         Number of top items to maintain.
     query_id : str
         Logical identifier for this continuous query.  Useful when the
         same key space hosts multiple concurrent top-k queries.
     query_version : int
-        Monotonically increasing version.  When the instruction or backend
-        changes, bump this to invalidate cached scores in the state.
+        Monotonically increasing version.  When the instruction changes,
+        bump this to invalidate cached scores in the state.
     ranking_method : str
         Execution strategy for scoring.  ``"pointwise"`` (default) asks the
         backend to score each candidate independently.  ``"pairwise"`` and
@@ -344,6 +342,11 @@ class TopKQuerySpec:
     scope_policy: TopKScopePolicy = field(default_factory=TopKScopePolicy)
 
     def __post_init__(self):
+        if self.semantic.backend != "hybrid":
+            raise ValueError(
+                "TopKQuerySpec does not expose backend selection. "
+                "Use internal planner/kernel config for scorer backend."
+            )
         if self.ranking_method not in VALID_RANKING_METHODS:
             raise ValueError(
                 f"Invalid ranking_method={self.ranking_method!r}. "
@@ -360,7 +363,6 @@ class TopKQuerySpec:
         instruction: str = "",
         *,
         k: int = 10,
-        backend: str = "external_score",
         ttl_seconds: Optional[int] = None,
         max_candidates: Optional[int] = None,
     ) -> "TopKQuerySpec":
@@ -371,13 +373,12 @@ class TopKQuerySpec:
             spec = TopKQuerySpec.simple(
                 "Rank by relevance to user interests",
                 k=5,
-                backend="llm",
                 ttl_seconds=3600,
                 max_candidates=100,
             )
         """
         return cls(
-            semantic=SemanticSpec.for_sem_topk(instruction, scorer_backend=backend),
+            semantic=SemanticSpec.for_sem_topk(instruction),
             k=k,
             trigger_policy=TriggerPolicy(),
             scope_policy=TopKScopePolicy(
@@ -477,6 +478,13 @@ class GroupbyQuerySpec:
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     maintenance_trigger_policy: Optional[TriggerPolicy] = None
     scope_policy: GroupbyScopePolicy = field(default_factory=GroupbyScopePolicy)
+
+    def __post_init__(self) -> None:
+        if self.semantic.backend != "hybrid":
+            raise ValueError(
+                "GroupbyQuerySpec does not expose backend selection. "
+                "Use internal planner/kernel config for grouping backend."
+            )
 
     @classmethod
     def simple(
@@ -580,7 +588,7 @@ class AggQuerySpec:
     semantic: SemanticSpec = field(
         default_factory=lambda: SemanticSpec(
             instruction="Aggregate semantic state over a keyed stream.",
-            backend="rule",
+            backend="hybrid",
             output_mode="summary",
         )
     )
@@ -591,6 +599,11 @@ class AggQuerySpec:
     scope_policy: AggScopePolicy = field(default_factory=AggScopePolicy)
 
     def __post_init__(self):
+        if self.semantic.backend != "hybrid":
+            raise ValueError(
+                "AggQuerySpec does not expose backend selection. "
+                "Use internal planner/kernel config for aggregation backend."
+            )
         if self.agg_method not in VALID_AGG_METHODS:
             raise ValueError(
                 f"Invalid agg_method={self.agg_method!r}. "
@@ -601,7 +614,6 @@ class AggQuerySpec:
         cls,
         instruction: str = "Aggregate semantic state over a keyed stream.",
         *,
-        backend: str = "rule",
         agg_method: str = "algebraic",
         ttl_seconds: Optional[int] = None,
         max_buffer_events: Optional[int] = None,
@@ -610,7 +622,7 @@ class AggQuerySpec:
         return cls(
             semantic=SemanticSpec(
                 instruction=instruction,
-                backend=backend,
+                backend="hybrid",
                 output_mode="summary",
             ),
             agg_method=agg_method,

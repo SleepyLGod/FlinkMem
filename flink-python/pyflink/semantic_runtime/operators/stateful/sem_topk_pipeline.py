@@ -77,7 +77,7 @@ def build_sem_topk_pipeline(
     query_spec : TopKQuerySpec
         Continuous top-k query definition.
     llm_config : LLMClientConfig, optional
-        Required when ``query_spec.semantic.backend == "llm"``.
+        Required when ``topk_config.scorer_backend == "llm"``.
     embedding_config : EmbeddingBackendConfig, optional
         Optional embedding scorer config. Current implementation supports
         only ``backend="mock"`` / ``"local_lexical"``.
@@ -87,7 +87,7 @@ def build_sem_topk_pipeline(
         Max concurrent async scoring requests.
     """
     score_field = topk_config.score_field
-    backend = query_spec.semantic.backend
+    backend = topk_config.scorer_backend
     trigger_mode = query_spec.trigger_policy.mode
     supported_scope_close_kinds = {"session", "tumbling", "semantic"}
 
@@ -217,11 +217,21 @@ def build_sem_topk_pipeline(
             kernel_input = ready
         else:
             ready = candidate_stream.filter(
-                lambda v: not topk_candidate_needs_scoring(v, query_spec, score_field),
+                lambda v: not topk_candidate_needs_scoring(
+                    v,
+                    query_version=query_spec.query_version,
+                    score_backend=backend,
+                    score_field=score_field,
+                ),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             )
             to_score = candidate_stream.filter(
-                lambda v: topk_candidate_needs_scoring(v, query_spec, score_field),
+                lambda v: topk_candidate_needs_scoring(
+                    v,
+                    query_version=query_spec.query_version,
+                    score_backend=backend,
+                    score_field=score_field,
+                ),
                 output_type=Types.PICKLED_BYTE_ARRAY(),
             )
 

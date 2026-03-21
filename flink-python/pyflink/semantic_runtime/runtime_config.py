@@ -211,15 +211,27 @@ def _reject_execution_path(raw: Dict[str, Any], operator_name: str) -> None:
 
 def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
     _reject_execution_path(raw, "sem_topk")
+    if "backend" in raw or "scorer_backend" in raw:
+        raise ValueError(
+            "sem_topk query_spec no longer accepts backend/scorer_backend; "
+            "move scoring backend selection into operators.sem_topk.kernel."
+        )
     if "semantic" in raw:
+        semantic = dict(raw.get("semantic", {}))
+        if "backend" in semantic:
+            raise ValueError(
+                "sem_topk query_spec.semantic no longer accepts backend; "
+                "move scoring backend selection into operators.sem_topk.kernel."
+            )
+        semantic.setdefault("backend", "hybrid")
         out = dict(raw)
+        out["semantic"] = semantic
         out["scope_policy"] = _inject_scope_defaults(
             dict(out.get("scope_policy", {})),
             defaults_ttl_seconds=defaults_ttl_seconds,
         )
         return out
 
-    backend = raw.get("backend", raw.get("scorer_backend", "external_score"))
     scope = _inject_scope_defaults(
         dict(raw.get("scope_policy", {})),
         defaults_ttl_seconds=defaults_ttl_seconds,
@@ -230,7 +242,6 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
     out: Dict[str, Any] = {
         "semantic": SemanticSpec.for_sem_topk(
             raw.get("instruction", ""),
-            scorer_backend=backend,
             threshold=raw.get("threshold"),
         ).to_dict(),
         "k": raw.get("k", 10),
@@ -245,6 +256,11 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
 
 def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
     _reject_execution_path(raw, "sem_groupby")
+    if "backend" in raw:
+        raise ValueError(
+            "sem_groupby query_spec no longer accepts backend; "
+            "move grouping backend selection into operators.sem_groupby.kernel."
+        )
     for legacy_key in ("assignment_method", "assign_threshold", "new_group_threshold"):
         if legacy_key in raw:
             raise ValueError(
@@ -252,7 +268,15 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
                 "move execution/backend tuning into operators.sem_groupby.kernel."
             )
     if "semantic" in raw:
+        semantic = dict(raw.get("semantic", {}))
+        if "backend" in semantic:
+            raise ValueError(
+                "sem_groupby query_spec.semantic no longer accepts backend; "
+                "move grouping backend selection into operators.sem_groupby.kernel."
+            )
+        semantic.setdefault("backend", "hybrid")
         out = dict(raw)
+        out["semantic"] = semantic
         out["scope_policy"] = _inject_scope_defaults(
             dict(out.get("scope_policy", {})),
             defaults_ttl_seconds=defaults_ttl_seconds,
@@ -269,7 +293,7 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
     return {
         "semantic": SemanticSpec(
             instruction=raw.get("instruction", "Assign tuples to semantic groups."),
-            backend=raw.get("backend", "hybrid"),
+            backend="hybrid",
             output_mode="label",
         ).to_dict(),
         "query_id": raw.get("query_id", "default"),
@@ -282,8 +306,21 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
 
 def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) -> Dict[str, Any]:
     _reject_execution_path(raw, "sem_agg")
+    if "backend" in raw:
+        raise ValueError(
+            "sem_agg query_spec no longer accepts backend; "
+            "move backend selection into internal planner/kernel config."
+        )
     if "semantic" in raw:
+        semantic = dict(raw.get("semantic", {}))
+        if "backend" in semantic:
+            raise ValueError(
+                "sem_agg query_spec.semantic no longer accepts backend; "
+                "move backend selection into internal planner/kernel config."
+            )
+        semantic.setdefault("backend", "hybrid")
         out = dict(raw)
+        out["semantic"] = semantic
         out["scope_policy"] = _inject_scope_defaults(
             dict(out.get("scope_policy", {})),
             defaults_ttl_seconds=defaults_ttl_seconds,
@@ -302,7 +339,7 @@ def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) 
     return {
         "semantic": SemanticSpec(
             instruction=raw.get("instruction", "Aggregate semantic state over a keyed stream."),
-            backend=raw.get("backend", "rule"),
+            backend="hybrid",
             output_mode="summary",
         ).to_dict(),
         "query_id": raw.get("query_id", "default"),

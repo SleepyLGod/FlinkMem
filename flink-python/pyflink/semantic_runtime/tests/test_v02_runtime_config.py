@@ -53,7 +53,6 @@ class TestRuntimeConfig:
                         "query_spec": {
                             "semantic": {
                                 "instruction": "rank weather days",
-                                "backend": "llm",
                                 "output_mode": "score",
                             },
                             "k": 5,
@@ -63,6 +62,7 @@ class TestRuntimeConfig:
                         "kernel": {
                             "score_field": "similarity",
                             "recompute_interval_ms": 2000,
+                            "scorer_backend": "llm",
                             "overflow_policy": "drop_newest",
                         },
                     }
@@ -85,7 +85,6 @@ class TestRuntimeConfig:
                         "query_spec": {
                             "semantic": {
                                 "instruction": "label records",
-                                "backend": "embedding",
                                 "output_mode": "label",
                             },
                         }
@@ -96,6 +95,7 @@ class TestRuntimeConfig:
         bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
         assert bundle.lowering_plan.lowering_kind == "derived_attribute_then_classical"
         assert bundle.lowering_plan.classical_operator == "groupby"
+        assert bundle.query_spec.semantic.backend == "hybrid"
 
     def test_agg_runtime_bundle_preserves_native_reduce_view(self):
         cfg = RuntimeConfig.from_dict(
@@ -131,6 +131,25 @@ class TestRuntimeConfig:
         )
         with pytest.raises(ValueError, match="no longer accepts public execution_path"):
             cfg.get_topk_query_spec()
+
+    def test_groupby_query_backend_is_rejected(self):
+        cfg = RuntimeConfig.from_dict(
+            {
+                "operators": {
+                    "sem_groupby": {
+                        "query_spec": {
+                            "semantic": {
+                                "instruction": "label records",
+                                "backend": "embedding",
+                                "output_mode": "label",
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        with pytest.raises(ValueError, match="sem_groupby query_spec.semantic no longer accepts backend"):
+            cfg.get_groupby_query_spec()
 
     def test_join_runtime_bundle_uses_match_lowering(self):
         cfg = RuntimeConfig.from_dict(

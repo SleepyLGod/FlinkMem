@@ -211,10 +211,10 @@ class TestSemanticSpec:
 
     def test_for_sem_topk(self):
         spec = SemanticSpec.for_sem_topk(
-            "Rerank by relevance", scorer_backend="llm", threshold=0.5
+            "Rerank by relevance", threshold=0.5
         )
         assert spec.instruction == "Rerank by relevance"
-        assert spec.backend == "llm"
+        assert spec.backend == "hybrid"
         assert spec.output_mode == "score"
         assert spec.threshold == 0.5
 
@@ -229,11 +229,11 @@ class TestSemanticSpec:
             SemanticSpec(output_mode="unknown")
 
     def test_roundtrip(self):
-        spec = SemanticSpec(instruction="test", backend="embedding", output_mode="score")
+        spec = SemanticSpec(instruction="test", output_mode="score")
         d = spec.to_dict()
         spec2 = SemanticSpec.from_dict(d)
         assert spec2.instruction == "test"
-        assert spec2.backend == "embedding"
+        assert spec2.backend == "llm"
         assert spec2.output_mode == "score"
 
 
@@ -1094,13 +1094,12 @@ class TestAggQuerySpec:
     def test_simple_builder(self):
         spec = AggQuerySpec.simple(
             "Summarize memory state",
-            backend="llm",
             agg_method="summarize",
             ttl_seconds=600,
             max_buffer_events=50,
             flush_interval_ms=10000,
         )
-        assert spec.semantic.backend == "llm"
+        assert spec.semantic.backend == "hybrid"
         assert spec.agg_method == "summarize"
         assert spec.scope_policy.max_buffer_events == 50
 
@@ -1498,7 +1497,6 @@ class TestJoinQuerySpec:
         spec = JoinQuerySpec(
             semantic=SemanticSpec(
                 instruction="Judge semantic join eligibility",
-                backend="llm",
                 output_mode="bool",
             ),
             query_id="join1",
@@ -1519,6 +1517,44 @@ class TestJoinQuerySpec:
         assert restored.pairing_method == "blocking"
         assert restored.trigger_policy.mode == "idle_flush"
         assert restored.scope_policy.window_kind == "sliding"
+
+
+class TestGenericSemanticBackendBoundaries:
+    def test_topk_query_spec_rejects_public_backend(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="does not expose backend selection"):
+            TopKQuerySpec(
+                semantic=SemanticSpec(
+                    instruction="rank by relevance",
+                    backend="embedding",
+                    output_mode="score",
+                )
+            )
+
+    def test_groupby_query_spec_rejects_public_backend(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="does not expose backend selection"):
+            GroupbyQuerySpec(
+                semantic=SemanticSpec(
+                    instruction="group by topic",
+                    backend="llm",
+                    output_mode="label",
+                )
+            )
+
+    def test_agg_query_spec_rejects_public_backend(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="does not expose backend selection"):
+            AggQuerySpec(
+                semantic=SemanticSpec(
+                    instruction="aggregate semantic state",
+                    backend="rule",
+                    output_mode="summary",
+                )
+            )
 
 
 # ============================================================================

@@ -95,11 +95,30 @@ class _FakeOnTimerContext(_FakeContext):
     pass
 
 
-def _make_topk(query_spec: TopKQuerySpec) -> SemTopKFunction:
-    func = SemTopKFunction(
-        SemTopKConfig(max_candidates=16, emission_policy="snapshot", recompute_interval_ms=0),
-        query_spec=query_spec,
+def _resolve_test_topk_config(
+    topk_config: SemTopKConfig | None,
+    *,
+    llm_config: LLMClientConfig | None,
+    embedding_config: EmbeddingBackendConfig | None,
+) -> SemTopKConfig:
+    """Return the internal top-k config used by the pure-Python harness."""
+    if topk_config is not None:
+        return topk_config
+    scorer_backend = "external_score"
+    if llm_config is not None:
+        scorer_backend = "llm"
+    elif embedding_config is not None:
+        scorer_backend = "embedding"
+    return SemTopKConfig(
+        max_candidates=16,
+        emission_policy="snapshot",
+        recompute_interval_ms=0,
+        scorer_backend=scorer_backend,
     )
+
+
+def _make_topk(query_spec: TopKQuerySpec, config: SemTopKConfig) -> SemTopKFunction:
+    func = SemTopKFunction(config, query_spec=query_spec)
     func._candidates = _FakeMapState()
     func._snapshot = _FakeValueState(None)
     func._meta = _FakeValueState(None)
@@ -107,11 +126,11 @@ def _make_topk(query_spec: TopKQuerySpec) -> SemTopKFunction:
     return func
 
 
-def _make_scope_snapshot_emitter(query_spec: TopKQuerySpec) -> SemTopKScopeSnapshotFunction:
-    func = SemTopKScopeSnapshotFunction(
-        SemTopKConfig(max_candidates=16, emission_policy="snapshot", recompute_interval_ms=0),
-        query_spec=query_spec,
-    )
+def _make_scope_snapshot_emitter(
+    query_spec: TopKQuerySpec,
+    config: SemTopKConfig,
+) -> SemTopKScopeSnapshotFunction:
+    func = SemTopKScopeSnapshotFunction(config, query_spec=query_spec)
     func._candidates = _FakeMapState()
     func._meta = _FakeValueState()
     func._metrics = None
@@ -126,11 +145,18 @@ def _run_pipeline_in_memory(
     rows: List[Dict[str, Any]],
     query_spec: TopKQuerySpec,
     *,
+    topk_config: SemTopKConfig | None = None,
     llm_config: LLMClientConfig | None = None,
     embedding_config: EmbeddingBackendConfig | None = None,
 ) -> List[Dict[str, Any]]:
-    topk = _make_topk(query_spec)
-    snapshot_emitter = _make_scope_snapshot_emitter(query_spec)
+    config = _resolve_test_topk_config(
+        topk_config,
+        llm_config=llm_config,
+        embedding_config=embedding_config,
+    )
+    scorer_backend = config.scorer_backend
+    topk = _make_topk(query_spec, config)
+    snapshot_emitter = _make_scope_snapshot_emitter(query_spec, config)
     ctx = _FakeContext("user_1")
     outputs: List[Dict[str, Any]] = []
     score_field = topk._config.score_field
@@ -145,13 +171,13 @@ def _run_pipeline_in_memory(
     llm_worker = None
     embedding_worker = None
     snapshot_pool_worker = None
-    if query_spec.semantic.backend == "llm":
+    if scorer_backend == "llm":
         llm_worker = _PointwiseLLMScorerWorker(
             query_spec,
             llm_config or LLMClientConfig(backend="mock"),
             score_field,
         )
-    elif query_spec.semantic.backend == "embedding":
+    elif scorer_backend == "embedding":
         embedding_worker = _EmbeddingScorerWorker(
             query_spec,
             embedding_config or EmbeddingBackendConfig(backend="mock"),
@@ -163,46 +189,46 @@ def _run_pipeline_in_memory(
             query_spec, topk._config, contextual_plan
         )
         contextual_trigger_mode = contextual_snapshot_spec.trigger_policy.mode
-        snapshot_emitter = _make_scope_snapshot_emitter(contextual_snapshot_spec)
-        if query_spec.semantic.backend == "llm":
+        snapshot_emitter = _make_scope_snapshot_emitter(contextual_snapshot_spec, config)
+        if scorer_backend == "llm":
             snapshot_pool_worker = _BoundedPoolLLMTopKSnapshotWorker(
                 query_spec,
                 llm_config or LLMClientConfig(backend="mock"),
                 score_field,
             )
-        elif query_spec.semantic.backend == "embedding":
+        elif scorer_backend == "embedding":
             snapshot_pool_worker = _BoundedPoolEmbeddingTopKSnapshotWorker(
                 query_spec,
                 embedding_config or EmbeddingBackendConfig(backend="mock"),
                 score_field,
             )
-        elif query_spec.semantic.backend == "external_score":
+        elif scorer_backend == "external_score":
             snapshot_pool_worker = _BoundedPoolExternalTopKSnapshotWorker(
                 query_spec,
                 score_field,
             )
         else:
-            raise AssertionError(f"unexpected backend: {query_spec.semantic.backend}")
+            raise AssertionError(f"unexpected backend: {scorer_backend}")
     elif trigger_mode == "on_scope_close":
-        if query_spec.semantic.backend == "llm":
+        if scorer_backend == "llm":
             snapshot_pool_worker = _BoundedPoolLLMTopKSnapshotWorker(
                 query_spec,
                 llm_config or LLMClientConfig(backend="mock"),
                 score_field,
             )
-        elif query_spec.semantic.backend == "embedding":
+        elif scorer_backend == "embedding":
             snapshot_pool_worker = _BoundedPoolEmbeddingTopKSnapshotWorker(
                 query_spec,
                 embedding_config or EmbeddingBackendConfig(backend="mock"),
                 score_field,
             )
-        elif query_spec.semantic.backend == "external_score":
+        elif scorer_backend == "external_score":
             snapshot_pool_worker = _BoundedPoolExternalTopKSnapshotWorker(
                 query_spec,
                 score_field,
             )
         else:
-            raise AssertionError(f"unexpected backend: {query_spec.semantic.backend}")
+            raise AssertionError(f"unexpected backend: {scorer_backend}")
 
     if trigger_mode not in {"on_event", "on_scope_close", "periodic", "idle_flush", "count_threshold"}:
         raise ValueError("sem_topk currently supports only trigger_policy.mode in {'on_event', 'on_scope_close', 'periodic', 'idle_flush', 'count_threshold'}")
@@ -242,19 +268,18 @@ def _run_pipeline_in_memory(
             candidates = retrieve_to_topk_items(row)
             if candidates:
                 for candidate in candidates:
-                    backend = query_spec.semantic.backend
-                    if backend == "external_score":
+                    if scorer_backend == "external_score":
                         if topk_candidate_has_score(candidate, score_field):
                             outputs.extend(list(topk.process_element(candidate, ctx)))
                         else:
                             raise ValueError(f"topk_missing_external_score:{score_field}")
                     else:
-                        if backend == "llm":
+                        if scorer_backend == "llm":
                             scored_rows = _invoke_async(llm_worker, candidate)
-                        elif backend == "embedding":
+                        elif scorer_backend == "embedding":
                             scored_rows = _invoke_async(embedding_worker, candidate)
                         else:
-                            raise AssertionError(f"unexpected backend: {backend}")
+                            raise AssertionError(f"unexpected backend: {scorer_backend}")
                         for scored in scored_rows:
                             if not (is_topk_candidate_record(scored) and topk_candidate_has_score(scored, score_field)):
                                 raise AssertionError("expected scored top-k candidate")
@@ -275,24 +300,28 @@ def _run_pipeline_in_memory(
         if trigger_mode in {"periodic", "idle_flush", "count_threshold", "on_scope_close"}:
             saw_flat_pointwise = True
 
-        backend = query_spec.semantic.backend
-        if backend == "external_score":
+        if scorer_backend == "external_score":
             if topk_candidate_has_score(row, score_field):
                 outputs.extend(list(topk.process_element(row, ctx)))
             else:
                 raise ValueError(f"topk_missing_external_score:{score_field}")
             continue
 
-        if not topk_candidate_needs_scoring(row, query_spec, score_field):
+        if not topk_candidate_needs_scoring(
+            row,
+            query_version=query_spec.query_version,
+            score_backend=scorer_backend,
+            score_field=score_field,
+        ):
             outputs.extend(list(topk.process_element(row, ctx)))
             continue
 
-        if backend == "llm":
+        if scorer_backend == "llm":
             scored_rows = _invoke_async(llm_worker, row)
-        elif backend == "embedding":
+        elif scorer_backend == "embedding":
             scored_rows = _invoke_async(embedding_worker, row)
         else:
-            raise AssertionError(f"unexpected backend: {backend}")
+            raise AssertionError(f"unexpected backend: {scorer_backend}")
 
         for scored in scored_rows:
             if not (is_topk_candidate_record(scored) and topk_candidate_has_score(scored, score_field)):
@@ -372,34 +401,50 @@ class TestTopKPipelineHelpers:
         assert is_topk_candidate_record({"candidate_id": ""}) is False
 
     def test_external_score_needs_only_missing_score(self):
-        spec = TopKQuerySpec.simple("rank weather days", backend="external_score")
+        spec = TopKQuerySpec.simple("rank weather days")
         ready = {"candidate_id": "c1", "score": 0.8}
         missing = {"candidate_id": "c2"}
-        assert topk_candidate_needs_scoring(ready, spec) is False
-        assert topk_candidate_needs_scoring(missing, spec) is True
+        assert topk_candidate_needs_scoring(
+            ready,
+            query_version=spec.query_version,
+            score_backend="external_score",
+        ) is False
+        assert topk_candidate_needs_scoring(
+            missing,
+            query_version=spec.query_version,
+            score_backend="external_score",
+        ) is True
 
     def test_llm_needs_rescore_on_stale_query_version(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         row = {
             "candidate_id": "c1",
             "score": 0.9,
             "_query_version": 0,
             "_score_backend": "llm",
         }
-        assert topk_candidate_needs_scoring(row, spec) is True
+        assert topk_candidate_needs_scoring(
+            row,
+            query_version=spec.query_version,
+            score_backend="llm",
+        ) is True
 
     def test_llm_ready_when_backend_and_version_match(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         row = {
             "candidate_id": "c1",
             "score": 0.9,
             "_query_version": spec.query_version,
             "_score_backend": "llm",
         }
-        assert topk_candidate_needs_scoring(row, spec) is False
+        assert topk_candidate_needs_scoring(
+            row,
+            query_version=spec.query_version,
+            score_backend="llm",
+        ) is False
 
     def test_contextual_plan_pairwise_uses_tournament_of_pairs(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         spec.ranking_method = "pairwise"
         plan = derive_topk_contextual_plan(spec, SemTopKConfig())
         assert plan == TopKContextualPlan(
@@ -410,14 +455,14 @@ class TestTopKPipelineHelpers:
         )
 
     def test_contextual_plan_listwise_defaults_to_global_rank(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         spec.ranking_method = "listwise"
         plan = derive_topk_contextual_plan(spec, SemTopKConfig())
         assert plan.context_chunk_size is None
         assert plan.merge_strategy == "global_rank"
 
     def test_contextual_sliding_scope_close_uses_epoch_surrogate(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         spec.ranking_method = "pairwise"
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.window_kind = "sliding"
@@ -429,7 +474,7 @@ class TestTopKPipelineHelpers:
         assert eff.trigger_policy.interval_ms == 60000
 
     def test_contextual_ttl_scope_close_uses_periodic_surrogate(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         spec.ranking_method = "listwise"
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.ttl_seconds = 30
@@ -442,7 +487,7 @@ class TestTopKPipelineHelpers:
 
 class TestPointwiseScorers:
     def test_pointwise_llm_mock_scores_candidate(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="llm")
+        spec = TopKQuerySpec.simple("best weather days")
         worker = _PointwiseLLMScorerWorker(spec, LLMClientConfig(backend="mock"))
         row = {
             "key": "user_1",
@@ -458,7 +503,7 @@ class TestPointwiseScorers:
         assert out["source"] == "topk_llm_pointwise"
 
     def test_embedding_mock_scores_candidate(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="embedding")
+        spec = TopKQuerySpec.simple("best weather days")
         worker = _EmbeddingScorerWorker(spec, EmbeddingBackendConfig(backend="mock"))
         row = {
             "key": "user_1",
@@ -473,7 +518,7 @@ class TestPointwiseScorers:
         assert out["source"] == "topk_embedding_pointwise"
 
     def test_embedding_local_hashing_scores_candidate(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="embedding")
+        spec = TopKQuerySpec.simple("best weather days")
         worker = _EmbeddingScorerWorker(
             spec,
             EmbeddingBackendConfig(backend="local_hashing", dimensions=64),
@@ -490,7 +535,7 @@ class TestPointwiseScorers:
         assert out["_score_backend"] == "embedding"
 
     def test_embedding_unsupported_backend_fails_fast(self):
-        spec = TopKQuerySpec.simple("best weather days", backend="embedding")
+        spec = TopKQuerySpec.simple("best weather days")
         worker = _EmbeddingScorerWorker(spec, EmbeddingBackendConfig(backend="remote_api"))
         row = {
             "key": "user_1",
@@ -511,7 +556,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "on_scope_close"
         rows = [
@@ -540,7 +584,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.window_kind = "sliding"
@@ -564,7 +607,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.window_kind = "session"
@@ -599,7 +641,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.window_kind = "semantic"
@@ -636,7 +677,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "periodic"
         spec.trigger_policy.interval_ms = 50
@@ -667,7 +707,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "idle_flush"
         spec.trigger_policy.idle_ms = 50
@@ -698,7 +737,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.trigger_policy.mode = "count_threshold"
         spec.trigger_policy.count_threshold = 2
@@ -732,7 +770,7 @@ class TestTopKPipelineInMemory:
         assert snapshots[0]["top_ids"] == ["d2"]
 
     def test_auto_periodic_contextual_emits_on_timer(self):
-        spec = TopKQuerySpec.simple("best sunny weather days", k=1, backend="llm")
+        spec = TopKQuerySpec.simple("best sunny weather days", k=1)
         spec.ranking_method = "pairwise"
         spec.trigger_policy.mode = "periodic"
         spec.trigger_policy.interval_ms = 50
@@ -756,7 +794,7 @@ class TestTopKPipelineInMemory:
         assert snapshots[0]["top_ids"] == ["d2"]
 
     def test_auto_scope_close_pointwise_splits_pool_and_flat(self):
-        spec = TopKQuerySpec.simple("best sunny weather days", k=1, backend="embedding")
+        spec = TopKQuerySpec.simple("best sunny weather days", k=1)
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.window_kind = "session"
         spec.scope_policy.session_gap_ms = 50
@@ -798,7 +836,7 @@ class TestTopKPipelineInMemory:
         assert ("f1",) in top_id_sets
 
     def test_pointwise_auto_expands_bounded_pool(self):
-        spec = TopKQuerySpec.simple("best weather days", k=1, backend="embedding")
+        spec = TopKQuerySpec.simple("best weather days", k=1)
         rows = [
             {
                 "key": "user_1",
@@ -824,7 +862,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="llm",
         )
         spec.ranking_method = "pairwise"
         rows = [
@@ -850,7 +887,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="llm",
         )
         spec.ranking_method = "pairwise"
         spec.trigger_policy.mode = "on_scope_close"
@@ -881,7 +917,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="embedding",
         )
         spec.ranking_method = "listwise"
         spec.trigger_policy.mode = "on_scope_close"
@@ -913,7 +948,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="llm",
         )
         spec.ranking_method = "listwise"
         spec.trigger_policy.mode = "periodic"
@@ -940,7 +974,6 @@ class TestTopKPipelineInMemory:
         spec = TopKQuerySpec.simple(
             "best sunny weather days",
             k=1,
-            backend="llm",
         )
         spec.ranking_method = "listwise"
         rows = [
@@ -957,7 +990,7 @@ class TestTopKPipelineInMemory:
         assert snapshots[0]["top_ids"] == ["d1"]
 
     def test_external_score_pipeline_emits_topk(self):
-        spec = TopKQuerySpec.simple("best weather days", k=2, backend="external_score")
+        spec = TopKQuerySpec.simple("best weather days", k=2)
         rows = [
             {"key": "user_1", "candidate_id": "d1", "score": 0.3, "query": "best weather"},
             {"key": "user_1", "candidate_id": "d2", "score": 0.9, "query": "best weather"},
@@ -969,7 +1002,7 @@ class TestTopKPipelineInMemory:
         assert snapshots[-1]["top_ids"] == ["d2", "d3"]
 
     def test_llm_pointwise_pipeline_scores_then_emits_topk(self):
-        spec = TopKQuerySpec.simple("best weather days", k=2, backend="llm")
+        spec = TopKQuerySpec.simple("best weather days", k=2)
         rows = [
             {
                 "key": "user_1",
@@ -996,7 +1029,7 @@ class TestTopKPipelineInMemory:
         assert set(snapshots[-1]["top_ids"]) == {"d1", "d3"}
 
     def test_embedding_pipeline_scores_then_emits_topk(self):
-        spec = TopKQuerySpec.simple("best weather days", k=1, backend="embedding")
+        spec = TopKQuerySpec.simple("best weather days", k=1)
         rows = [
             {
                 "key": "user_1",
@@ -1017,7 +1050,7 @@ class TestTopKPipelineInMemory:
         assert snapshots[-1]["top_ids"] == ["d2"]
 
     def test_passthrough_records_survive(self):
-        spec = TopKQuerySpec.simple("best weather days", k=1, backend="external_score")
+        spec = TopKQuerySpec.simple("best weather days", k=1)
         rows = [
             {
                 "key": "user_1",
@@ -1035,7 +1068,7 @@ class TestTopKPipelineInMemory:
         assert out[0]["source"] == "cache"
 
     def test_llm_pairwise_bounded_pool_emits_topk(self):
-        spec = TopKQuerySpec.simple("best sunny weather days", k=2, backend="llm")
+        spec = TopKQuerySpec.simple("best sunny weather days", k=2)
         spec.ranking_method = "pairwise"
         rows = [
             {
@@ -1056,7 +1089,7 @@ class TestTopKPipelineInMemory:
         assert set(snapshots[-1]["top_ids"]) == {"d1", "d3"}
 
     def test_embedding_listwise_bounded_pool_emits_topk(self):
-        spec = TopKQuerySpec.simple("best sunny weather days", k=1, backend="embedding")
+        spec = TopKQuerySpec.simple("best sunny weather days", k=1)
         spec.ranking_method = "listwise"
         rows = [
             {
