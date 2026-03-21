@@ -1,7 +1,7 @@
 """Semantic runtime public API."""
 
 from pyflink.semantic_runtime.public_api import (
-    SemanticContext,
+    SemContext,
     SemAggRequest,
     SemFilterRequest,
     SemGroupbyRequest,
@@ -22,7 +22,7 @@ from pyflink.semantic_runtime.public_api import (
 )
 
 __all__ = [
-    "SemanticContext",
+    "SemContext",
     "SemMapRequest",
     "SemFilterRequest",
     "SemLocalTopKRequest",

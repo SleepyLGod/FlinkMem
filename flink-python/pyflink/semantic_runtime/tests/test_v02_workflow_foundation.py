@@ -16,7 +16,7 @@ if not _SEM_RUNTIME_DST.exists():
     os.symlink(_SEM_RUNTIME_SRC, _SEM_RUNTIME_DST)
 
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig
-from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec, TopKQuerySpec
+from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec, TopKQuerySpec
 from pyflink.semantic_runtime.runtime.continuous_rag_components import (
     MEMORY_EVENT_TAG,
     QUERY_REQUEST_TAG,
@@ -28,7 +28,7 @@ from pyflink.semantic_runtime.runtime.continuous_rag_workflow import (
     build_continuous_rag_workflow_from_runtime_config,
     validate_rag_config,
 )
-from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig
+from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig
 from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
 from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig

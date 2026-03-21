@@ -18,7 +18,7 @@
 """
 Canonical event model and key schema for V0.2 stateful semantic operators.
 
-All V0.2 stateful operators expect events in the :class:`SemanticEvent` shape.
+All V0.2 stateful operators expect events in the :class:`SemEvent` shape.
 Key extraction helpers are provided to produce stable Flink key-by selectors.
 """
 
@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SemanticEvent:
+class SemEvent:
     """Canonical event payload for V0.2 operators.
 
     Required fields
@@ -83,7 +83,7 @@ class SemanticEvent:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SemanticEvent":
+    def from_dict(cls, d: Dict[str, Any]) -> "SemEvent":
         """Deserialise from a plain dict."""
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
@@ -139,15 +139,15 @@ def is_window_snapshot(d: Dict[str, Any]) -> bool:
     )
 
 
-def window_snapshot_to_semantic_events(
+def window_snapshot_to_sem_events(
     snap: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Convert a WindowSnapshot dict into a list of SemanticEvent dicts.
+    """Convert a WindowSnapshot dict into a list of SemEvent dicts.
 
     Each original event stored in the snapshot is unwrapped.  If the
-    stored events are already SemanticEvent-shaped they are returned
+    stored events are already SemEvent-shaped they are returned
     as-is with ``window_id`` injected into ``metadata``.  Otherwise a
-    minimal SemanticEvent is synthesised with the event text as
+    minimal SemEvent is synthesised with the event text as
     ``payload``.
 
     This is the **Subflow A adapter** that sits between ``sem_window``
@@ -161,13 +161,13 @@ def window_snapshot_to_semantic_events(
     result: List[Dict[str, Any]] = []
     for idx, evt in enumerate(events):
         if isinstance(evt, dict) and "payload" in evt and "seq_id" in evt:
-            # Already SemanticEvent-shaped — inject window provenance
+            # Already SemEvent-shaped — inject window provenance
             out = dict(evt)
             out.setdefault("metadata", {})
             out["metadata"]["window_id"] = window_id
             out["metadata"]["window_trigger"] = snap.get("trigger_reason", "")
         else:
-            # Raw event — wrap into SemanticEvent shape
+            # Raw event — wrap into SemEvent shape
             out = {
                 "key": key,
                 "payload": str(evt) if not isinstance(evt, dict)
@@ -188,7 +188,7 @@ def window_snapshot_to_semantic_events(
 def window_snapshot_to_summary_event(
     snap: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Convert a WindowSnapshot dict into a single summary SemanticEvent dict.
+    """Convert a WindowSnapshot dict into a single summary SemEvent dict.
 
     The ``payload`` is a concatenation of all event payloads in the window,
     which is suitable for downstream aggregation operators that expect one
@@ -220,14 +220,14 @@ def window_snapshot_to_summary_event(
     }
 
 
-def group_assignment_to_semantic_event(
+def group_assignment_to_sem_event(
     assignment: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Normalize a sem_groupby assignment into a SemanticEvent dict.
+    """Normalize a sem_groupby assignment into a SemEvent dict.
 
     This adapter is used between ``sem_groupby`` and ``sem_agg`` so the
     aggregation stage always receives a stable event envelope with required
-    SemanticEvent fields.
+    SemEvent fields.
     """
     key = assignment.get("key", "")
     seq_id = int(assignment.get("event_seq_id", assignment.get("seq_id", 0)))

@@ -24,12 +24,12 @@ from typing import Any, Dict, List, Optional
 
 from pyflink.datastream.functions import KeyedProcessFunction
 
-from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
+from pyflink.semantic_runtime.sem_spec import AggQuerySpec
 from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
 from pyflink.semantic_runtime.runtime.event_model import (
-    SemanticEvent,
+    SemEvent,
     is_window_snapshot,
-    window_snapshot_to_semantic_events,
+    window_snapshot_to_sem_events,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_agg import (
     SemAggConfig,
@@ -64,10 +64,10 @@ class WindowOwnedSemAggFunction(KeyedProcessFunction):
         if not is_window_snapshot(value):
             return
 
-        raw_events = list(window_snapshot_to_semantic_events(value))
+        raw_events = list(window_snapshot_to_sem_events(value))
         if not raw_events:
             return
-        events = [SemanticEvent.from_dict(e) for e in raw_events]
+        events = [SemEvent.from_dict(e) for e in raw_events]
         now_ms = int(time.time() * 1000)
 
         if self._resolved_mode == "algebraic":

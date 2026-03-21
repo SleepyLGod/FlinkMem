@@ -48,53 +48,107 @@ def _stateful_runtime_config() -> RuntimeConfig:
     )
 
 
-def test_build_sem_map_from_request() -> None:
-    cfg = _row_runtime_config(
-        "sem_map",
-        response='{"sentiment":"positive","confidence":0.9}',
+def test_apply_sem_map_from_request_uses_pushdown(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_apply_sem_map_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.map_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_map_pushdown",
+        fake_apply_sem_map_pushdown,
     )
-    op = facade_builders.build_sem_map_from_request(
-        sem_map(intent="Extract sentiment: {input}", output_schema={"sentiment": str}),
-        cfg,
+
+    result = facade_builders.apply_sem_map_from_request(
+        sentinel.input_ds,
+        request=sem_map(intent="Extract sentiment", output_schema={"sentiment": str}),
+        runtime_config=_row_runtime_config("sem_map", response='{"sentiment":"positive"}'),
     )
-    assert op.__class__.__name__ == "SemMapFunction"
+
+    assert result is sentinel.map_stream
+    assert captured["args"] == (sentinel.input_ds,)
 
 
-def test_build_sem_filter_from_request() -> None:
-    cfg = _row_runtime_config(
-        "sem_filter",
-        response='{"decision": true, "confidence": 0.9, "reason": "ok"}',
+def test_apply_sem_filter_from_request_uses_pushdown(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_apply_sem_filter_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.filter_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_filter_pushdown",
+        fake_apply_sem_filter_pushdown,
     )
-    op = facade_builders.build_sem_filter_from_request(
-        sem_filter(intent="Keep weather-related events"),
-        cfg,
+
+    result = facade_builders.apply_sem_filter_from_request(
+        sentinel.input_ds,
+        request=sem_filter(intent="Keep weather-related events"),
+        runtime_config=_row_runtime_config(
+            "sem_filter",
+            response='{"decision": true, "confidence": 0.9, "reason": "ok"}',
+        ),
     )
-    assert op.__class__.__name__ == "SemFilterFunction"
+
+    assert result is sentinel.filter_stream
+    assert captured["args"] == (sentinel.input_ds,)
 
 
-def test_build_sem_local_topk_from_request() -> None:
-    cfg = _row_runtime_config("sem_local_topk", response='["B","A"]')
-    op = facade_builders.build_sem_local_topk_from_request(
-        sem_local_topk(intent="Rank candidates", k=2),
-        cfg,
+def test_apply_sem_local_topk_from_request_uses_pushdown(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_apply_sem_local_topk_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.topk_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_local_topk_pushdown",
+        fake_apply_sem_local_topk_pushdown,
+    )
+
+    result = facade_builders.apply_sem_local_topk_from_request(
+        sentinel.input_ds,
+        request=sem_local_topk(intent="Rank candidates", k=2),
+        runtime_config=_row_runtime_config("sem_local_topk", response='["B","A"]'),
         candidates_field="items",
     )
-    assert op.__class__.__name__ == "SemLocalTopKFunction"
+
+    assert result is sentinel.topk_stream
+    assert captured["args"] == (sentinel.input_ds,)
+    assert captured["kwargs"]["candidates_field"] == "items"
 
 
-def test_build_sem_lookup_join_from_request() -> None:
-    cfg = _row_runtime_config(
-        "sem_lookup_join",
-        response='{"matched":"candidate_1","score":0.9}',
+def test_apply_sem_lookup_join_from_request_uses_pushdown(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_apply_sem_lookup_join_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.lookup_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_lookup_join_pushdown",
+        fake_apply_sem_lookup_join_pushdown,
     )
-    op = facade_builders.build_sem_lookup_join_from_request(
-        sem_lookup_join(
+
+    result = facade_builders.apply_sem_lookup_join_from_request(
+        sentinel.input_ds,
+        request=sem_lookup_join(
             intent="Join with the most relevant memory",
             candidate_source=["candidate_1", "candidate_2"],
         ),
-        cfg,
+        runtime_config=_row_runtime_config(
+            "sem_lookup_join",
+            response='{"matched": true, "match_score": 0.9, "selected_candidate": "candidate_1", "reason": "ok"}',
+        ),
     )
-    assert op.__class__.__name__ == "SemLookupJoinFunction"
+
+    assert result is sentinel.lookup_stream
+    assert captured["args"] == (sentinel.input_ds,)
 
 
 def test_build_sem_window_from_request() -> None:
@@ -124,14 +178,14 @@ def test_build_sem_agg_from_request() -> None:
 def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_build_sem_topk_pipeline(*args, **kwargs):
+    def fake_apply_sem_topk_pushdown(*args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
         return sentinel.stream
 
     monkeypatch.setattr(
-        "pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline.build_sem_topk_pipeline",
-        fake_build_sem_topk_pipeline,
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_topk_pushdown",
+        fake_apply_sem_topk_pushdown,
     )
 
     result = facade_builders.build_sem_topk_from_request(
@@ -144,6 +198,51 @@ def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
     assert result is sentinel.stream
     assert captured["args"] == (sentinel.input_ds,)
     kwargs = captured["kwargs"]
-    assert kwargs["key_selector"] is sentinel.key_selector
-    assert kwargs["query_spec"].k == 3
-    assert kwargs["query_spec"].trigger_policy.mode == "on_scope_close"
+    assert kwargs["request"].k == 3
+    assert kwargs["runtime_config"].__class__.__name__ == "RuntimeConfig"
+
+
+def test_apply_sem_groupby_from_request_uses_pushdown_for_window(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_apply_sem_groupby_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.grouped_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_groupby_pushdown",
+        fake_apply_sem_groupby_pushdown,
+    )
+
+    result = facade_builders.apply_sem_groupby_from_request(
+        sentinel.input_ds,
+        request=sem_groupby(intent="Group by topic", context=context("window")),
+        runtime_config=_stateful_runtime_config(),
+    )
+
+    assert result is sentinel.grouped_stream
+    assert captured["args"] == (sentinel.input_ds,)
+
+
+def test_apply_sem_agg_from_request_uses_pushdown_for_window_algebraic(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_apply_sem_agg_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.agg_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_agg_pushdown",
+        fake_apply_sem_agg_pushdown,
+    )
+
+    result = facade_builders.apply_sem_agg_from_request(
+        sentinel.input_ds,
+        request=sem_agg(intent="Aggregate totals", mode="algebraic", context=context("window")),
+        runtime_config=_stateful_runtime_config(),
+    )
+
+    assert result is sentinel.agg_stream
+    assert captured["args"] == (sentinel.input_ds,)

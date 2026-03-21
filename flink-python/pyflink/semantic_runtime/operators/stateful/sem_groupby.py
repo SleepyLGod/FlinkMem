@@ -47,9 +47,9 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
     build_ttl_config,
 )
 from pyflink.semantic_runtime.runtime.event_model import (
-    SemanticEvent,
+    SemEvent,
     is_window_snapshot,
-    window_snapshot_to_semantic_events,
+    window_snapshot_to_sem_events,
 )
 from pyflink.semantic_runtime.runtime.async_bridge import (
     ASYNC_WORK_TAG,
@@ -63,7 +63,7 @@ from pyflink.semantic_runtime.runtime.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
-from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
+from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 
 logger = logging.getLogger(__name__)
@@ -548,7 +548,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
         # Detect WindowSnapshot input → expand into individual events
         if isinstance(value, dict) and is_window_snapshot(value):
-            for sub_event_dict in window_snapshot_to_semantic_events(value):
+            for sub_event_dict in window_snapshot_to_sem_events(value):
                 yield from self._process_single_event(sub_event_dict, ctx, now_ms)
             return
 
@@ -561,13 +561,13 @@ class SemGroupbyFunction(KeyedProcessFunction):
         ctx: "KeyedProcessFunction.Context",
         now_ms: int,
     ) -> Iterable[Any]:
-        """Process a single SemanticEvent-shaped dict."""
-        # Parse as SemanticEvent
+        """Process a single SemEvent-shaped dict."""
+        # Parse as SemEvent
         if isinstance(value, dict):
-            event = SemanticEvent.from_dict(value)
+            event = SemEvent.from_dict(value)
             event_dict = value
         else:
-            event = SemanticEvent(
+            event = SemEvent(
                 key=str(ctx.get_current_key()), payload=str(value), seq_id=0,
             )
             event_dict = event.to_dict()
@@ -711,7 +711,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
     # -- internals -----------------------------------------------------------
 
-    def _local_assign(self, event: SemanticEvent) -> Tuple[Optional[str], float]:
+    def _local_assign(self, event: SemEvent) -> Tuple[Optional[str], float]:
         """Return the best local candidate group and its score."""
         best_id, best_score = None, 0.0
 
@@ -769,7 +769,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         existing_groups = self._existing_groups_payload()
         if len(events) == 1:
             event = dict(events[0])
-            semantic_event = SemanticEvent.from_dict(event)
+            semantic_event = SemEvent.from_dict(event)
             suggested_group_id, suggested_score = self._local_assign(semantic_event)
             return {
                 "event": event,
@@ -820,7 +820,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self,
         *,
         event_dict: Dict[str, Any],
-        event: SemanticEvent,
+        event: SemEvent,
         meta: Dict[str, Any],
     ) -> Iterable[Any]:
         """Append one event to the async chunk and emit work when full."""
@@ -851,7 +851,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             if profile is not None
         ]
 
-    def _assign_locally(self, event: SemanticEvent, now_ms: int) -> Dict[str, Any]:
+    def _assign_locally(self, event: SemEvent, now_ms: int) -> Dict[str, Any]:
         """Assign one event using the configured local method."""
         best_group_id, confidence = self._local_assign(event)
         if best_group_id and confidence >= self._resolved_assign_threshold:
@@ -863,7 +863,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
     @staticmethod
     def _assignment_row(
-        event: SemanticEvent,
+        event: SemEvent,
         group_id: str,
         confidence: float,
         source: str,
@@ -882,7 +882,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         }
 
     def _update_group(
-        self, group_id: str, event: SemanticEvent, now_ms: int
+        self, group_id: str, event: SemEvent, now_ms: int
     ) -> None:
         """Increment group counters and update timestamp."""
         profile = self._group_profiles.get(group_id)
@@ -893,7 +893,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._group_profiles.put(group_id, profile)
 
     def _maybe_create_group(
-        self, event: SemanticEvent, now_ms: int
+        self, event: SemEvent, now_ms: int
     ) -> Optional[str]:
         """Create a new group if under the limit. Returns group_id or None.
 
@@ -918,7 +918,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._group_profiles.put(group_id, profile)
         return group_id
 
-    def _create_group_or_raise(self, event: SemanticEvent, now_ms: int) -> str:
+    def _create_group_or_raise(self, event: SemEvent, now_ms: int) -> str:
         """Create a new group or fail when policy forbids it."""
         group_id = self._maybe_create_group(event, now_ms)
         if group_id is None:
@@ -940,7 +940,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if not group_id:
             raise RuntimeError("sem_groupby async classify returned no group_id")
 
-        event = SemanticEvent(
+        event = SemEvent(
             key=str(payload.get("key", "") or ""),
             payload=str(payload.get("payload", "") or ""),
             seq_id=int(payload.get("event_seq_id", 0)),

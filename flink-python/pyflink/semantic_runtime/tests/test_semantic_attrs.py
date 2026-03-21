@@ -7,7 +7,7 @@ import asyncio
 import json
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.row._semantic_attrs import (
+from pyflink.semantic_runtime.runtime.steps import (
     SemLabelFunction,
     SemMatchFunction,
     SemScoreFunction,

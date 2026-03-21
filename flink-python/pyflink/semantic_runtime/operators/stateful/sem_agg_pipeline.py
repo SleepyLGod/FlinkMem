@@ -28,9 +28,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from pyflink.semantic_runtime.semantic_spec import AggQuerySpec
-from pyflink.semantic_runtime.runtime.semantic_lowering import (
-    SemanticLoweringPlan,
+from pyflink.semantic_runtime.sem_spec import AggQuerySpec
+from pyflink.semantic_runtime.runtime.plans import (
+    SemLoweringPlan,
     resolve_agg_lowering_plan,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
@@ -41,7 +41,7 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg_window import WindowOwn
 class AggExecutionPlan:
     execution_path: str = "operator_owned"
     input_kind: str = "event_stream"
-    lowering_plan: Optional[SemanticLoweringPlan] = None
+    lowering_plan: Optional[SemLoweringPlan] = None
 
 
 def resolve_agg_execution_plan(

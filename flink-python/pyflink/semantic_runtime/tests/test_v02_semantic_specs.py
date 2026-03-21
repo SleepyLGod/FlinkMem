@@ -18,13 +18,13 @@ import time
 
 import pytest
 
-from pyflink.semantic_runtime.runtime.event_model import SemanticEvent
+from pyflink.semantic_runtime.runtime.event_model import SemEvent
 from pyflink.semantic_runtime.runtime.timer_policy import TimerCategory, encode_timer_key
 from pyflink.semantic_runtime.runtime.state_descriptors import OverflowPolicy
 from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG
 from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
-from pyflink.semantic_runtime.semantic_spec import (
-    SemanticSpec,
+from pyflink.semantic_runtime.sem_spec import (
+    SemSpec,
     TriggerPolicy,
     GroupbyQuerySpec,
     GroupbyScopePolicy,
@@ -52,7 +52,7 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
     resolve_agg_execution_plan,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_agg_window import WindowOwnedSemAggFunction
-from pyflink.semantic_runtime.runtime.semantic_lowering import (
+from pyflink.semantic_runtime.runtime.plans import (
     resolve_topk_lowering_plan,
     resolve_groupby_lowering_plan,
     resolve_agg_lowering_plan,
@@ -151,8 +151,8 @@ def _split_outputs(items):
     return main, side
 
 
-from pyflink.semantic_runtime.semantic_spec import (
-    SemanticSpec,
+from pyflink.semantic_runtime.sem_spec import (
+    SemSpec,
     TriggerPolicy,
     GroupbyQuerySpec,
     GroupbyScopePolicy,
@@ -178,7 +178,7 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
 from pyflink.semantic_runtime.operators.stateful.sem_agg_window import (
     WindowOwnedSemAggFunction,
 )
-from pyflink.semantic_runtime.runtime.semantic_lowering import (
+from pyflink.semantic_runtime.runtime.plans import (
     resolve_topk_lowering_plan,
     resolve_groupby_lowering_plan,
     resolve_agg_lowering_plan,
@@ -186,9 +186,9 @@ from pyflink.semantic_runtime.runtime.semantic_lowering import (
 )
 
 
-class TestSemanticSpec:
+class TestSemSpec:
     def test_defaults(self):
-        spec = SemanticSpec()
+        spec = SemSpec()
         assert spec.backend == "llm"
         assert spec.output_mode == "json"
         assert spec.instruction == ""
@@ -196,7 +196,7 @@ class TestSemanticSpec:
         assert spec.threshold is None
 
     def test_for_sem_map(self):
-        spec = SemanticSpec.for_sem_map(
+        spec = SemSpec.for_sem_map(
             "Extract sentiment", output_schema={"sentiment": str}
         )
         assert spec.instruction == "Extract sentiment"
@@ -205,20 +205,20 @@ class TestSemanticSpec:
         assert spec.schema == {"sentiment": str}
 
     def test_for_sem_map_text_mode(self):
-        spec = SemanticSpec.for_sem_map("Summarize", return_mode="text")
+        spec = SemSpec.for_sem_map("Summarize", return_mode="text")
         assert spec.backend == "hybrid"
         assert spec.output_mode == "text"
         assert spec.schema is None
 
     def test_for_sem_filter(self):
-        spec = SemanticSpec.for_sem_filter("Keep weather-related events", threshold=0.8)
+        spec = SemSpec.for_sem_filter("Keep weather-related events", threshold=0.8)
         assert spec.instruction == "Keep weather-related events"
         assert spec.backend == "hybrid"
         assert spec.output_mode == "bool"
         assert spec.threshold == 0.8
 
     def test_for_sem_topk(self):
-        spec = SemanticSpec.for_sem_topk(
+        spec = SemSpec.for_sem_topk(
             "Rerank by relevance", threshold=0.5
         )
         assert spec.instruction == "Rerank by relevance"
@@ -229,17 +229,17 @@ class TestSemanticSpec:
     def test_invalid_backend(self):
         import pytest
         with pytest.raises(ValueError, match="Invalid backend"):
-            SemanticSpec(backend="nonexistent")
+            SemSpec(backend="nonexistent")
 
     def test_invalid_output_mode(self):
         import pytest
         with pytest.raises(ValueError, match="Invalid output_mode"):
-            SemanticSpec(output_mode="unknown")
+            SemSpec(output_mode="unknown")
 
     def test_roundtrip(self):
-        spec = SemanticSpec(instruction="test", output_mode="score")
+        spec = SemSpec(instruction="test", output_mode="score")
         d = spec.to_dict()
-        spec2 = SemanticSpec.from_dict(d)
+        spec2 = SemSpec.from_dict(d)
         assert spec2.instruction == "test"
         assert spec2.backend == "llm"
         assert spec2.output_mode == "score"
@@ -309,7 +309,7 @@ class TestGroupbyQuerySpec:
 
     def test_roundtrip(self):
         spec = GroupbyQuerySpec(
-            semantic=SemanticSpec(
+            semantic=SemSpec(
                 instruction="Group similar memories",
                 backend="hybrid",
                 output_mode="label",
@@ -375,7 +375,7 @@ class TestGroupbyQuerySpec:
         func._meta = _FakeValueState({"total_assigned": 1, "key": "k"})
 
         results = list(func.process_element(
-            SemanticEvent(key="k", payload="alpha", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha", seq_id=1).to_dict(),
             _FakeContext("k"),
         ))
         assert len(results) == 1
@@ -396,7 +396,7 @@ class TestGroupbyQuerySpec:
             "g1": _new_group_profile("g1", "alpha topic", 100),
             "g2": _new_group_profile("g2", "beta topic", 100),
         })
-        gid, score = func._local_assign(SemanticEvent(key="k", payload="anything", seq_id=1))
+        gid, score = func._local_assign(SemEvent(key="k", payload="anything", seq_id=1))
         assert gid == "g2"
         assert score == 0.9
 
@@ -541,7 +541,7 @@ class TestGroupbyQuerySpec:
                 "g1": _new_group_profile("g1", "alpha topic", 100),
                 "g2": _new_group_profile("g2", "beta topic", 100),
             },
-            SemanticEvent(key="k", payload="anything", seq_id=1),
+            SemEvent(key="k", payload="anything", seq_id=1),
         )
         assert gid == "g2"
         assert score == 0.9
@@ -615,7 +615,7 @@ class TestGroupbyQuerySpec:
         func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
         outs = list(
             func.process_element(
-                SemanticEvent(key="k", payload="brand new topic", seq_id=1).to_dict(),
+                SemEvent(key="k", payload="brand new topic", seq_id=1).to_dict(),
                 _FakeContext("k"),
             )
         )
@@ -665,7 +665,7 @@ class TestGroupbyQuerySpec:
 
         first = list(
             func.process_element(
-                SemanticEvent(key="k", payload="project kickoff", seq_id=1).to_dict(),
+                SemEvent(key="k", payload="project kickoff", seq_id=1).to_dict(),
                 _FakeContext("k"),
             )
         )
@@ -675,7 +675,7 @@ class TestGroupbyQuerySpec:
 
         second = list(
             func.process_element(
-                SemanticEvent(key="k", payload="travel hotel", seq_id=2).to_dict(),
+                SemEvent(key="k", payload="travel hotel", seq_id=2).to_dict(),
                 _FakeContext("k"),
             )
         )
@@ -708,7 +708,7 @@ class TestGroupbyQuerySpec:
 
         outs = list(
             func.process_element(
-                SemanticEvent(
+                SemEvent(
                     key="k",
                     payload="project budget",
                     seq_id=1,
@@ -785,7 +785,7 @@ class TestGroupbyQuerySpec:
 
         ctx = _Ctx()
         list(func.process_element(
-            SemanticEvent(key="k", payload="alpha budget update", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha budget update", seq_id=1).to_dict(),
             ctx,
         ))
         meta = func._meta.value()
@@ -846,7 +846,7 @@ class TestGroupbyQuerySpec:
 
         ctx = _Ctx()
         list(func.process_element(
-            SemanticEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict(),
             ctx,
         ))
         fire_at = func._meta.value()["_timer_recompute"]
@@ -901,7 +901,7 @@ class TestGroupbyQuerySpec:
 
         ctx = _Ctx()
         list(func.process_element(
-            SemanticEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict(),
             ctx,
         ))
         fire_at = func._meta.value()["_timer_recompute"]
@@ -953,7 +953,7 @@ class TestGroupbyQuerySpec:
 
         ctx = _Ctx()
         list(func.process_element(
-            SemanticEvent(key="k", payload="alpha update", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha update", seq_id=1).to_dict(),
             ctx,
         ))
         fire_at = func._meta.value()["_timer_recompute"]
@@ -978,13 +978,13 @@ class TestGroupbyQuerySpec:
 
         ctx = _FakeContext("k")
         list(func.process_element(
-            SemanticEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
             ctx,
         ))
         assert len(list(func._group_profiles.keys())) == 1
 
         list(func.process_element(
-            SemanticEvent(
+            SemEvent(
                 key="k",
                 payload="travel booking",
                 seq_id=2,
@@ -1032,7 +1032,7 @@ class TestGroupbyQuerySpec:
 
         ctx = _Ctx()
         list(func.process_element(
-            SemanticEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
+            SemEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
             ctx,
         ))
         meta = func._meta.value()
@@ -1046,7 +1046,7 @@ class TestGroupbyQuerySpec:
         assert updated["scope_epoch"] == 1
 
 
-class TestSemanticLoweringPlans:
+class TestSemLoweringPlans:
     def test_topk_pointwise_lowers_to_score_plus_topn(self):
         plan = resolve_topk_lowering_plan(TopKQuerySpec(ranking_method="pointwise"))
         assert plan.lowering_kind == "derived_attribute_then_classical"
@@ -1118,7 +1118,7 @@ class TestAggQuerySpec:
 
     def test_roundtrip(self):
         spec = AggQuerySpec(
-            semantic=SemanticSpec(
+            semantic=SemSpec(
                 instruction="Compress memory",
                 backend="hybrid",
                 output_mode="summary",
@@ -1503,7 +1503,7 @@ class TestJoinQuerySpec:
 
     def test_roundtrip(self):
         spec = JoinQuerySpec(
-            semantic=SemanticSpec(
+            semantic=SemSpec(
                 instruction="Judge semantic join eligibility",
                 output_mode="bool",
             ),
@@ -1533,7 +1533,7 @@ class TestGenericSemanticBackendBoundaries:
 
         with pytest.raises(ValueError, match="does not expose backend selection"):
             TopKQuerySpec(
-                semantic=SemanticSpec(
+                semantic=SemSpec(
                     instruction="rank by relevance",
                     backend="embedding",
                     output_mode="score",
@@ -1545,7 +1545,7 @@ class TestGenericSemanticBackendBoundaries:
 
         with pytest.raises(ValueError, match="does not expose backend selection"):
             GroupbyQuerySpec(
-                semantic=SemanticSpec(
+                semantic=SemSpec(
                     instruction="group by topic",
                     backend="llm",
                     output_mode="label",
@@ -1557,7 +1557,7 @@ class TestGenericSemanticBackendBoundaries:
 
         with pytest.raises(ValueError, match="does not expose backend selection"):
             AggQuerySpec(
-                semantic=SemanticSpec(
+                semantic=SemSpec(
                     instruction="aggregate semantic state",
                     backend="rule",
                     output_mode="summary",

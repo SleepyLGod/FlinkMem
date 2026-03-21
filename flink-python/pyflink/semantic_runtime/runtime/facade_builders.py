@@ -20,83 +20,95 @@ from pyflink.semantic_runtime.public_api import (
     SemTopKRequest,
     SemWindowRequest,
 )
-from pyflink.semantic_runtime.runtime.operator_plans import (
+from pyflink.semantic_runtime.runtime.plans import (
     lower_sem_agg_request,
-    lower_sem_filter_request,
     lower_sem_groupby_request,
-    lower_sem_lookup_join_request,
-    lower_sem_local_topk_request,
-    lower_sem_map_request,
     lower_sem_topk_request,
     lower_sem_window_request,
+)
+from pyflink.semantic_runtime.runtime.pushdown import (
+    apply_sem_agg_pushdown,
+    apply_sem_filter_pushdown,
+    apply_sem_groupby_pushdown,
+    apply_sem_local_topk_pushdown,
+    apply_sem_lookup_join_pushdown,
+    apply_sem_map_pushdown,
+    apply_sem_topk_pushdown,
 )
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 
-def build_sem_map_from_request(
+def apply_sem_map_from_request(
+    input_ds: DataStream,
+    *,
     request: SemMapRequest,
     runtime_config: RuntimeConfig,
-):
-    """Build a row-level semantic map runtime from a public request."""
-    from pyflink.semantic_runtime.operators.row.sem_map import SemMapFunction
-
-    plan = lower_sem_map_request(request, runtime_config)
-    return SemMapFunction(
-        prompt_template=plan.intent,
-        output_schema=plan.output_schema,
-        llm_config=plan.llm_config,
-        return_mode=plan.output_mode,
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Apply a row-level semantic map request through the pushdown path."""
+    return apply_sem_map_pushdown(
+        input_ds,
+        request=request,
+        runtime_config=runtime_config,
+        timeout_ms=timeout_ms,
+        async_capacity=async_capacity,
     )
 
 
-def build_sem_filter_from_request(
+def apply_sem_filter_from_request(
+    input_ds: DataStream,
+    *,
     request: SemFilterRequest,
     runtime_config: RuntimeConfig,
-):
-    """Build a row-level semantic filter runtime from a public request."""
-    from pyflink.semantic_runtime.operators.row.sem_filter import SemFilterFunction
-
-    plan = lower_sem_filter_request(request, runtime_config)
-    return SemFilterFunction(
-        prompt_template=plan.intent,
-        llm_config=plan.llm_config,
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Apply a row-level semantic filter request through the pushdown path."""
+    return apply_sem_filter_pushdown(
+        input_ds,
+        request=request,
+        runtime_config=runtime_config,
+        timeout_ms=timeout_ms,
+        async_capacity=async_capacity,
     )
 
 
-def build_sem_local_topk_from_request(
+def apply_sem_local_topk_from_request(
+    input_ds: DataStream,
+    *,
     request: SemLocalTopKRequest,
     runtime_config: RuntimeConfig,
-    *,
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
     candidates_field: str = "candidates",
-):
-    """Build a row-level local semantic top-k runtime from a public request."""
-    from pyflink.semantic_runtime.operators.row.sem_local_topk import SemLocalTopKFunction
-
-    plan = lower_sem_local_topk_request(
-        request,
-        runtime_config,
+) -> DataStream:
+    """Apply a row-level local semantic top-k request through the pushdown path."""
+    return apply_sem_local_topk_pushdown(
+        input_ds,
+        request=request,
+        runtime_config=runtime_config,
+        timeout_ms=timeout_ms,
+        async_capacity=async_capacity,
         candidates_field=candidates_field,
     )
-    return SemLocalTopKFunction(
-        prompt_template=plan.intent,
-        k=plan.k,
-        llm_config=plan.llm_config,
-        candidates_field=plan.candidates_field,
-    )
 
 
-def build_sem_lookup_join_from_request(
+def apply_sem_lookup_join_from_request(
+    input_ds: DataStream,
+    *,
     request: SemLookupJoinRequest,
     runtime_config: RuntimeConfig,
-):
-    """Build a row-level semantic lookup join runtime from a public request."""
-    from pyflink.semantic_runtime.operators.row.sem_lookup_join import SemLookupJoinFunction
-
-    plan = lower_sem_lookup_join_request(request, runtime_config)
-    return SemLookupJoinFunction(
-        prompt_template=plan.intent,
-        llm_config=plan.llm_config,
-        join_config=plan.join_config,
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Apply a row-level semantic lookup join request through the pushdown path."""
+    return apply_sem_lookup_join_pushdown(
+        input_ds,
+        request=request,
+        runtime_config=runtime_config,
+        timeout_ms=timeout_ms,
+        async_capacity=async_capacity,
     )
 
 
@@ -126,9 +138,21 @@ def build_sem_topk_from_request(
     )
 
     plan = lower_sem_topk_request(request, runtime_config)
+    if plan.context_kind == "window" and plan.query_spec.ranking_method == "pointwise":
+        return apply_sem_topk_pushdown(
+            input_ds,
+            request=request,
+            runtime_config=runtime_config,
+            timeout_ms=async_timeout_ms,
+            async_capacity=async_capacity,
+        )
+
     llm_config = None
     if plan.kernel_config.scorer_backend == "llm":
-        llm_config = runtime_config.to_llm_client_config()
+        llm_config = runtime_config.get_operator_llm_client_config(
+            "sem_topk",
+            allow_query_spec=True,
+        )
 
     embedding_config = runtime_config.to_embedding_backend_config()
     return build_sem_topk_pipeline(
@@ -141,6 +165,28 @@ def build_sem_topk_from_request(
         async_timeout_ms=async_timeout_ms,
         async_capacity=async_capacity,
     )
+
+
+def apply_sem_groupby_from_request(
+    input_ds: DataStream,
+    *,
+    request: SemGroupbyRequest,
+    runtime_config: RuntimeConfig,
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Apply a stateful semantic groupby request to one input stream."""
+    plan = lower_sem_groupby_request(request, runtime_config)
+    if plan.context_kind == "window":
+        return apply_sem_groupby_pushdown(
+            input_ds,
+            request=request,
+            runtime_config=runtime_config,
+            timeout_ms=timeout_ms,
+            async_capacity=async_capacity,
+        )
+    op = build_sem_groupby_from_request(request, runtime_config)
+    return input_ds.key_by(lambda value: value.get("key", "")).process(op)
 
 
 def build_sem_groupby_from_request(
@@ -158,6 +204,24 @@ def build_sem_groupby_from_request(
         query_spec=plan.query_spec,
         input_kind=plan.input_kind,
     )
+
+
+def apply_sem_agg_from_request(
+    input_ds: DataStream,
+    *,
+    request: SemAggRequest,
+    runtime_config: RuntimeConfig,
+) -> DataStream:
+    """Apply a stateful semantic aggregation request to one input stream."""
+    plan = lower_sem_agg_request(request, runtime_config)
+    if plan.context_kind == "window" and plan.mode == "algebraic":
+        return apply_sem_agg_pushdown(
+            input_ds,
+            request=request,
+            runtime_config=runtime_config,
+        )
+    op = build_sem_agg_from_request(request, runtime_config)
+    return input_ds.key_by(lambda value: value.get("key", "")).process(op)
 
 
 def build_sem_agg_from_request(

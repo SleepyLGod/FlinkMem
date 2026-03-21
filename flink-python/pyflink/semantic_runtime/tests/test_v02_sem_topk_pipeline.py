@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 from pyflink.semantic_runtime.runtime.event_model import retrieve_to_topk_items
 from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
 from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (

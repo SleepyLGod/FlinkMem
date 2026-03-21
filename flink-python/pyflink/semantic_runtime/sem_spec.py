@@ -16,13 +16,13 @@
 # under the License.
 
 """
-SemanticSpec — unified semantic criterion specification.
+SemSpec — unified semantic criterion specification.
 Operator-specific query specs — continuous semantic query definitions.
 
-SemanticSpec captures the semantic "what to do" across operators, decoupled
+SemSpec captures the semantic "what to do" across operators, decoupled
 from how each operator manages state or topology.
 
-The operator-specific query specs wrap SemanticSpec and add operator-level
+The operator-specific query specs wrap SemSpec and add operator-level
 continuous semantics such as scope policy, trigger policy, method selection,
 and versioning.
 
@@ -49,11 +49,11 @@ VALID_OUTPUT_MODES = {"bool", "label", "score", "json", "text", "summary"}
 
 
 # ---------------------------------------------------------------------------
-# SemanticSpec
+# SemSpec
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SemanticSpec:
+class SemSpec:
     """Unified semantic criterion specification.
 
     Parameters
@@ -109,8 +109,8 @@ class SemanticSpec:
         *,
         output_schema: Optional[Dict[str, Any]] = None,
         return_mode: str = "json",
-    ) -> "SemanticSpec":
-        """Build a SemanticSpec suited for ``sem_map``."""
+    ) -> "SemSpec":
+        """Build a SemSpec suited for ``sem_map``."""
         output_mode = return_mode  # "json" or "text"
         return cls(
             instruction=instruction,
@@ -125,8 +125,8 @@ class SemanticSpec:
         instruction: str,
         *,
         threshold: Optional[float] = None,
-    ) -> "SemanticSpec":
-        """Build a SemanticSpec suited for ``sem_filter``."""
+    ) -> "SemSpec":
+        """Build a SemSpec suited for ``sem_filter``."""
         return cls(
             instruction=instruction,
             backend="hybrid",
@@ -140,8 +140,8 @@ class SemanticSpec:
         instruction: str = "",
         *,
         threshold: Optional[float] = None,
-    ) -> "SemanticSpec":
-        """Build a SemanticSpec suited for ``sem_topk`` scoring/reranking."""
+    ) -> "SemSpec":
+        """Build a SemSpec suited for ``sem_topk`` scoring/reranking."""
         return cls(
             instruction=instruction,
             backend="hybrid",
@@ -162,7 +162,7 @@ class SemanticSpec:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SemanticSpec":
+    def from_dict(cls, d: Dict[str, Any]) -> "SemSpec":
         """Deserialize from a plain dict."""
         return cls(
             instruction=d.get("instruction", ""),
@@ -319,13 +319,13 @@ class TriggerPolicy:
 class TopKQuerySpec:
     """Complete specification for a continuous top-k query.
 
-    Wraps a :class:`SemanticSpec` (criterion / prompt) and adds
+    Wraps a :class:`SemSpec` (criterion / prompt) and adds
     the top-k-specific parameters: *k*, query versioning, scope policy,
     ranking method, and trigger policy.
 
     Parameters
     ----------
-    semantic : SemanticSpec
+    semantic : SemSpec
         The semantic criterion (instruction, output_mode, …).
         ``semantic.instruction`` is the ranking prompt / predicate.
         The scoring backend is an internal planner/kernel concern.
@@ -348,7 +348,7 @@ class TopKQuerySpec:
         Defines the active candidate scope (TTL, pool cap, window).
     """
 
-    semantic: SemanticSpec = field(default_factory=lambda: SemanticSpec.for_sem_topk())
+    semantic: SemSpec = field(default_factory=lambda: SemSpec.for_sem_topk())
     k: int = 10
     query_id: str = "default"
     query_version: int = 1
@@ -393,7 +393,7 @@ class TopKQuerySpec:
             )
         """
         return cls(
-            semantic=SemanticSpec.for_sem_topk(instruction),
+            semantic=SemSpec.for_sem_topk(instruction),
             k=k,
             trigger_policy=TriggerPolicy(),
             scope_policy=TopKScopePolicy(
@@ -418,7 +418,7 @@ class TopKQuerySpec:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TopKQuerySpec":
         return cls(
-            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            semantic=SemSpec.from_dict(d.get("semantic", {})),
             k=d.get("k", 10),
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
@@ -481,8 +481,8 @@ class GroupbyQuerySpec:
     contract.
     """
 
-    semantic: SemanticSpec = field(
-        default_factory=lambda: SemanticSpec(
+    semantic: SemSpec = field(
+        default_factory=lambda: SemSpec(
             instruction="Assign tuples to semantic groups.",
             backend="hybrid",
             output_mode="label",
@@ -510,7 +510,7 @@ class GroupbyQuerySpec:
         max_groups_per_key: Optional[int] = None,
     ) -> "GroupbyQuerySpec":
         return cls(
-            semantic=SemanticSpec(
+            semantic=SemSpec(
                 instruction=instruction,
                 backend="hybrid",
                 output_mode="label",
@@ -539,7 +539,7 @@ class GroupbyQuerySpec:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "GroupbyQuerySpec":
         return cls(
-            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            semantic=SemSpec.from_dict(d.get("semantic", {})),
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
@@ -600,8 +600,8 @@ class AggScopePolicy:
 class AggQuerySpec:
     """Continuous query definition for ``sem_agg``."""
 
-    semantic: SemanticSpec = field(
-        default_factory=lambda: SemanticSpec(
+    semantic: SemSpec = field(
+        default_factory=lambda: SemSpec(
             instruction="Aggregate semantic state over a keyed stream.",
             backend="hybrid",
             output_mode="summary",
@@ -635,7 +635,7 @@ class AggQuerySpec:
         flush_interval_ms: Optional[int] = None,
     ) -> "AggQuerySpec":
         return cls(
-            semantic=SemanticSpec(
+            semantic=SemSpec(
                 instruction=instruction,
                 backend="hybrid",
                 output_mode="summary",
@@ -662,7 +662,7 @@ class AggQuerySpec:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AggQuerySpec":
         return cls(
-            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            semantic=SemSpec.from_dict(d.get("semantic", {})),
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             agg_method=d.get("agg_method", "algebraic"),
@@ -711,8 +711,8 @@ class JoinScopePolicy:
 class JoinQuerySpec:
     """Continuous query definition for future true two-input ``sem_join``."""
 
-    semantic: SemanticSpec = field(
-        default_factory=lambda: SemanticSpec(
+    semantic: SemSpec = field(
+        default_factory=lambda: SemSpec(
             instruction="Decide whether left and right tuples semantically join.",
             backend="llm",
             output_mode="bool",
@@ -743,7 +743,7 @@ class JoinQuerySpec:
         max_right_buffer: Optional[int] = None,
     ) -> "JoinQuerySpec":
         return cls(
-            semantic=SemanticSpec(
+            semantic=SemSpec(
                 instruction=instruction,
                 backend=backend,
                 output_mode="bool",
@@ -770,7 +770,7 @@ class JoinQuerySpec:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "JoinQuerySpec":
         return cls(
-            semantic=SemanticSpec.from_dict(d.get("semantic", {})),
+            semantic=SemSpec.from_dict(d.get("semantic", {})),
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
             pairing_method=d.get("pairing_method", "candidate_pruned"),

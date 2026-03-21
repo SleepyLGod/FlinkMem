@@ -53,9 +53,9 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
     sem_agg_meta_descriptor,
 )
 from pyflink.semantic_runtime.runtime.event_model import (
-    SemanticEvent,
+    SemEvent,
     is_window_snapshot,
-    window_snapshot_to_semantic_events,
+    window_snapshot_to_sem_events,
 )
 from pyflink.semantic_runtime.runtime.async_bridge import (
     ASYNC_WORK_TAG,
@@ -70,10 +70,10 @@ from pyflink.semantic_runtime.runtime.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
-from pyflink.semantic_runtime.semantic_spec import (
+from pyflink.semantic_runtime.sem_spec import (
     AggQuerySpec,
     AggScopePolicy,
-    SemanticSpec,
+    SemSpec,
     TriggerPolicy,
 )
 
@@ -212,7 +212,7 @@ def _build_default_agg_query_spec(config: SemAggConfig) -> AggQuerySpec:
         )
 
     return AggQuerySpec(
-        semantic=SemanticSpec(
+        semantic=SemSpec(
             instruction="Aggregate semantic events into one result.",
             backend="hybrid",
             output_mode="summary" if config.mode != "algebraic" else "json",
@@ -343,7 +343,7 @@ class SemAggFunction(KeyedProcessFunction):
 
         # Detect WindowSnapshot input → expand into individual events
         if isinstance(value, dict) and is_window_snapshot(value):
-            for sub_event_dict in window_snapshot_to_semantic_events(value):
+            for sub_event_dict in window_snapshot_to_sem_events(value):
                 yield from self._process_single_event(sub_event_dict, ctx, now_ms)
             return
 
@@ -351,13 +351,13 @@ class SemAggFunction(KeyedProcessFunction):
         yield from self._process_single_event(value, ctx, now_ms)
 
     def _process_single_event(self, value, ctx, now_ms: int):
-        """Process a single SemanticEvent-shaped dict."""
+        """Process a single SemEvent-shaped dict."""
         # Parse event
         if isinstance(value, dict):
-            event = SemanticEvent.from_dict(value)
+            event = SemEvent.from_dict(value)
             event_dict = value
         else:
-            event = SemanticEvent(
+            event = SemEvent(
                 key=str(ctx.get_current_key()), payload=str(value), seq_id=0,
             )
             event_dict = event.to_dict()

@@ -33,6 +33,7 @@ Python code with the isolated JVM side causes version skew.
 from __future__ import annotations
 
 import json
+import ast
 import statistics
 import sys
 import time
@@ -46,12 +47,27 @@ import pytest
 from pyflink.common import Time, Types
 from pyflink.datastream import AsyncDataStream, StreamExecutionEnvironment
 
-from pyflink.semantic_runtime.operators import (
-    build_sem_filter_operator,
-    build_sem_map_operator,
+from pyflink.semantic_runtime.public_api import (
+    context,
+    sem_agg,
+    sem_filter,
+    sem_groupby,
+    sem_local_topk,
+    sem_lookup_join,
+    sem_map,
+    sem_topk,
 )
+from pyflink.semantic_runtime.runtime import (
+    apply_sem_agg_pushdown,
+    apply_sem_filter_pushdown,
+    apply_sem_groupby_pushdown,
+    apply_sem_local_topk_pushdown,
+    apply_sem_lookup_join_pushdown,
+    apply_sem_map_pushdown,
+    apply_sem_topk_pushdown,
+)
+from pyflink.semantic_runtime.runtime.external_search_backend import MockSearchBackend
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
 
 _SEM_RUNTIME_SRC = pathlib.Path(__file__).resolve().parents[1]
 _SEM_RUNTIME_DST = pathlib.Path(_pf.__file__).parent / "semantic_runtime"
@@ -110,6 +126,17 @@ def collect_results(env: StreamExecutionEnvironment, result_stream, job_name: st
     return results
 
 
+def parse_result_record(raw: str) -> Dict[str, Any]:
+    """Parse one collected result record from JSON or Python dict repr."""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        parsed = ast.literal_eval(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected collected result record to be a dict")
+    return parsed
+
+
 def assert_job_fails(env: StreamExecutionEnvironment, result_stream, job_name: str) -> None:
     """Assert that the stream job fails during execution."""
     try:
@@ -165,29 +192,21 @@ def test_normal_pipeline() -> None:
         filter_response=filter_resp,
         filter_delay_s=0.05,
     )
-    map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
-            "Classify: {input}",
+    mapped = apply_sem_map_pushdown(
+        ds,
+        request=sem_map(
+            intent="Classify sentiment",
             output_schema={"sentiment": str, "confidence": float},
         ),
-        runtime_config,
+        runtime_config=runtime_config,
     )
-    mapped = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(10), 5, Types.STRING())
 
-    filter_fn = build_sem_filter_operator(
-        SemanticSpec.for_sem_filter("Keep positive? {input}"),
-        runtime_config,
-    )
-    filtered = AsyncDataStream.unordered_wait(
+    filtered = apply_sem_filter_pushdown(
         mapped,
-        filter_fn,
-        Time.seconds(10),
-        5,
-        Types.STRING(),
+        request=sem_filter(intent="Keep positive sentiment only"),
+        runtime_config=runtime_config,
     )
-
-    kept = filtered.filter(lambda x: json.loads(x).get("decision", False))
-    results = collect_results(env, kept, "test_normal_pipeline")
+    results = collect_results(env, filtered, "test_normal_pipeline")
     report = SLOReport(results)
 
     assert report.total == len(inputs)
@@ -211,14 +230,16 @@ def test_timeout_pipeline_fails() -> None:
         filter_response=json.dumps({"decision": True, "confidence": 0.9, "reason": "unused"}),
         filter_delay_s=0.05,
     )
-    map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
-            "Classify: {input}",
+    result = apply_sem_map_pushdown(
+        ds,
+        request=sem_map(
+            intent="Classify sentiment",
             output_schema={"sentiment": str, "confidence": float},
         ),
-        runtime_config,
+        runtime_config=runtime_config,
+        timeout_ms=1_000,
+        async_capacity=2,
     )
-    result = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(1), 2, Types.STRING())
     assert_job_fails(env, result, "test_timeout_pipeline_fails")
 
 
@@ -236,14 +257,16 @@ def test_invalid_json_pipeline_fails() -> None:
         filter_response=json.dumps({"decision": True, "confidence": 0.9, "reason": "unused"}),
         filter_delay_s=0.05,
     )
-    map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
-            "Classify: {input}",
+    result = apply_sem_map_pushdown(
+        ds,
+        request=sem_map(
+            intent="Classify sentiment",
             output_schema={"sentiment": str, "confidence": float},
         ),
-        runtime_config,
+        runtime_config=runtime_config,
+        timeout_ms=10_000,
+        async_capacity=5,
     )
-    result = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(10), 5, Types.STRING())
     assert_job_fails(env, result, "test_invalid_json_pipeline_fails")
 
 
@@ -263,14 +286,16 @@ def test_backpressure_pipeline() -> None:
         filter_response=json.dumps({"decision": True, "confidence": 0.9, "reason": "unused"}),
         filter_delay_s=0.05,
     )
-    map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
-            "Classify: {input}",
+    result = apply_sem_map_pushdown(
+        ds,
+        request=sem_map(
+            intent="Classify sentiment",
             output_schema={"sentiment": str, "confidence": float},
         ),
-        runtime_config,
+        runtime_config=runtime_config,
+        timeout_ms=30_000,
+        async_capacity=10,
     )
-    result = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(30), 10, Types.STRING())
 
     start = time.time()
     results = collect_results(env, result, "test_backpressure_pipeline")
@@ -355,36 +380,23 @@ def test_real_pipeline_if_enabled() -> None:
             },
         }
     )
-    map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
-            (
-                "Return strict JSON with keys sentiment and confidence. "
-                "sentiment must be one of positive, neutral, negative. "
-                "confidence must be a float in [0,1]. "
-                "Input: {input}"
-            ),
+    mapped = apply_sem_map_pushdown(
+        ds,
+        request=sem_map(
+            intent="Classify sentiment as positive, neutral, or negative",
             output_schema={"sentiment": str, "confidence": float},
         ),
-        runtime_config,
+        runtime_config=runtime_config,
+        timeout_ms=60_000,
+        async_capacity=2,
     )
-    mapped = AsyncDataStream.unordered_wait(ds, map_fn, Time.seconds(60), 2, Types.STRING())
 
-    filter_fn = build_sem_filter_operator(
-        SemanticSpec.for_sem_filter(
-            (
-                "Return strict JSON with keys decision, confidence, reason. "
-                "decision should be true only for clearly positive sentiment. "
-                "Input: {input}"
-            )
-        ),
-        runtime_config,
-    )
-    filtered = AsyncDataStream.unordered_wait(
+    filtered = apply_sem_filter_pushdown(
         mapped,
-        filter_fn,
-        Time.seconds(60),
-        2,
-        Types.STRING(),
+        request=sem_filter(intent="Keep only clearly positive sentiment"),
+        runtime_config=runtime_config,
+        timeout_ms=60_000,
+        async_capacity=2,
     )
 
     results = collect_results(env, filtered, "test_real_pipeline_if_enabled")
@@ -395,11 +407,257 @@ def test_real_pipeline_if_enabled() -> None:
     assert isinstance(parsed.get("reason"), str)
 
 
+def test_local_topk_pushdown_pipeline() -> None:
+    """Positive pushdown path for sem_local_topk should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    records = [
+        json.dumps({"query": "best restaurant", "candidates": ["A", "B", "C", "D"]}),
+    ]
+    ds = env.from_collection(records, type_info=Types.STRING())
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_local_topk": {
+                    "kernel": {
+                        "mock_delay_s": 0.05,
+                        "mock_response": json.dumps(
+                            {
+                                "scored_candidates": [
+                                    {"candidate": "C", "score": 0.98, "reason": "best"},
+                                    {"candidate": "A", "score": 0.91, "reason": "good"},
+                                    {"candidate": "D", "score": 0.8, "reason": "ok"},
+                                ]
+                            }
+                        ),
+                    }
+                }
+            },
+        }
+    )
+    result = apply_sem_local_topk_pushdown(
+        ds,
+        request=sem_local_topk(intent="Rank candidates by relevance", k=2),
+        runtime_config=runtime_config,
+    )
+    results = collect_results(env, result, "test_local_topk_pushdown_pipeline")
+    assert len(results) == 1
+    parsed = json.loads(results[0])
+    assert parsed["top_k"][0]["candidate"] == "C"
+    assert len(parsed["top_k"]) == 2
+
+
+def test_lookup_join_pushdown_pipeline() -> None:
+    """Positive pushdown path for sem_lookup_join should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    inputs = ["budget update"]
+    ds = env.from_collection(inputs, type_info=Types.STRING())
+    backend = MockSearchBackend(
+        query_rules={
+            "budget": [
+                {"candidate_id": "c1", "text": "Budget plan", "score": 0.9},
+                {"candidate_id": "c2", "text": "Budget risk", "score": 0.8},
+            ]
+        }
+    )
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_lookup_join": {
+                    "kernel": {
+                        "mock_delay_s": 0.05,
+                        "mock_response": json.dumps(
+                            {
+                                "matched": True,
+                                "match_score": 0.93,
+                                "selected_candidate": {"candidate_id": "c1"},
+                                "reason": "best semantic match",
+                            }
+                        ),
+                        "right_block_size": 1,
+                    }
+                }
+            },
+        }
+    )
+    result = apply_sem_lookup_join_pushdown(
+        ds,
+        request=sem_lookup_join(intent="Join with the most relevant budget memory", candidate_source=backend),
+        runtime_config=runtime_config,
+    )
+    results = collect_results(env, result, "test_lookup_join_pushdown_pipeline")
+    assert len(results) == 1
+    parsed = json.loads(results[0])
+    assert parsed["join_result"]["selected_candidate"]["candidate_id"] == "c1"
+
+
+def test_window_groupby_pushdown_pipeline() -> None:
+    """Positive pushdown path for window-owned sem_groupby should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    snapshots = [
+        json.dumps(
+            {
+                "key": "user_1",
+                "window_id": "w1",
+                "trigger_reason": "close",
+                "events": [
+                    {"key": "user_1", "payload": "project budget", "seq_id": 1},
+                    {"key": "user_1", "payload": "project risk", "seq_id": 2},
+                    {"key": "user_1", "payload": "travel flight", "seq_id": 3},
+                ],
+            }
+        )
+    ]
+    ds = env.from_collection(snapshots, type_info=Types.STRING())
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "operators": {
+                "sem_groupby": {
+                    "query_spec": {},
+                    "kernel": {"assignment_method": "rule", "confidence_threshold": 0.5},
+                }
+            }
+        }
+    )
+    result = apply_sem_groupby_pushdown(
+        ds,
+        request=sem_groupby(intent="Group by topic", context=context("window")),
+        runtime_config=runtime_config,
+    )
+    results = collect_results(env, result, "test_window_groupby_pushdown_pipeline")
+    assert len(results) == 3
+    parsed = [parse_result_record(item) for item in results]
+    assert parsed[0]["group_id"] == parsed[1]["group_id"]
+    assert parsed[2]["group_id"] != parsed[0]["group_id"]
+
+
+def test_stateful_topk_pushdown_pipeline() -> None:
+    """Positive pushdown path for bounded pointwise sem_topk should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    pools = [
+        json.dumps(
+            {
+                "key": "user_1",
+                "query": "budget",
+                "query_seq_id": 7,
+                "candidates": [
+                    {"candidate_id": "c1", "text": "Budget plan"},
+                    {"candidate_id": "c2", "text": "Budget risk"},
+                    {"candidate_id": "c3", "text": "Travel itinerary"},
+                ],
+            }
+        )
+    ]
+    ds = env.from_collection(pools, type_info=Types.STRING())
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_topk": {
+                    "query_spec": {},
+                    "kernel": {
+                        "scorer_backend": "llm",
+                        "mock_delay_s": 0.05,
+                        "mock_response": json.dumps(
+                            {
+                                "scored_candidates": [
+                                    {
+                                        "candidate": {"candidate_id": "c2", "text": "Budget risk"},
+                                        "score": 0.97,
+                                        "reason": "best",
+                                    },
+                                    {
+                                        "candidate": {"candidate_id": "c1", "text": "Budget plan"},
+                                        "score": 0.88,
+                                        "reason": "good",
+                                    },
+                                    {
+                                        "candidate": {"candidate_id": "c3", "text": "Travel itinerary"},
+                                        "score": 0.21,
+                                        "reason": "low",
+                                    },
+                                ]
+                            }
+                        ),
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_topk_pushdown(
+        ds,
+        request=sem_topk(intent="Rank relevant memories", k=2, context=context("window")),
+        runtime_config=runtime_config,
+    )
+    results = collect_results(env, result, "test_stateful_topk_pushdown_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["top_ids"] == ["c2", "c1"]
+
+
+def test_window_algebraic_agg_pushdown_pipeline() -> None:
+    """Positive pushdown path for window-owned algebraic sem_agg should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    snapshots = [
+        json.dumps(
+            {
+                "key": "user_1",
+                "window_id": "w1",
+                "trigger_reason": "close",
+                "events": [
+                    {"key": "user_1", "payload": "a", "seq_id": 1, "total": 3},
+                    {"key": "user_1", "payload": "b", "seq_id": 2, "total": 5},
+                ],
+            }
+        )
+    ]
+    ds = env.from_collection(snapshots, type_info=Types.STRING())
+
+    def sum_reduce(acc, event):
+        return {"key": acc.get("key", "user_1"), "total": acc.get("total", 0) + event.get("total", 0)}
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "operators": {
+                "sem_agg": {
+                    "query_spec": {},
+                    "kernel": {"mode": "algebraic", "reduce_fn": sum_reduce},
+                }
+            }
+        }
+    )
+    result = apply_sem_agg_pushdown(
+        ds,
+        request=sem_agg(intent="Aggregate totals", mode="algebraic", context=context("window")),
+        runtime_config=runtime_config,
+    )
+    results = collect_results(env, result, "test_window_algebraic_agg_pushdown_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["aggregate"]["total"] == 8
+
+
 TESTS = {
     "normal": test_normal_pipeline,
     "timeout": test_timeout_pipeline_fails,
     "invalid_json": test_invalid_json_pipeline_fails,
     "backpressure": test_backpressure_pipeline,
+    "local_topk": test_local_topk_pushdown_pipeline,
+    "lookup_join": test_lookup_join_pushdown_pipeline,
+    "groupby": test_window_groupby_pushdown_pipeline,
+    "stateful_topk": test_stateful_topk_pushdown_pipeline,
+    "agg": test_window_algebraic_agg_pushdown_pipeline,
     "real": test_real_pipeline_if_enabled,
 }
 
@@ -409,7 +667,17 @@ if __name__ == "__main__":
     if which == "all":
         passed = 0
         failed = 0
-        for name in ("normal", "timeout", "invalid_json", "backpressure"):
+        for name in (
+            "normal",
+            "timeout",
+            "invalid_json",
+            "backpressure",
+            "local_topk",
+            "lookup_join",
+            "groupby",
+            "stateful_topk",
+            "agg",
+        ):
             fn = TESTS[name]
             try:
                 fn()

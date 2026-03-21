@@ -13,7 +13,7 @@ from pyflink.semantic_runtime.public_api import (
     sem_topk,
     sem_window,
 )
-from pyflink.semantic_runtime.runtime.operator_plans import (
+from pyflink.semantic_runtime.runtime.plans import (
     lower_sem_agg_request,
     lower_sem_filter_request,
     lower_sem_groupby_request,
@@ -119,6 +119,8 @@ def test_lower_sem_lookup_join_request() -> None:
         runtime_config,
     )
     assert plan.intent == "Join with the most relevant memory"
+    assert plan.left_block_size == 1
+    assert plan.right_block_size is None
     assert plan.llm_config.backend == "mock"
     assert plan.join_config.mock_candidates == ["candidate_1", "candidate_2"]
 

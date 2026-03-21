@@ -76,7 +76,7 @@ from pyflink.semantic_runtime.runtime.timer_policy import (
     resolve_timer_category,
 )
 from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 
 logger = logging.getLogger(__name__)
 

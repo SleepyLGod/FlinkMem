@@ -51,10 +51,11 @@ from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, crea
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators.row._common import (
     attach_metrics,
-    validate_generic_semantic_spec,
+    validate_generic_sem_spec,
     validate_schema,
 )
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_map_prompt
+from pyflink.semantic_runtime.sem_spec import SemSpec
 
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.runtime_config import RuntimeConfig
@@ -173,17 +174,17 @@ class SemMapFunction(AsyncFunction):
 
 
 def build_sem_map_operator(
-    semantic: SemanticSpec,
+    semantic: SemSpec,
     runtime_config: "RuntimeConfig",
 ) -> SemMapFunction:
     """Build a public row-style semantic map operator."""
-    validate_generic_semantic_spec(
+    validate_generic_sem_spec(
         semantic,
         operator_name="sem_map",
         allowed_output_modes={"json", "text"},
     )
     from pyflink.semantic_runtime.public_api import sem_map
-    from pyflink.semantic_runtime.runtime.operator_plans import lower_sem_map_request
+    from pyflink.semantic_runtime.runtime.plans import lower_sem_map_request
 
     plan = lower_sem_map_request(
         sem_map(
@@ -194,7 +195,11 @@ def build_sem_map_operator(
         runtime_config,
     )
     return SemMapFunction(
-        prompt_template=plan.intent,
+        prompt_template=build_sem_map_prompt(
+            plan.intent,
+            output_schema=plan.output_schema,
+            output_mode=plan.output_mode,
+        ),
         output_schema=plan.output_schema,
         llm_config=plan.llm_config,
         return_mode=plan.output_mode,

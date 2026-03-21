@@ -39,7 +39,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec, TriggerPolicy
+from pyflink.semantic_runtime.sem_spec import TopKQuerySpec, TriggerPolicy
 from pyflink.semantic_runtime.runtime.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,

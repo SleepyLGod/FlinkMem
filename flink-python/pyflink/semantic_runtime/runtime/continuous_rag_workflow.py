@@ -79,14 +79,14 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg import (
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
     build_sem_agg_operator,
 )
-from pyflink.semantic_runtime.runtime.sem_search import (
+from pyflink.semantic_runtime.runtime.steps.sem_search import (
     SemSearchConfig,
     SemSearchFunction,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_topk import (
     SemTopKConfig,
 )
-from pyflink.semantic_runtime.semantic_spec import AggQuerySpec, GroupbyQuerySpec, TopKQuerySpec
+from pyflink.semantic_runtime.sem_spec import AggQuerySpec, GroupbyQuerySpec, TopKQuerySpec
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig, RuntimeConfig
 from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (

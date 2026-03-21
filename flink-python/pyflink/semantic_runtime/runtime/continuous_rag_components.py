@@ -29,7 +29,7 @@ from pyflink.datastream.functions import KeyedProcessFunction
 
 from pyflink.semantic_runtime.runtime.async_bridge import build_async_bridge
 from pyflink.semantic_runtime.runtime.event_model import (
-    group_assignment_to_semantic_event,
+    group_assignment_to_sem_event,
     retrieve_to_answer_context,
     retrieve_to_topk_items,
     topk_to_answer_context,
@@ -240,7 +240,7 @@ class _RetrieveAsyncMergeFunction(KeyedProcessFunction):
 
 
 class _GroupbyToAggEnvelope(KeyedProcessFunction):
-    """Normalize sem_groupby outputs into SemanticEvent-like envelopes for sem_agg."""
+    """Normalize sem_groupby outputs into SemEvent-like envelopes for sem_agg."""
 
     def process_element(self, value, ctx: "KeyedProcessFunction.Context"):
         if not isinstance(value, dict):
@@ -248,7 +248,7 @@ class _GroupbyToAggEnvelope(KeyedProcessFunction):
         if {"key", "payload", "seq_id"}.issubset(value.keys()):
             yield value
             return
-        yield group_assignment_to_semantic_event(value)
+        yield group_assignment_to_sem_event(value)
 
 
 class _RetrievalToAnswerEnvelope(KeyedProcessFunction):

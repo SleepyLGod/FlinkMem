@@ -40,7 +40,7 @@ from pyflink.datastream import StreamExecutionEnvironment, AsyncDataStream
 
 from pyflink.semantic_runtime.operators import build_sem_map_operator
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.sem_spec import SemSpec
 
 
 def _mock_runtime_config(*, response: str, delay_s: float) -> RuntimeConfig:
@@ -72,7 +72,7 @@ def run_normal():
     mock_response = json.dumps({"sentiment": "positive", "confidence": 0.95})
     runtime_config = _mock_runtime_config(response=mock_response, delay_s=0.05)
     sem_map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
+        SemSpec.for_sem_map(
             "Classify sentiment: {input}",
             output_schema={"sentiment": str, "confidence": float},
         ),
@@ -101,7 +101,7 @@ def run_timeout():
         delay_s=30.0,
     )
     sem_map_fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
+        SemSpec.for_sem_map(
             "Classify: {input}",
             output_schema={"sentiment": str, "confidence": float},
         ),

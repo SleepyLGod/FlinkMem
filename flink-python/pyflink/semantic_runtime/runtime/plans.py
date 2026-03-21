@@ -15,17 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Internal per-operator plans.
+"""Internal operator planning.
 
-These plans merge public semantic requests with internal runtime configuration.
-They are not public API. Their role is to keep runtime assembly explicit while
-preventing low-level config objects from leaking into the public surface.
+This module is the single internal planning entrypoint for semantic runtime.
+It merges two responsibilities that used to live in separate files:
+
+1. lowering public requests into per-operator runtime plans,
+2. deciding whether an operator path lowers to `sem_xxx + Flink operator`
+   or remains native runtime.
+
+This module is not public API.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.public_api import (
@@ -38,12 +43,13 @@ from pyflink.semantic_runtime.public_api import (
     SemTopKRequest,
     SemWindowRequest,
 )
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
-from pyflink.semantic_runtime.semantic_spec import (
+from pyflink.semantic_runtime.sem_spec import SemSpec
+from pyflink.semantic_runtime.sem_spec import (
     AggQuerySpec,
     AggScopePolicy,
     GroupbyQuerySpec,
     GroupbyScopePolicy,
+    JoinQuerySpec,
     TopKQuerySpec,
     TopKScopePolicy,
     TriggerPolicy,
@@ -51,11 +57,46 @@ from pyflink.semantic_runtime.semantic_spec import (
 
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.operators.row.sem_lookup_join import SemLookupJoinConfig
-    from pyflink.semantic_runtime.runtime_config import RuntimeConfig
     from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
     from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
     from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
     from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
+    from pyflink.semantic_runtime.runtime_config import RuntimeConfig
+
+
+VALID_LOWERING_KINDS = {
+    "derived_attribute_then_classical",
+    "native_runtime",
+}
+
+
+@dataclass(frozen=True)
+class SemDerivedAttrPlan:
+    """Internal plan for one semantic derived attribute."""
+
+    attribute_kind: str
+    output_field: str
+    backend: str
+    stable_per_record: bool = True
+    bounded_context: bool = False
+
+
+@dataclass(frozen=True)
+class SemLoweringPlan:
+    """Logical lowering result for one semantic operator."""
+
+    operator_name: str
+    lowering_kind: str
+    classical_operator: Optional[str] = None
+    derived_attribute: Optional[SemDerivedAttrPlan] = None
+    notes: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.lowering_kind not in VALID_LOWERING_KINDS:
+            raise ValueError(
+                f"Invalid lowering_kind={self.lowering_kind!r}. "
+                f"Must be one of {VALID_LOWERING_KINDS}."
+            )
 
 
 @dataclass(frozen=True)
@@ -65,7 +106,7 @@ class SemMapPlan:
     intent: str
     output_schema: Optional[Dict[str, Any]]
     output_mode: str
-    semantic: SemanticSpec
+    semantic: SemSpec
     llm_config: LLMClientConfig
 
 
@@ -74,7 +115,7 @@ class SemFilterPlan:
     """Merged internal plan for row-level semantic filter."""
 
     intent: str
-    semantic: SemanticSpec
+    semantic: SemSpec
     llm_config: LLMClientConfig
 
 
@@ -84,7 +125,7 @@ class SemLocalTopKPlan:
 
     intent: str
     k: int
-    semantic: SemanticSpec
+    semantic: SemSpec
     llm_config: LLMClientConfig
     candidates_field: str
 
@@ -95,6 +136,8 @@ class SemLookupJoinPlan:
 
     intent: str
     candidate_source: Any
+    left_block_size: int
+    right_block_size: Optional[int]
     llm_config: LLMClientConfig
     join_config: "SemLookupJoinConfig"
 
@@ -147,7 +190,7 @@ def lower_sem_map_request(
     runtime_config: "RuntimeConfig",
 ) -> SemMapPlan:
     """Lower a public semantic map request into one internal plan."""
-    semantic = SemanticSpec.for_sem_map(
+    semantic = SemSpec.for_sem_map(
         request.intent,
         output_schema=request.output_schema,
         return_mode=request.output_mode,
@@ -166,7 +209,7 @@ def lower_sem_filter_request(
     runtime_config: "RuntimeConfig",
 ) -> SemFilterPlan:
     """Lower a public semantic filter request into one internal plan."""
-    semantic = SemanticSpec.for_sem_filter(request.intent)
+    semantic = SemSpec.for_sem_filter(request.intent)
     return SemFilterPlan(
         intent=request.intent,
         semantic=semantic,
@@ -181,7 +224,7 @@ def lower_sem_local_topk_request(
     candidates_field: str = "candidates",
 ) -> SemLocalTopKPlan:
     """Lower a public local top-k request into one internal plan."""
-    semantic = SemanticSpec.for_sem_topk(request.intent)
+    semantic = SemSpec.for_sem_topk(request.intent)
     return SemLocalTopKPlan(
         intent=request.intent,
         k=request.k,
@@ -196,13 +239,16 @@ def lower_sem_lookup_join_request(
     runtime_config: "RuntimeConfig",
 ) -> SemLookupJoinPlan:
     """Lower a public lookup join request into one internal plan."""
+    join_config = runtime_config.get_lookup_join_config(
+        candidate_source=request.candidate_source,
+    )
     return SemLookupJoinPlan(
         intent=request.intent,
         candidate_source=request.candidate_source,
+        left_block_size=1,
+        right_block_size=join_config.right_block_size,
         llm_config=runtime_config.get_row_llm_client_config("sem_lookup_join"),
-        join_config=runtime_config.get_lookup_join_config(
-            candidate_source=request.candidate_source,
-        ),
+        join_config=join_config,
     )
 
 
@@ -312,4 +358,113 @@ def lower_sem_agg_request(
         input_kind=input_kind,
         query_spec=query_spec,
         kernel_config=runtime_config.get_agg_kernel_config(),
+    )
+
+
+def resolve_topk_lowering_plan(query_spec: TopKQuerySpec) -> SemLoweringPlan:
+    """Resolve the logical form for ``sem_topk``."""
+    if query_spec.ranking_method == "pointwise":
+        return SemLoweringPlan(
+            operator_name="sem_topk",
+            lowering_kind="derived_attribute_then_classical",
+            classical_operator="topn",
+            derived_attribute=SemDerivedAttrPlan(
+                attribute_kind="score",
+                output_field="score",
+                backend="planner_selected",
+                stable_per_record=True,
+                bounded_context=False,
+            ),
+            notes=(
+                "Pointwise top-k can be modeled as semantic score generation "
+                "followed by classical Top-N maintenance.",
+            ),
+        )
+    return SemLoweringPlan(
+        operator_name="sem_topk",
+        lowering_kind="native_runtime",
+        notes=(
+            "Contextual rerank depends on pool-level context and does not lower "
+            "to one stable per-record score attribute.",
+        ),
+    )
+
+
+def resolve_groupby_lowering_plan(
+    query_spec: GroupbyQuerySpec,
+    *,
+    input_kind: str = "event_stream",
+) -> SemLoweringPlan:
+    """Resolve the logical form for ``sem_groupby``."""
+    if input_kind == "window_snapshot":
+        return SemLoweringPlan(
+            operator_name="sem_groupby",
+            lowering_kind="derived_attribute_then_classical",
+            classical_operator="groupby",
+            derived_attribute=SemDerivedAttrPlan(
+                attribute_kind="label",
+                output_field="group_id",
+                backend="planner_selected",
+                stable_per_record=True,
+                bounded_context=False,
+            ),
+            notes=(
+                "Bounded/window-owned grouping is modeled as semantic label "
+                "generation followed by classical group-by.",
+            ),
+        )
+
+    return SemLoweringPlan(
+        operator_name="sem_groupby",
+        lowering_kind="native_runtime",
+        notes=(
+            "Operator-owned grouping keeps evolving group state; group identity "
+            "is not a static per-record label.",
+        ),
+    )
+
+
+def resolve_agg_lowering_plan(
+    query_spec: AggQuerySpec,
+    *,
+    input_kind: str = "event_stream",
+) -> SemLoweringPlan:
+    """Resolve the logical form for ``sem_agg``."""
+    if input_kind == "window_snapshot" and query_spec.agg_method == "algebraic":
+        return SemLoweringPlan(
+            operator_name="sem_agg",
+            lowering_kind="derived_attribute_then_classical",
+            classical_operator="aggregate",
+            notes=(
+                "Window-owned algebraic aggregation can run as bounded native "
+                "aggregation without operator-owned semantic state.",
+            ),
+        )
+    return SemLoweringPlan(
+        operator_name="sem_agg",
+        lowering_kind="native_runtime",
+        notes=(
+            "Semantic summarize/compressive reduction remains native runtime.",
+        ),
+    )
+
+
+def resolve_join_lowering_plan(query_spec: JoinQuerySpec) -> SemLoweringPlan:
+    """Resolve the logical form for future ``sem_join``."""
+    return SemLoweringPlan(
+        operator_name="sem_join",
+        lowering_kind="derived_attribute_then_classical",
+        classical_operator="join/filter",
+        derived_attribute=SemDerivedAttrPlan(
+            attribute_kind="match",
+            output_field="match_score",
+            backend=query_spec.semantic.backend,
+            stable_per_record=False,
+            bounded_context=False,
+        ),
+        notes=(
+            "Logical sem_join can be modeled as semantic match score/predicate "
+            "plus classical join/filter even if runtime still needs native "
+            "candidate generation and pruning.",
+        ),
     )

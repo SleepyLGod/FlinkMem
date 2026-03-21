@@ -40,7 +40,7 @@ from pyflink.semantic_runtime.runtime.continuous_rag_components import (
     _RetrieveAsyncMergeFunction,
     _SummarizeAsyncMergeFunction,
 )
-from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig, SemSearchFunction
+from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig, SemSearchFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import build_sem_agg_operator
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig, SemGroupbyFunction
@@ -50,7 +50,7 @@ from pyflink.semantic_runtime.runtime.external_search_backend import (
     MockSearchBackend,
     SearchBackendAsyncFn,
 )
-from pyflink.semantic_runtime.semantic_spec import (
+from pyflink.semantic_runtime.sem_spec import (
     AggScopePolicy,
     AggQuerySpec,
     GroupbyQuerySpec,

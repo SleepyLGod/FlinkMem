@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.sem_spec import SemSpec
 
 
 def validate_schema(obj: Any, schema: Dict[str, type]) -> bool:
@@ -46,8 +46,8 @@ def attach_metrics(parsed: dict, metrics) -> dict:
     return parsed
 
 
-def validate_generic_semantic_spec(
-    spec: SemanticSpec,
+def validate_generic_sem_spec(
+    spec: SemSpec,
     *,
     operator_name: str,
     allowed_output_modes: set[str],

@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from pyflink.semantic_runtime.runtime.event_model import SemanticEvent
+from pyflink.semantic_runtime.runtime.event_model import SemEvent
 from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig, SemWindowFunction, _new_window_meta
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
@@ -34,10 +34,10 @@ from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     SemGroupbyFunction,
     _new_group_profile,
 )
-from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig, SemSearchFunction
+from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig, SemSearchFunction
 from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
-from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec, GroupbyScopePolicy, TriggerPolicy, AggQuerySpec, AggScopePolicy, TopKQuerySpec
+from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec, GroupbyScopePolicy, TriggerPolicy, AggQuerySpec, AggScopePolicy, TopKQuerySpec
 from pyflink.semantic_runtime.runtime.external_search_backend import MockSearchBackend
 from pyflink.semantic_runtime.runtime.continuous_rag_workflow import ContinuousRAGConfig
 
@@ -153,7 +153,7 @@ class TestStateSafetyAudit:
             "g2": {"label": "newer group", "event_count": 2, "last_update_ms": 200,
                     "created_ms": 200, "summary": "", "group_id": "g2"},
         })
-        event = SemanticEvent(key="k", payload="brand new topic", seq_id=0)
+        event = SemEvent(key="k", payload="brand new topic", seq_id=0)
         gid = func._maybe_create_group(event, 300)
         assert gid is not None
         # g1 (oldest) should have been evicted
@@ -168,7 +168,7 @@ class TestStateSafetyAudit:
             "g1": {"label": "a", "event_count": 1, "last_update_ms": 100},
             "g2": {"label": "b", "event_count": 1, "last_update_ms": 200},
         })
-        event = SemanticEvent(key="k", payload="c", seq_id=0)
+        event = SemEvent(key="k", payload="c", seq_id=0)
         gid = func._maybe_create_group(event, 300)
         assert gid is None
 
@@ -403,7 +403,7 @@ class TestKeyedCountConservation:
         func._window_meta = _FakeValueState(_new_window_meta(1000))
 
         for i in range(5):
-            ev = SemanticEvent(key="k", payload=f"msg{i}", seq_id=i)
+            ev = SemEvent(key="k", payload=f"msg{i}", seq_id=i)
             func._event_buffer.add(ev.to_dict())
 
         buffered = list(func._event_buffer.get())
@@ -419,7 +419,7 @@ class TestKeyedCountConservation:
         func._meta = _FakeValueState({"total_events": 0, "total_groups": 1})
 
         # Assign an event that matches g1
-        ev = SemanticEvent(key="k", payload="alpha discussion", seq_id=0)
+        ev = SemEvent(key="k", payload="alpha discussion", seq_id=0)
         gid, conf = func._local_assign(ev)
         assert gid == "g1"
 
@@ -506,7 +506,7 @@ class TestStateBoundEnforcement:
         })
 
         # Creating a third group should evict the oldest
-        event = SemanticEvent(key="k", payload="topic three new", seq_id=0)
+        event = SemEvent(key="k", payload="topic three new", seq_id=0)
         gid = func._maybe_create_group(event, 300)
         assert gid is not None
         assert len(func._group_profiles.keys()) == 2
@@ -603,7 +603,7 @@ class TestSemanticWindowSplitBehavior:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(_new_window_meta(1000))
 
-        events = [SemanticEvent(key="k", payload=f"m{i}", seq_id=i) for i in range(3)]
+        events = [SemEvent(key="k", payload=f"m{i}", seq_id=i) for i in range(3)]
         for ev in events:
             func._event_buffer.add(ev.to_dict())
 
@@ -627,7 +627,7 @@ class TestSemanticWindowSplitBehavior:
         meta["event_count"] = 2
 
         # Event WITH topic_shift boundary
-        ev = SemanticEvent(
+        ev = SemEvent(
             key="k", payload="new topic", seq_id=2,
             boundary_flags={"topic_shift": True},
         )
@@ -645,7 +645,7 @@ class TestSemanticWindowSplitBehavior:
         meta = func._window_meta.value()
         meta["event_count"] = 2
 
-        ev = SemanticEvent(key="k", payload="continuing", seq_id=2)
+        ev = SemEvent(key="k", payload="continuing", seq_id=2)
         trigger = func._check_triggers(ev, meta)
         assert trigger is None
 
@@ -663,8 +663,8 @@ class TestGroupAssignmentStability:
         })
         func._meta = _FakeValueState({"total_events": 0, "total_groups": 2})
 
-        ev1 = SemanticEvent(key="k", payload="machine learning", seq_id=0)
-        ev2 = SemanticEvent(key="k", payload="learning algorithms", seq_id=1)
+        ev1 = SemEvent(key="k", payload="machine learning", seq_id=0)
+        ev2 = SemEvent(key="k", payload="learning algorithms", seq_id=1)
 
         gid1, _ = func._local_assign(ev1)
         gid2, _ = func._local_assign(ev2)
@@ -681,8 +681,8 @@ class TestGroupAssignmentStability:
         })
         func._meta = _FakeValueState({"total_events": 0, "total_groups": 2})
 
-        ev_ml = SemanticEvent(key="k", payload="machine learning", seq_id=0)
-        ev_cook = SemanticEvent(key="k", payload="cooking recipes", seq_id=1)
+        ev_ml = SemEvent(key="k", payload="machine learning", seq_id=0)
+        ev_cook = SemEvent(key="k", payload="cooking recipes", seq_id=1)
 
         gid_ml, _ = func._local_assign(ev_ml)
         gid_cook, _ = func._local_assign(ev_cook)
@@ -703,7 +703,7 @@ class TestRetrieveConsistency:
             "c3": {"content": "flink state management", "_cached_at_ms": 300},
         })
 
-        ev = SemanticEvent(key="k", payload="flink streaming", seq_id=0)
+        ev = SemEvent(key="k", payload="flink streaming", seq_id=0)
         results1 = func._local_retrieve(ev)
         results2 = func._local_retrieve(ev)
 
@@ -720,7 +720,7 @@ class TestRetrieveConsistency:
             "c1": {"content": "flink streaming", "_cached_at_ms": 100},
         })
 
-        ev = SemanticEvent(key="k", payload="flink streaming", seq_id=0)
+        ev = SemEvent(key="k", payload="flink streaming", seq_id=0)
         results_before = func._local_retrieve(ev)
 
         # Add a highly relevant entry
@@ -895,13 +895,13 @@ class TestCheckpointRecoveryStructural:
         assert restored["topk"][0]["candidate_id"] == "c1"
 
     def test_semantic_event_roundtrip(self):
-        """SemanticEvent model should survive serialization."""
+        """SemEvent model should survive serialization."""
         import pickle
-        ev = SemanticEvent(
+        ev = SemEvent(
             key="user_1", payload="test message", seq_id=42,
             metadata={"boundary": "topic_shift", "extra": [1, 2, 3]},
         )
-        restored = SemanticEvent.from_dict(pickle.loads(pickle.dumps(ev.to_dict())))
+        restored = SemEvent.from_dict(pickle.loads(pickle.dumps(ev.to_dict())))
         assert restored.key == "user_1"
         assert restored.payload == "test message"
         assert restored.seq_id == 42
@@ -951,7 +951,7 @@ class TestEndToEndRAGConsistency:
         # Simulate memory subflow: window collects, groupby assigns, agg reduces
         window_buf = _FakeListState()
         for i in range(3):
-            ev = SemanticEvent(key="user_1", payload=f"Flink is great {i}", seq_id=i)
+            ev = SemEvent(key="user_1", payload=f"Flink is great {i}", seq_id=i)
             window_buf.add(ev.to_dict())
 
         # After window flush, events go to groupby
@@ -967,7 +967,7 @@ class TestEndToEndRAGConsistency:
         func_gb._meta = _FakeValueState({"total_events": 0, "total_groups": 1})
 
         for ev_dict in events_out:
-            ev = SemanticEvent.from_dict(ev_dict)
+            ev = SemEvent.from_dict(ev_dict)
             gid, _ = func_gb._local_assign(ev)
             assert gid == "g1"  # all about flink
 
@@ -980,7 +980,7 @@ class TestEndToEndRAGConsistency:
             "c3": {"content": "flink is great 2", "_cached_at_ms": 300},
         })
 
-        query_ev = SemanticEvent(key="user_1", payload="flink", seq_id=10)
+        query_ev = SemEvent(key="user_1", payload="flink", seq_id=10)
         results = func_ret._local_retrieve(query_ev)
         assert len(results) >= 1
 

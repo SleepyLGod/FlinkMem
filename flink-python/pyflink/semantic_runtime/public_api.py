@@ -40,7 +40,7 @@ VALID_AGG_MODES = {"algebraic", "summarize", "compressive"}
 
 
 @dataclass(frozen=True)
-class SemanticContext:
+class SemContext:
     """Public business context for semantic operations.
 
     Attributes:
@@ -99,7 +99,7 @@ class SemLookupJoinRequest:
 class SemWindowRequest:
     """Public semantic window request."""
 
-    context: SemanticContext
+    context: SemContext
 
 
 @dataclass(frozen=True)
@@ -108,7 +108,7 @@ class SemTopKRequest:
 
     intent: str
     k: int
-    context: SemanticContext
+    context: SemContext
 
     def __post_init__(self) -> None:
         if self.k <= 0:
@@ -120,7 +120,7 @@ class SemGroupbyRequest:
     """Public stateful semantic groupby request."""
 
     intent: str
-    context: SemanticContext
+    context: SemContext
 
 
 @dataclass(frozen=True)
@@ -129,7 +129,7 @@ class SemAggRequest:
 
     intent: str
     mode: str
-    context: SemanticContext
+    context: SemContext
 
     def __post_init__(self) -> None:
         if self.mode not in VALID_AGG_MODES:
@@ -139,9 +139,9 @@ class SemAggRequest:
             )
 
 
-def context(kind: str, **metadata: Any) -> SemanticContext:
+def context(kind: str, **metadata: Any) -> SemContext:
     """Create a public semantic context."""
-    return SemanticContext(kind=kind, metadata=dict(metadata))
+    return SemContext(kind=kind, metadata=dict(metadata))
 
 
 def sem_map(
@@ -169,21 +169,21 @@ def sem_lookup_join(*, intent: str, candidate_source: Any) -> SemLookupJoinReque
     return SemLookupJoinRequest(intent=intent, candidate_source=candidate_source)
 
 
-def sem_window(*, context: SemanticContext) -> SemWindowRequest:
+def sem_window(*, context: SemContext) -> SemWindowRequest:
     """Create a public semantic window request."""
     return SemWindowRequest(context=context)
 
 
-def sem_topk(*, intent: str, k: int, context: SemanticContext) -> SemTopKRequest:
+def sem_topk(*, intent: str, k: int, context: SemContext) -> SemTopKRequest:
     """Create a public stateful semantic top-k request."""
     return SemTopKRequest(intent=intent, k=k, context=context)
 
 
-def sem_groupby(*, intent: str, context: SemanticContext) -> SemGroupbyRequest:
+def sem_groupby(*, intent: str, context: SemContext) -> SemGroupbyRequest:
     """Create a public stateful semantic groupby request."""
     return SemGroupbyRequest(intent=intent, context=context)
 
 
-def sem_agg(*, intent: str, mode: str, context: SemanticContext) -> SemAggRequest:
+def sem_agg(*, intent: str, mode: str, context: SemContext) -> SemAggRequest:
     """Create a public stateful semantic aggregation request."""
     return SemAggRequest(intent=intent, mode=mode, context=context)

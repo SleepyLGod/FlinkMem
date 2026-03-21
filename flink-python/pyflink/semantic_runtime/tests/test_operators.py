@@ -30,7 +30,7 @@ from pyflink.semantic_runtime.operators.row.sem_lookup_join import (
     SemLookupJoinFunction, SemLookupJoinConfig,
 )
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.sem_spec import SemSpec
 
 
 def _mock_runtime_config(operator_name: str, *, response: str, delay_s: float = 0.05) -> RuntimeConfig:
@@ -60,7 +60,7 @@ def run_sem_map():
         response=json.dumps({"sentiment": "positive", "confidence": 0.9}),
     )
     fn = build_sem_map_operator(
-        SemanticSpec.for_sem_map(
+        SemSpec.for_sem_map(
             "Classify: {input}",
             output_schema={"sentiment": str, "confidence": float},
         ),
@@ -83,7 +83,7 @@ def run_sem_filter():
     mock_resp = json.dumps({"decision": True, "confidence": 0.85, "reason": "positive"})
     runtime_config = _mock_runtime_config("sem_filter", response=mock_resp)
     fn = build_sem_filter_operator(
-        SemanticSpec.for_sem_filter("Is this positive? {input}"),
+        SemSpec.for_sem_filter("Is this positive? {input}"),
         runtime_config,
     )
     result = AsyncDataStream.unordered_wait(ds, fn, Time.seconds(10), 2, Types.STRING())
@@ -102,10 +102,19 @@ def run_sem_local_topk():
     ]
     ds = env.from_collection(records, type_info=Types.STRING())
 
-    mock_resp = json.dumps(["C", "A", "D", "B"])
+    mock_resp = json.dumps(
+        {
+            "scored_candidates": [
+                {"candidate": "C", "score": 0.98, "reason": "best"},
+                {"candidate": "A", "score": 0.95, "reason": "strong"},
+                {"candidate": "D", "score": 0.80, "reason": "ok"},
+                {"candidate": "B", "score": 0.70, "reason": "weak"},
+            ]
+        }
+    )
     runtime_config = _mock_runtime_config("sem_local_topk", response=mock_resp)
     fn = build_sem_local_topk_operator(
-        SemanticSpec.for_sem_topk("Rank these for '{input}': {candidates}"),
+        SemSpec.for_sem_topk("Rank these for '{input}': {candidates}"),
         k=2,
         runtime_config=runtime_config,
     )
@@ -120,7 +129,14 @@ def run_sem_lookup_join():
     env.set_parallelism(1)
     ds = env.from_collection(["query_a", "query_b"], type_info=Types.STRING())
 
-    mock_join_result = json.dumps({"matched": "candidate_1", "score": 0.92})
+    mock_join_result = json.dumps(
+        {
+            "matched": True,
+            "match_score": 0.92,
+            "selected_candidate": {"candidate_id": "candidate_1"},
+            "reason": "best semantic match",
+        }
+    )
     from pyflink.semantic_runtime.llm_client import LLMClientConfig
 
     llm_config = LLMClientConfig(

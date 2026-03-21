@@ -56,7 +56,7 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
     sem_window_meta_descriptor,
 )
 from pyflink.semantic_runtime.runtime.event_model import (
-    SemanticEvent,
+    SemEvent,
     WindowSnapshot,
 )
 from pyflink.semantic_runtime.runtime.timer_policy import (
@@ -143,18 +143,18 @@ class SemWindowFunction(KeyedProcessFunction):
     def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
         """Process one incoming event.
 
-        The *value* is expected to be a dict (``SemanticEvent.to_dict()``
+        The *value* is expected to be a dict (``SemEvent.to_dict()``
         or compatible) serialised by Flink's ``Types.PICKLED_BYTE_ARRAY``.
 
         Yields ``WindowSnapshot.to_dict()`` dicts on the main output.
         """
-        # Materialise as SemanticEvent for convenience
+        # Materialise as SemEvent for convenience
         if isinstance(value, dict):
-            event = SemanticEvent.from_dict(value)
+            event = SemEvent.from_dict(value)
             event_dict = value
         else:
             # Fallback: treat as raw payload string
-            event = SemanticEvent(
+            event = SemEvent(
                 key=str(ctx.get_current_key()),
                 payload=str(value),
                 seq_id=0,
@@ -233,7 +233,7 @@ class SemWindowFunction(KeyedProcessFunction):
     # -- internals -----------------------------------------------------------
 
     def _check_triggers(
-        self, event: SemanticEvent, meta: Dict[str, Any]
+        self, event: SemEvent, meta: Dict[str, Any]
     ) -> Optional[str]:
         """Return trigger reason string or None."""
         # 1. Semantic boundary flag

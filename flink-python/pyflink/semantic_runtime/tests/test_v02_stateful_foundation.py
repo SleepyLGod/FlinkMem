@@ -20,7 +20,7 @@ import time
 import pytest
 
 from pyflink.semantic_runtime.runtime.event_model import (
-    SemanticEvent,
+    SemEvent,
     WindowSnapshot,
     simple_key_selector,
     composite_key_selector,
@@ -49,40 +49,40 @@ from pyflink.semantic_runtime.operators.stateful.sem_window import (
     _new_window_meta,
 )
 from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec, TriggerPolicy, TopKQuerySpec, TopKScopePolicy
+from pyflink.semantic_runtime.sem_spec import SemSpec, TriggerPolicy, TopKQuerySpec, TopKScopePolicy
 
 
 # ============================================================================
 # Event Model Tests
 # ============================================================================
 
-class TestSemanticEvent:
+class TestSemEvent:
     def test_roundtrip(self):
-        e = SemanticEvent(key="u1", payload="hello", seq_id=1, event_time_ms=1000)
+        e = SemEvent(key="u1", payload="hello", seq_id=1, event_time_ms=1000)
         d = e.to_dict()
-        e2 = SemanticEvent.from_dict(d)
+        e2 = SemEvent.from_dict(d)
         assert e2.key == "u1"
         assert e2.payload == "hello"
         assert e2.seq_id == 1
         assert e2.event_time_ms == 1000
 
     def test_effective_time_event(self):
-        e = SemanticEvent(key="k", payload="x", seq_id=0, event_time_ms=5000)
+        e = SemEvent(key="k", payload="x", seq_id=0, event_time_ms=5000)
         assert e.effective_time_ms == 5000
 
     def test_effective_time_proc(self):
-        e = SemanticEvent(key="k", payload="x", seq_id=0)
+        e = SemEvent(key="k", payload="x", seq_id=0)
         assert e.effective_time_ms == e.proc_time_ms
 
     def test_has_boundary(self):
-        e = SemanticEvent(key="k", payload="x", seq_id=0,
+        e = SemEvent(key="k", payload="x", seq_id=0,
                           boundary_flags={"topic_shift": True})
         assert e.has_boundary("topic_shift") is True
         assert e.has_boundary("intent_shift") is False
 
     def test_from_dict_ignores_extra_keys(self):
         d = {"key": "k", "payload": "p", "seq_id": 0, "extra_field": 42}
-        e = SemanticEvent.from_dict(d)
+        e = SemEvent.from_dict(d)
         assert e.key == "k"
 
 
@@ -252,19 +252,19 @@ class TestSemWindowBoundaryLogic:
 
     def test_count_trigger(self):
         func = self._make_func(max_events=3)
-        event = SemanticEvent(key="k", payload="x", seq_id=0)
+        event = SemEvent(key="k", payload="x", seq_id=0)
         meta = {"event_count": 3}
         assert func._check_triggers(event, meta) == "count"
 
     def test_count_not_yet(self):
         func = self._make_func(max_events=3)
-        event = SemanticEvent(key="k", payload="x", seq_id=0)
+        event = SemEvent(key="k", payload="x", seq_id=0)
         meta = {"event_count": 2}
         assert func._check_triggers(event, meta) is None
 
     def test_semantic_boundary(self):
         func = self._make_func()
-        event = SemanticEvent(key="k", payload="x", seq_id=0,
+        event = SemEvent(key="k", payload="x", seq_id=0,
                               boundary_flags={"topic_shift": True})
         meta = {"event_count": 1}
         assert func._check_triggers(event, meta) == "semantic_boundary"
@@ -272,7 +272,7 @@ class TestSemWindowBoundaryLogic:
     def test_semantic_boundary_priority(self):
         """Semantic boundary takes priority over count."""
         func = self._make_func(max_events=1)
-        event = SemanticEvent(key="k", payload="x", seq_id=0,
+        event = SemEvent(key="k", payload="x", seq_id=0,
                               boundary_flags={"topic_shift": True})
         meta = {"event_count": 1}
         assert func._check_triggers(event, meta) == "semantic_boundary"
@@ -368,7 +368,7 @@ class TestSemGroupbyLocalAssign:
             "g1": {"label": "machine learning algorithms", "event_count": 5},
             "g2": {"label": "web development frontend", "event_count": 3},
         })
-        event = SemanticEvent(key="k", payload="machine learning algorithms rock", seq_id=0)
+        event = SemEvent(key="k", payload="machine learning algorithms rock", seq_id=0)
         gid, score = func._local_assign(event)
         assert gid == "g1"
         assert score > 0.5
@@ -377,13 +377,13 @@ class TestSemGroupbyLocalAssign:
         func = self._make_func_with_groups({
             "g1": {"label": "machine learning", "event_count": 5},
         })
-        event = SemanticEvent(key="k", payload="completely unrelated topic", seq_id=0)
+        event = SemEvent(key="k", payload="completely unrelated topic", seq_id=0)
         gid, score = func._local_assign(event)
         assert score == 0.0
 
     def test_empty_groups(self):
         func = self._make_func_with_groups({})
-        event = SemanticEvent(key="k", payload="anything", seq_id=0)
+        event = SemEvent(key="k", payload="anything", seq_id=0)
         gid, score = func._local_assign(event)
         assert gid is None
         assert score == 0.0
@@ -393,7 +393,7 @@ class TestSemGroupbyLocalAssign:
             "g1": {"label": "python programming", "event_count": 5},
             "g2": {"label": "python web flask django", "event_count": 3},
         })
-        event = SemanticEvent(key="k", payload="python web flask", seq_id=0)
+        event = SemEvent(key="k", payload="python web flask", seq_id=0)
         gid, score = func._local_assign(event)
         assert gid == "g2"
 
@@ -402,7 +402,7 @@ class TestSemGroupbyLocalAssign:
 # SemSearch Logic Tests (no Flink runtime)
 # ============================================================================
 
-from pyflink.semantic_runtime.runtime.sem_search import (
+from pyflink.semantic_runtime.runtime.steps.sem_search import (
     SemSearchConfig,
     SemSearchFunction,
 )
@@ -429,7 +429,7 @@ class TestSemSearchLocalRetrieve:
             "c2": {"content": "web development react frontend", "source": "doc2"},
             "c3": {"content": "machine learning pytorch training", "source": "doc3"},
         })
-        event = SemanticEvent(key="k", payload="machine learning", seq_id=0)
+        event = SemEvent(key="k", payload="machine learning", seq_id=0)
         results = func._local_retrieve(event)
         assert len(results) >= 2
         # Top results should be ML-related
@@ -439,13 +439,13 @@ class TestSemSearchLocalRetrieve:
         func = self._make_func_with_cache({
             "c1": {"content": "completely irrelevant xyz", "source": "doc1"},
         })
-        event = SemanticEvent(key="k", payload="quantum computing", seq_id=0)
+        event = SemEvent(key="k", payload="quantum computing", seq_id=0)
         results = func._local_retrieve(event)
         assert len(results) == 0
 
     def test_empty_cache(self):
         func = self._make_func_with_cache({})
-        event = SemanticEvent(key="k", payload="anything", seq_id=0)
+        event = SemEvent(key="k", payload="anything", seq_id=0)
         results = func._local_retrieve(event)
         assert results == []
 
@@ -454,7 +454,7 @@ class TestSemSearchLocalRetrieve:
             "c1": {"content": "python", "source": "a"},
             "c2": {"content": "python programming language", "source": "b"},
         })
-        event = SemanticEvent(key="k", payload="python", seq_id=0)
+        event = SemEvent(key="k", payload="python", seq_id=0)
         results = func._local_retrieve(event)
         assert len(results) >= 1
         # c1 has perfect keyword match (1/1), c2 partial (1/3)
@@ -468,7 +468,7 @@ class TestSemSearchLocalRetrieve:
             "c1": {"content": "sunny warm weather forecast", "source": "a"},
             "c2": {"content": "rain storm alert", "source": "b"},
         })
-        event = SemanticEvent(key="k", payload="best sunny weather", seq_id=0)
+        event = SemEvent(key="k", payload="best sunny weather", seq_id=0)
         results = func._local_retrieve(event)
         assert results
         assert results[0]["candidate_id"] == "c1"
@@ -481,7 +481,7 @@ class TestSemSearchLocalRetrieve:
             "c1": {"text": "budget planning update", "source": "a"},
             "c2": {"text": "travel packing list", "source": "b"},
         })
-        event = SemanticEvent(key="k", payload="budget update", seq_id=0)
+        event = SemEvent(key="k", payload="budget update", seq_id=0)
         results = func._local_retrieve(event)
         assert results
         assert results[0]["candidate_id"] == "c1"
@@ -712,7 +712,7 @@ from pyflink.semantic_runtime.operators.stateful.sem_topk import (
     SemTopKConfig,
     SemTopKFunction,
 )
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec, TopKScopePolicy
+from pyflink.semantic_runtime.sem_spec import TopKQuerySpec, TopKScopePolicy
 
 class TestSemTopKConfig:
     def test_defaults(self):
@@ -749,7 +749,7 @@ class TestSemTopKConfig:
 
     def test_topk_query_spec_roundtrip_with_session_scope(self):
         spec = TopKQuerySpec(
-            semantic=SemanticSpec.for_sem_topk("rank best weather days"),
+            semantic=SemSpec.for_sem_topk("rank best weather days"),
             k=4,
             query_id="topk1",
             query_version=3,
@@ -775,7 +775,7 @@ class TestSemTopKConfig:
 
         with pytest.raises(ValueError, match="does not expose backend selection"):
             TopKQuerySpec(
-                semantic=SemanticSpec(
+                semantic=SemSpec(
                     instruction="rank best weather days",
                     backend="embedding",
                     output_mode="score",
@@ -1227,5 +1227,5 @@ class TestSemTopKPureStateMachine:
 
 
 # ============================================================================
-# SemanticSpec & RuntimeConfig Tests
+# SemSpec & RuntimeConfig Tests
 # ============================================================================

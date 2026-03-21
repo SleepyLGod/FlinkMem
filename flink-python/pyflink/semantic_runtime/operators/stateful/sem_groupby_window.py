@@ -31,12 +31,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pyflink.datastream.functions import KeyedProcessFunction
 
-from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
+from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec
 from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG, AsyncWorkItem
 from pyflink.semantic_runtime.runtime.event_model import (
-    SemanticEvent,
+    SemEvent,
     is_window_snapshot,
-    window_snapshot_to_semantic_events,
+    window_snapshot_to_sem_events,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     _ASYNC_ASSIGNMENT_METHODS,
@@ -83,7 +83,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
         if not is_window_snapshot(value):
             return
 
-        events = [SemanticEvent.from_dict(e) for e in window_snapshot_to_semantic_events(value)]
+        events = [SemEvent.from_dict(e) for e in window_snapshot_to_sem_events(value)]
         if not events:
             return
 
@@ -130,7 +130,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
     def _assign_within_scope(
         self,
         groups: Dict[str, Dict[str, Any]],
-        event: SemanticEvent,
+        event: SemEvent,
     ) -> List[Dict[str, Any]]:
         now_ms = int(time.time() * 1000)
         if self._resolved_assignment_method not in _LOCAL_ASSIGNMENT_METHODS:
@@ -149,7 +149,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
     def _local_assign(
         self,
         groups: Dict[str, Dict[str, Any]],
-        event: SemanticEvent,
+        event: SemEvent,
     ) -> Tuple[Optional[str], float]:
         best_id: Optional[str] = None
         best_score = 0.0
@@ -169,7 +169,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
         self,
         groups: Dict[str, Dict[str, Any]],
         group_id: str,
-        event: SemanticEvent,
+        event: SemEvent,
         now_ms: int,
     ) -> None:
         profile = groups.get(group_id)
@@ -181,7 +181,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
     def _maybe_create_group(
         self,
         groups: Dict[str, Dict[str, Any]],
-        event: SemanticEvent,
+        event: SemEvent,
         now_ms: int,
     ) -> Optional[str]:
         count = len(groups)
@@ -206,7 +206,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
     def _create_group_or_raise(
         self,
         groups: Dict[str, Dict[str, Any]],
-        event: SemanticEvent,
+        event: SemEvent,
         now_ms: int,
     ) -> str:
         """Create a new group or fail when policy forbids it."""
@@ -219,7 +219,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
 
     @staticmethod
     def _assignment_row(
-        event: SemanticEvent,
+        event: SemEvent,
         group_id: str,
         confidence: float,
         source: str,
@@ -236,7 +236,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             "boundary_flags": dict(event.boundary_flags),
         }
 
-    def _build_scope_async_payload(self, events: List[SemanticEvent]) -> Dict[str, Any]:
+    def _build_scope_async_payload(self, events: List[SemEvent]) -> Dict[str, Any]:
         """Build one scope-level async assignment payload."""
         return {
             "events": [event.to_dict() for event in events],

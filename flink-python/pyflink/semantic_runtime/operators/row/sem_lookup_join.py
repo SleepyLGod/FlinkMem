@@ -36,10 +36,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
@@ -123,6 +122,8 @@ class SemLookupJoinConfig:
     """Picklable configuration for SemLookupJoinFunction."""
     max_candidates_per_record: int = 20
     retrieve_timeout_ms: float = 5000.0
+    left_block_size: int = 1
+    right_block_size: Optional[int] = None
     search_backend: Optional[ExternalSearchBackend] = None
     # mock-specific
     mock_candidates: Optional[List[Any]] = None
@@ -163,6 +164,10 @@ class SemLookupJoinFunction(AsyncFunction):
         self._client = create_llm_client(self._llm_config)
         self._op_metrics = OperatorMetrics.from_runtime_context(runtime_context, "sem_lookup_join")
         cfg = self._join_config
+        if cfg.left_block_size != 1:
+            raise ValueError("row-level sem_lookup_join requires left_block_size == 1")
+        if cfg.right_block_size is not None and cfg.right_block_size <= 0:
+            raise ValueError("sem_lookup_join requires right_block_size > 0 when set")
         if cfg.search_backend is not None:
             self._retriever = CandidateRetrieverFromSearchBackend(cfg.search_backend)
         elif cfg.mock_candidates is not None:
@@ -171,8 +176,12 @@ class SemLookupJoinFunction(AsyncFunction):
         else:
             self._retriever = MockCandidateRetriever([], 0.0)
         self._retriever.open()
-        logger.info("SemLookupJoinFunction opened (max_cand=%d, timeout=%dms)",
-                     cfg.max_candidates_per_record, cfg.retrieve_timeout_ms)
+        logger.info(
+            "SemLookupJoinFunction opened (max_cand=%d, timeout=%dms, right_block_size=%s)",
+            cfg.max_candidates_per_record,
+            cfg.retrieve_timeout_ms,
+            cfg.right_block_size,
+        )
 
     def close(self) -> None:
         if self._client is not None:
@@ -216,32 +225,8 @@ class SemLookupJoinFunction(AsyncFunction):
             logger.info("sem_lookup_join: truncated to %d candidates",
                         cfg.max_candidates_per_record)
 
-        # 3. LLM semantic matching
-        prompt = self._prompt_template.format(
-            input=value,
-            candidates=json.dumps(candidates),
-        )
-
-        try:
-            text, metrics = await self._client.call(prompt)
-        except Exception as e:
-            logger.warning("LLM call failed for sem_lookup_join: %s", e)
-            if om:
-                om.record_error()
-            raise RuntimeError(f"sem_lookup_join LLM call failed: {e}") from e
-
-        if om:
-            om.record_call(metrics.latency_ms, metrics.input_tokens,
-                           metrics.output_tokens, metrics.attempts)
-
-        # 4. Parse response
-        try:
-            parsed = json.loads(text)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("sem_lookup_join JSON parse failed: %s", e)
-            if om:
-                om.record_invalid_output()
-            raise ValueError(f"sem_lookup_join expected valid JSON output: {e}") from e
+        # 3. Pair-block semantic matching
+        parsed = await self._evaluate_candidate_blocks(value, candidates, om)
 
         result = {
             "_input": value,
@@ -249,7 +234,6 @@ class SemLookupJoinFunction(AsyncFunction):
             "candidate_count": len(candidates),
             "truncated": truncated,
         }
-        attach_metrics(result, metrics)
         return [json.dumps(result)]
 
     def timeout(self, value) -> List[str]:
@@ -257,3 +241,86 @@ class SemLookupJoinFunction(AsyncFunction):
         if self._op_metrics:
             self._op_metrics.record_timeout()
         raise TimeoutError(f"sem_lookup_join timed out for input: {value!r}")
+
+    async def _evaluate_candidate_blocks(
+        self,
+        value: Any,
+        candidates: List[Any],
+        metrics_sink: Optional[OperatorMetrics],
+    ) -> Dict[str, Any]:
+        """Evaluate bounded candidate blocks and return the best join result."""
+        best_result: Optional[Dict[str, Any]] = None
+        for block in self._candidate_blocks(candidates):
+            block_result = await self._evaluate_one_block(value, block, metrics_sink)
+            if best_result is None or float(block_result["match_score"]) > float(best_result["match_score"]):
+                best_result = block_result
+
+        if best_result is None:
+            return {
+                "matched": False,
+                "match_score": 0.0,
+                "selected_candidate": None,
+                "reason": "no candidates",
+            }
+        return best_result
+
+    def _candidate_blocks(self, candidates: List[Any]) -> List[List[Any]]:
+        """Split candidates into right-side evaluation blocks."""
+        block_size = self._join_config.right_block_size or len(candidates) or 1
+        return [
+            candidates[start : start + block_size]
+            for start in range(0, len(candidates), block_size)
+        ]
+
+    async def _evaluate_one_block(
+        self,
+        value: Any,
+        candidates: List[Any],
+        metrics_sink: Optional[OperatorMetrics],
+    ) -> Dict[str, Any]:
+        """Evaluate one candidate block with the semantic match backend."""
+        assert self._client is not None, "open() was not called"
+
+        prompt = self._prompt_template.format(
+            input=value,
+            candidates=json.dumps(candidates),
+        )
+        try:
+            text, metrics = await self._client.call(prompt)
+        except Exception as exc:
+            logger.warning("LLM call failed for sem_lookup_join: %s", exc)
+            if metrics_sink:
+                metrics_sink.record_error()
+            raise RuntimeError(f"sem_lookup_join LLM call failed: {exc}") from exc
+
+        if metrics_sink:
+            metrics_sink.record_call(
+                metrics.latency_ms,
+                metrics.input_tokens,
+                metrics.output_tokens,
+                metrics.attempts,
+            )
+
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("sem_lookup_join JSON parse failed: %s", exc)
+            if metrics_sink:
+                metrics_sink.record_invalid_output()
+            raise ValueError(f"sem_lookup_join expected valid JSON output: {exc}") from exc
+
+        return self._validate_block_result(parsed)
+
+    def _validate_block_result(self, parsed: Any) -> Dict[str, Any]:
+        """Validate one pair-block result."""
+        if not isinstance(parsed, dict):
+            raise ValueError("sem_lookup_join expected JSON object output")
+        required_fields = {"matched", "match_score", "selected_candidate", "reason"}
+        if not required_fields.issubset(parsed):
+            raise ValueError("sem_lookup_join response violates required block schema")
+        return {
+            "matched": bool(parsed["matched"]),
+            "match_score": float(parsed["match_score"]),
+            "selected_candidate": parsed["selected_candidate"],
+            "reason": str(parsed["reason"]),
+        }

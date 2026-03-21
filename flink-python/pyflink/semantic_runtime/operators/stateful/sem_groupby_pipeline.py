@@ -29,9 +29,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from pyflink.semantic_runtime.semantic_spec import GroupbyQuerySpec
-from pyflink.semantic_runtime.runtime.semantic_lowering import (
-    SemanticLoweringPlan,
+from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec
+from pyflink.semantic_runtime.runtime.plans import (
+    SemLoweringPlan,
     resolve_groupby_lowering_plan,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
@@ -49,7 +49,7 @@ class GroupbyExecutionPlan:
 
     execution_path: str = "operator_owned"
     input_kind: str = "event_stream"
-    lowering_plan: Optional[SemanticLoweringPlan] = None
+    lowering_plan: Optional[SemLoweringPlan] = None
 
 
 def resolve_groupby_execution_plan(

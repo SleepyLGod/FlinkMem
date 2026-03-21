@@ -39,8 +39,9 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators.row._common import attach_metrics, validate_generic_semantic_spec
-from pyflink.semantic_runtime.semantic_spec import SemanticSpec
+from pyflink.semantic_runtime.operators.row._common import attach_metrics, validate_generic_sem_spec
+from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_filter_prompt
+from pyflink.semantic_runtime.sem_spec import SemSpec
 
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.runtime_config import RuntimeConfig
@@ -138,23 +139,23 @@ class SemFilterFunction(AsyncFunction):
 
 
 def build_sem_filter_operator(
-    semantic: SemanticSpec,
+    semantic: SemSpec,
     runtime_config: "RuntimeConfig",
 ) -> SemFilterFunction:
     """Build a public row-style semantic filter operator."""
-    validate_generic_semantic_spec(
+    validate_generic_sem_spec(
         semantic,
         operator_name="sem_filter",
         allowed_output_modes={"bool"},
     )
     from pyflink.semantic_runtime.public_api import sem_filter
-    from pyflink.semantic_runtime.runtime.operator_plans import lower_sem_filter_request
+    from pyflink.semantic_runtime.runtime.plans import lower_sem_filter_request
 
     plan = lower_sem_filter_request(
         sem_filter(intent=semantic.instruction),
         runtime_config,
     )
     return SemFilterFunction(
-        prompt_template=plan.intent,
+        prompt_template=build_sem_filter_prompt(plan.intent),
         llm_config=plan.llm_config,
     )

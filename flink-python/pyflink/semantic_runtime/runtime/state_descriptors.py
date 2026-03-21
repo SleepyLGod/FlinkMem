@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Overflow / degrade policy
+# Overflow policy
 # ---------------------------------------------------------------------------
 
 class OverflowPolicy(enum.Enum):
@@ -99,7 +99,7 @@ def sem_window_event_buffer_descriptor(
 ) -> ListStateDescriptor:
     """ListState descriptor for the semantic window event buffer.
 
-    Each element is a pickled ``SemanticEvent.to_dict()`` dict.
+    Each element is a pickled ``SemEvent.to_dict()`` dict.
     """
     desc = ListStateDescriptor("sem_window_event_buffer", Types.PICKLED_BYTE_ARRAY())
     desc.enable_time_to_live(build_ttl_config(ttl_seconds))

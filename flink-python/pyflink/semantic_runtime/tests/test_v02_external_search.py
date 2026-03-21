@@ -141,7 +141,7 @@ class TestExternalSearchBackendInterface:
             "Match {input} with: {candidates}",
             LLMClientConfig(
                 backend="mock",
-                mock_response='{"matched":"c1","score":0.9}',
+                mock_response='{"matched": true, "match_score": 0.9, "selected_candidate": {"candidate_id":"c1"}, "reason": "best"}',
             ),
             SemLookupJoinConfig(
                 max_candidates_per_record=3,
@@ -161,7 +161,72 @@ class TestExternalSearchBackendInterface:
         assert backend.opened is False
         parsed = json.loads(out)
         assert parsed["candidate_count"] == 1
-        assert parsed["join_result"]["matched"] == "c1"
+        assert parsed["join_result"]["matched"] is True
+        assert parsed["join_result"]["selected_candidate"]["candidate_id"] == "c1"
+
+    def test_sem_lookup_join_uses_right_side_blocks_and_merges_best_match(self):
+        responses = [
+            json.dumps(
+                {
+                    "matched": True,
+                    "match_score": 0.6,
+                    "selected_candidate": {"candidate_id": "c1"},
+                    "reason": "first block",
+                }
+            ),
+            json.dumps(
+                {
+                    "matched": True,
+                    "match_score": 0.95,
+                    "selected_candidate": {"candidate_id": "c3"},
+                    "reason": "second block",
+                }
+            ),
+        ]
+
+        class _SequencedMockClient:
+            def __init__(self, items):
+                self._items = list(items)
+
+            async def call(self, prompt):
+                from pyflink.semantic_runtime.llm_client import LLMCallMetrics
+
+                if not self._items:
+                    raise RuntimeError("no more mock responses")
+                return self._items.pop(0), LLMCallMetrics()
+
+            def close(self):
+                return None
+
+        fn = SemLookupJoinFunction(
+            "Match {input} with: {candidates}",
+            LLMClientConfig(backend="mock"),
+            SemLookupJoinConfig(
+                max_candidates_per_record=4,
+                right_block_size=2,
+                mock_candidates=[
+                    {"candidate_id": "c1"},
+                    {"candidate_id": "c2"},
+                    {"candidate_id": "c3"},
+                    {"candidate_id": "c4"},
+                ],
+            ),
+        )
+
+        class _FakeRuntimeContext:
+            pass
+
+        fn.open(_FakeRuntimeContext())
+        fn._client = _SequencedMockClient(responses)
+        try:
+            out = asyncio.run(fn.async_invoke("budget update"))[0]
+        finally:
+            fn.close()
+
+        parsed = json.loads(out)
+        assert parsed["candidate_count"] == 4
+        assert parsed["join_result"]["selected_candidate"]["candidate_id"] == "c3"
+        assert parsed["join_result"]["match_score"] == 0.95
 
 
 # ============================================================================

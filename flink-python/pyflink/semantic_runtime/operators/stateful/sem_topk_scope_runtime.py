@@ -32,7 +32,7 @@ from pyflink.common.typeinfo import Types
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import MapState, ValueState, ValueStateDescriptor
 
-from pyflink.semantic_runtime.semantic_spec import TopKQuerySpec
+from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     build_ttl_config,

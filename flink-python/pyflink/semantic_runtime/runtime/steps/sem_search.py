@@ -18,7 +18,7 @@
 """
 sem_search — continuous stateful retrieval over keyed state.
 
-Input: keyed ``SemanticEvent`` dicts (query/request records).
+Input: keyed ``SemEvent`` dicts (query/request records).
 
 Output: bounded retrieved candidate sets with stable ordering metadata.
 
@@ -59,7 +59,7 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
     sem_search_cache_descriptor,
     build_ttl_config,
 )
-from pyflink.semantic_runtime.runtime.event_model import SemanticEvent
+from pyflink.semantic_runtime.runtime.event_model import SemEvent
 from pyflink.semantic_runtime.runtime.async_bridge import (
     ASYNC_WORK_TAG,
     AsyncWorkItem,
@@ -161,12 +161,12 @@ class SemSearchFunction(KeyedProcessFunction):
             yield from self._handle_async_result(value, now_ms)
             return
 
-        # Parse as SemanticEvent
+        # Parse as SemEvent
         if isinstance(value, dict):
-            event = SemanticEvent.from_dict(value)
+            event = SemEvent.from_dict(value)
             event_dict = value
         else:
-            event = SemanticEvent(
+            event = SemEvent(
                 key=str(ctx.get_current_key()), payload=str(value), seq_id=0,
             )
             event_dict = event.to_dict()
@@ -252,7 +252,7 @@ class SemSearchFunction(KeyedProcessFunction):
 
     # -- internals -----------------------------------------------------------
 
-    def _local_retrieve(self, event: SemanticEvent) -> List[Dict[str, Any]]:
+    def _local_retrieve(self, event: SemEvent) -> List[Dict[str, Any]]:
         """Retrieve matching candidates from keyed cache.
 
         Supports a default keyword overlap path and a lightweight local

@@ -38,20 +38,20 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.semantic_spec import (
+from pyflink.semantic_runtime.sem_spec import (
     AggQuerySpec,
     GroupbyQuerySpec,
     JoinQuerySpec,
-    SemanticSpec,
+    SemSpec,
     TopKQuerySpec,
 )
 if TYPE_CHECKING:
-    from pyflink.semantic_runtime.runtime.semantic_lowering import SemanticLoweringPlan
+    from pyflink.semantic_runtime.runtime.plans import SemLoweringPlan
     from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
     from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
     from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
     from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
-    from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig
+    from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig
     from pyflink.semantic_runtime.runtime.state_descriptors import OverflowPolicy
 
 
@@ -124,27 +124,27 @@ class EmbeddingBackendConfig:
 class TopKRuntimeBundle:
     query_spec: TopKQuerySpec
     kernel_config: "SemTopKConfig"
-    lowering_plan: "SemanticLoweringPlan"
+    lowering_plan: "SemLoweringPlan"
 
 
 @dataclass(frozen=True)
 class GroupbyRuntimeBundle:
     query_spec: GroupbyQuerySpec
     kernel_config: "SemGroupbyConfig"
-    lowering_plan: "SemanticLoweringPlan"
+    lowering_plan: "SemLoweringPlan"
 
 
 @dataclass(frozen=True)
 class AggRuntimeBundle:
     query_spec: AggQuerySpec
     kernel_config: "SemAggConfig"
-    lowering_plan: "SemanticLoweringPlan"
+    lowering_plan: "SemLoweringPlan"
 
 
 @dataclass(frozen=True)
 class JoinRuntimeBundle:
     query_spec: JoinQuerySpec
-    lowering_plan: "SemanticLoweringPlan"
+    lowering_plan: "SemLoweringPlan"
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +240,7 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
         scope["max_candidates"] = raw["max_candidates"]
 
     out: Dict[str, Any] = {
-        "semantic": SemanticSpec.for_sem_topk(
+        "semantic": SemSpec.for_sem_topk(
             raw.get("instruction", ""),
             threshold=raw.get("threshold"),
         ).to_dict(),
@@ -291,7 +291,7 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
         scope["max_groups_per_key"] = raw["max_groups_per_key"]
 
     return {
-        "semantic": SemanticSpec(
+        "semantic": SemSpec(
             instruction=raw.get("instruction", "Assign tuples to semantic groups."),
             backend="hybrid",
             output_mode="label",
@@ -337,7 +337,7 @@ def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) 
         scope["flush_interval_ms"] = raw["flush_interval_ms"]
 
     return {
-        "semantic": SemanticSpec(
+        "semantic": SemSpec(
             instruction=raw.get("instruction", "Aggregate semantic state over a keyed stream."),
             backend="hybrid",
             output_mode="summary",
@@ -367,7 +367,7 @@ def _normalize_join_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
             scope[field] = raw[field]
 
     return {
-        "semantic": SemanticSpec(
+        "semantic": SemSpec(
             instruction=raw.get("instruction", "Decide whether left and right tuples semantically join."),
             backend=raw.get("backend", "llm"),
             output_mode="bool",
@@ -438,7 +438,7 @@ class RuntimeConfig:
 
     - operator query semantics (`QuerySpec`)
     - kernel/runtime config (`Sem*Config`)
-    - lowering view (`SemanticLoweringPlan`)
+    - lowering view (`SemLoweringPlan`)
     """
 
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
@@ -496,6 +496,19 @@ class RuntimeConfig:
         _query_raw, kernel_raw = self._get_operator_sections(
             operator_name,
             allow_query_spec=False,
+        )
+        return _build_llm_client_config(self.llm, kernel_raw)
+
+    def get_operator_llm_client_config(
+        self,
+        operator_name: str,
+        *,
+        allow_query_spec: bool,
+    ) -> LLMClientConfig:
+        """Return the operator-scoped LLM client config for any operator section."""
+        _query_raw, kernel_raw = self._get_operator_sections(
+            operator_name,
+            allow_query_spec=allow_query_spec,
         )
         return _build_llm_client_config(self.llm, kernel_raw)
 
@@ -635,7 +648,7 @@ class RuntimeConfig:
         return SemAggConfig(**kwargs)
 
     def get_search_config(self) -> "SemSearchConfig":
-        from pyflink.semantic_runtime.runtime.sem_search import SemSearchConfig
+        from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig
 
         operator_name = _sem_search_operator_name(self.operators)
         _query_raw, kernel_raw = self._get_operator_sections(
@@ -676,7 +689,7 @@ class RuntimeConfig:
     # -- resolved bundles ----------------------------------------------------
 
     def resolve_topk_runtime_bundle(self) -> TopKRuntimeBundle:
-        from pyflink.semantic_runtime.runtime.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.plans import (
             resolve_topk_lowering_plan,
         )
 
@@ -688,7 +701,7 @@ class RuntimeConfig:
         )
 
     def resolve_groupby_runtime_bundle(self, *, input_kind: str = "event_stream") -> GroupbyRuntimeBundle:
-        from pyflink.semantic_runtime.runtime.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.plans import (
             resolve_groupby_lowering_plan,
         )
 
@@ -700,7 +713,7 @@ class RuntimeConfig:
         )
 
     def resolve_agg_runtime_bundle(self, *, input_kind: str = "event_stream") -> AggRuntimeBundle:
-        from pyflink.semantic_runtime.runtime.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.plans import (
             resolve_agg_lowering_plan,
         )
 
@@ -712,7 +725,7 @@ class RuntimeConfig:
         )
 
     def resolve_join_runtime_bundle(self) -> JoinRuntimeBundle:
-        from pyflink.semantic_runtime.runtime.semantic_lowering import (
+        from pyflink.semantic_runtime.runtime.plans import (
             resolve_join_lowering_plan,
         )
 
