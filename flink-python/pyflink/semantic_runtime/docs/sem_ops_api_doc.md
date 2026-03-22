@@ -1192,9 +1192,10 @@ This is the bridge between:
 
 **Layout rules**:
 
-- semantic operators (`sem_topk`, `sem_groupby`, `sem_agg`, `sem_join`) must use nested `query_spec` + `kernel`
-- runtime helpers (`sem_window`, `sem_search`) must use nested `kernel`
-- defaults such as `ttl_seconds` are injected into operator scope policies during typed hydration
+- public user entry is the facade layer (`sem_topk(...)`, `sem_groupby(...)`, `sem_agg(...)`, `sem_join(...)`)
+- nested `query_spec` + `kernel` is the internal/expert-layer runtime layout for semantic operators
+- nested `kernel` is the internal/expert-layer runtime layout for runtime helpers (`sem_window`, `sem_search`)
+- defaults such as `ttl_seconds` are injected during typed hydration inside the internal runtime layer
 
 **Workflow bridge**:
 

@@ -1197,9 +1197,10 @@ req = sem_topk(
 
 **布局规则**：
 
-- semantic operators（`sem_topk`、`sem_groupby`、`sem_agg`、`sem_join`）必须使用 nested `query_spec` + `kernel`
-- runtime helpers（`sem_window`、`sem_search`）必须使用 nested `kernel`
-- `ttl_seconds` 这类 defaults 会在 typed hydration 阶段自动注入到 operator scope policy
+- user 的主入口是 facade 层（`sem_topk(...)`、`sem_groupby(...)`、`sem_agg(...)`、`sem_join(...)`）
+- nested `query_spec` + `kernel` 是 semantic operators 的 internal/expert-layer runtime 布局
+- nested `kernel` 是 runtime helpers（`sem_window`、`sem_search`）的 internal/expert-layer runtime 布局
+- `ttl_seconds` 这类 defaults 会在 internal runtime layer 的 typed hydration 阶段自动注入
 
 **工作流桥接**：
 
