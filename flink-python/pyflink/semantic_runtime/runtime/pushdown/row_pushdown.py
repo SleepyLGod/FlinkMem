@@ -24,7 +24,6 @@ from pyflink.semantic_runtime.runtime.plans import (
 from pyflink.semantic_runtime.runtime.prompt_templates import (
     build_sem_filter_prompt,
     build_sem_lookup_join_prompt,
-    build_sem_local_topk_scoring_prompt,
     build_sem_map_prompt,
 )
 from pyflink.semantic_runtime.runtime.pushdown.common import parse_candidate_pool
@@ -207,7 +206,7 @@ def apply_sem_local_topk_pushdown(
         candidates_field=candidates_field,
     )
     scoring_fn = SemLocalTopKScoringFunction(
-        prompt_template=build_sem_local_topk_scoring_prompt(plan.intent),
+        score_intent=plan.intent,
         llm_config=plan.llm_config,
         candidates_field=plan.candidates_field,
     )

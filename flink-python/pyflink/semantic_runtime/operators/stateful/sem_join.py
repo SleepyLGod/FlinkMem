@@ -23,15 +23,12 @@ It is an internal/expert-layer kernel, not a public API.
 
 from __future__ import annotations
 
-import asyncio
-import json
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from pyflink.datastream.functions import KeyedCoProcessFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
-from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_join_block_prompt
 from pyflink.semantic_runtime.runtime.pushdown.common import parse_window_snapshot
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     sem_join_left_buffer_descriptor,
@@ -41,6 +38,7 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
 )
 from pyflink.semantic_runtime.runtime.event_model import window_snapshot_to_sem_events
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
+from pyflink.semantic_runtime.runtime.steps import evaluate_sem_match_block_sync
 from pyflink.semantic_runtime.sem_spec import JoinQuerySpec
 
 
@@ -88,49 +86,6 @@ def _validate_sem_join_backend(query_spec: JoinQuerySpec) -> None:
         )
 
 
-def _call_client_sync(client: LLMClient, prompt: str) -> tuple[str, Any]:
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(client.call(prompt))
-    finally:
-        loop.close()
-
-
-def _parse_match_block(payload: str, *, expected_size: int) -> List[Dict[str, Any]]:
-    try:
-        parsed = json.loads(payload)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError(f"sem_join expected valid JSON output: {exc}") from exc
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("matches"), list):
-        raise ValueError("sem_join block response must contain a matches list")
-
-    results: List[Dict[str, Any]] = []
-    for item in parsed["matches"]:
-        if not isinstance(item, dict):
-            raise ValueError("sem_join match entry must be a dict")
-        pair_idx = item.get("pair_idx")
-        matched = item.get("matched")
-        score = item.get("match_score")
-        reason = item.get("reason")
-        if not isinstance(pair_idx, int) or not 0 <= pair_idx < expected_size:
-            raise ValueError("sem_join match pair_idx is out of range")
-        if not isinstance(matched, bool):
-            raise ValueError("sem_join match entry must include bool matched")
-        if not isinstance(score, (int, float)):
-            raise ValueError("sem_join match entry must include numeric match_score")
-        if not isinstance(reason, str):
-            raise ValueError("sem_join match entry must include string reason")
-        results.append(
-            {
-                "pair_idx": pair_idx,
-                "matched": matched,
-                "match_score": float(score),
-                "reason": reason,
-            }
-        )
-    return results
-
-
 def _build_pair_rows(
     left_rows: List[Any],
     right_rows: List[Any],
@@ -168,6 +123,7 @@ def _pair_blocks(
 def _evaluate_pair_rows(
     *,
     client: LLMClient,
+    llm_config: LLMClientConfig,
     query_spec: JoinQuerySpec,
     kernel_config: SemJoinConfig,
     left_rows: List[Any],
@@ -183,11 +139,12 @@ def _evaluate_pair_rows(
 
     outputs: List[Dict[str, Any]] = []
     for block in _pair_blocks(pair_rows, pair_block_size=kernel_config.pair_block_size):
-        prompt = build_sem_join_block_prompt(query_spec.semantic.instruction).format(
-            pair_block=json.dumps(block)
+        matches = evaluate_sem_match_block_sync(
+            client=client,
+            llm_config=llm_config,
+            intent=query_spec.semantic.instruction,
+            pair_block=block,
         )
-        payload, _metrics = _call_client_sync(client, prompt)
-        matches = _parse_match_block(payload, expected_size=len(block))
         for match in matches:
             if not bool(match["matched"]):
                 continue
@@ -341,6 +298,7 @@ class SemJoinFunction(KeyedCoProcessFunction):
         assert self._client is not None, "open() was not called"
         return _evaluate_pair_rows(
             client=self._client,
+            llm_config=self._llm_config,
             query_spec=self._query_spec,
             kernel_config=self._kernel_config,
             left_rows=[row["payload"] for row in left_rows],
@@ -456,6 +414,7 @@ class WindowOwnedSemJoinFunction(KeyedCoProcessFunction):
         right_rows = [event.get("payload") for event in window_snapshot_to_sem_events(right_snapshot)]
         outputs = _evaluate_pair_rows(
             client=self._client,
+            llm_config=self._llm_config,
             query_spec=self._query_spec,
             kernel_config=self._kernel_config,
             left_rows=left_rows,

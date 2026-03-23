@@ -19,7 +19,8 @@
 sem_local_topk — local (row-level) semantic top-k over a bounded candidate list.
 
 The input record is expected to be a JSON string carrying a ``candidates``
-list.  The LLM reranks these candidates and returns the top-k.
+list. The operator uses the internal ``sem_score`` step to score these
+candidates and returns the top-k.
 
 This is the **local** V0.1 variant (no keyed state).  The continuous,
 stateful ``sem_topk`` lives in ``operators/stateful/sem_topk.py``.
@@ -39,8 +40,11 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
-from pyflink.semantic_runtime.operators.row._common import attach_metrics, validate_generic_sem_spec
-from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_local_topk_scoring_prompt
+from pyflink.semantic_runtime.operators.row._common import validate_generic_sem_spec
+from pyflink.semantic_runtime.runtime.steps import (
+    evaluate_sem_score_block_payload,
+    parse_sem_score_block,
+)
 from pyflink.semantic_runtime.sem_spec import SemSpec
 
 if TYPE_CHECKING:
@@ -54,11 +58,11 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
 
     def __init__(
         self,
-        prompt_template: str,
+        score_intent: str,
         llm_config: LLMClientConfig,
         candidates_field: str = "candidates",
     ) -> None:
-        self._prompt_template = prompt_template
+        self._score_intent = score_intent
         self._llm_config = llm_config
         self._candidates_field = candidates_field
         self._client: Optional[LLMClient] = None
@@ -101,63 +105,57 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
         assert self._client is not None, "open() was not called"
 
         record, candidates = self._parse_input_record(value)
-        prompt = self._prompt_template.format(
-            input=json.dumps(record),
-            candidates=json.dumps(candidates),
-        )
-
         try:
-            text, metrics = await self._client.call(prompt)
+            payload = await evaluate_sem_score_block_payload(
+                client=self._client,
+                llm_config=self._llm_config,
+                intent=self._score_intent,
+                score_block=[
+                    {
+                        "item_idx": idx,
+                        "input_record": record,
+                        "candidate": candidate,
+                    }
+                    for idx, candidate in enumerate(candidates)
+                ],
+            )
         except Exception as exc:
-            logger.warning("LLM call failed for sem_topk: %s", exc)
+            logger.warning("LLM call failed for sem_local_topk sem_score block: %s", exc)
             if self._op_metrics:
                 self._op_metrics.record_error()
             raise RuntimeError(f"sem_local_topk LLM call failed: {exc}") from exc
 
-        if self._op_metrics:
+        metrics = payload.get("_metrics")
+        if self._op_metrics is not None and isinstance(metrics, dict):
             self._op_metrics.record_call(
-                metrics.latency_ms,
-                metrics.input_tokens,
-                metrics.output_tokens,
-                metrics.attempts,
+                float(metrics.get("latency_ms", 0.0)),
+                int(metrics.get("input_tokens", 0)),
+                int(metrics.get("output_tokens", 0)),
+                int(metrics.get("attempts", 1)),
             )
 
         try:
-            ranked = json.loads(text)
-        except (json.JSONDecodeError, TypeError) as exc:
-            logger.warning("sem_topk JSON parse failed: %s", exc)
+            score_rows = parse_sem_score_block(payload, expected_size=len(candidates))
+        except ValueError as exc:
             if self._op_metrics:
                 self._op_metrics.record_invalid_output()
-            raise ValueError(f"sem_local_topk expected valid JSON output: {exc}") from exc
+            raise ValueError(f"sem_local_topk expected valid sem_score block output: {exc}") from exc
 
-        if not isinstance(ranked, dict) or "scored_candidates" not in ranked:
-            logger.warning("sem_topk expected object with scored_candidates, got %s", type(ranked).__name__)
-            if self._op_metrics:
-                self._op_metrics.record_invalid_output()
-            raise ValueError("sem_local_topk expected object with scored_candidates")
-
-        scored_candidates = ranked["scored_candidates"]
-        if not isinstance(scored_candidates, list):
-            if self._op_metrics:
-                self._op_metrics.record_invalid_output()
-            raise ValueError("sem_local_topk expected scored_candidates to be a list")
-
+        score_map = {row["item_idx"]: row for row in score_rows}
         normalized: List[dict] = []
-        for item in scored_candidates:
-            if not isinstance(item, dict):
-                raise ValueError("sem_local_topk expected dict scored candidate entries")
-            if "candidate" not in item or "score" not in item:
-                raise ValueError("sem_local_topk expected candidate and score in scored entry")
+        for idx, candidate in enumerate(candidates):
+            if idx not in score_map:
+                if self._op_metrics:
+                    self._op_metrics.record_invalid_output()
+                raise ValueError("sem_local_topk sem_score block is missing candidate score")
+            row = score_map[idx]
             normalized.append(
                 {
-                    "candidate": item["candidate"],
-                    "score": float(item["score"]),
-                    "reason": str(item.get("reason", "")),
+                    "candidate": candidate,
+                    "score": float(row["score"]),
+                    "reason": str(row["reason"]),
                 }
             )
-
-        if self._op_metrics:
-            attach_metrics(ranked, metrics)
         return normalized, len(candidates)
 
 
@@ -177,12 +175,12 @@ class SemLocalTopKScoringFunction(_BaseSemLocalTopKAsyncFunction):
 
 
 class SemLocalTopKFunction(_BaseSemLocalTopKAsyncFunction):
-    """Async local semantic top-k reranker (V0.1, row-level, no keyed state).
+    """Async local semantic top-k operator (V0.1, row-level, no keyed state).
 
     Parameters
     ----------
     prompt_template : str
-        Format-string with ``{input}`` and ``{candidates}`` placeholders.
+        Semantic scoring intent used by the internal ``sem_score`` step.
     k : int
         Number of top results to return.
     llm_config : LLMClientConfig
@@ -200,7 +198,7 @@ class SemLocalTopKFunction(_BaseSemLocalTopKAsyncFunction):
         candidates_field: str = "candidates",
     ) -> None:
         super().__init__(
-            prompt_template=prompt_template,
+            score_intent=prompt_template,
             llm_config=llm_config,
             candidates_field=candidates_field,
         )
@@ -246,7 +244,7 @@ def build_sem_local_topk_operator(
         candidates_field=candidates_field,
     )
     return SemLocalTopKFunction(
-        prompt_template=build_sem_local_topk_scoring_prompt(plan.intent),
+        prompt_template=plan.intent,
         k=plan.k,
         llm_config=plan.llm_config,
         candidates_field=plan.candidates_field,

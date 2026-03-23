@@ -104,11 +104,11 @@ def run_sem_local_topk():
 
     mock_resp = json.dumps(
         {
-            "scored_candidates": [
-                {"candidate": "C", "score": 0.98, "reason": "best"},
-                {"candidate": "A", "score": 0.95, "reason": "strong"},
-                {"candidate": "D", "score": 0.80, "reason": "ok"},
-                {"candidate": "B", "score": 0.70, "reason": "weak"},
+            "scores": [
+                {"item_idx": 0, "score": 0.95, "confidence": 0.9, "reason": "strong"},
+                {"item_idx": 1, "score": 0.70, "confidence": 0.7, "reason": "weak"},
+                {"item_idx": 2, "score": 0.98, "confidence": 0.95, "reason": "best"},
+                {"item_idx": 3, "score": 0.80, "confidence": 0.8, "reason": "ok"},
             ]
         }
     )

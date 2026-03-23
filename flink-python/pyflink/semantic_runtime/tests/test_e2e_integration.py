@@ -427,10 +427,11 @@ def test_local_topk_pushdown_pipeline() -> None:
                         "mock_delay_s": 0.05,
                         "mock_response": json.dumps(
                             {
-                                "scored_candidates": [
-                                    {"candidate": "C", "score": 0.98, "reason": "best"},
-                                    {"candidate": "A", "score": 0.91, "reason": "good"},
-                                    {"candidate": "D", "score": 0.8, "reason": "ok"},
+                                "scores": [
+                                    {"item_idx": 0, "score": 0.91, "confidence": 0.9, "reason": "good"},
+                                    {"item_idx": 1, "score": 0.70, "confidence": 0.7, "reason": "weak"},
+                                    {"item_idx": 2, "score": 0.98, "confidence": 0.95, "reason": "best"},
+                                    {"item_idx": 3, "score": 0.8, "confidence": 0.8, "reason": "ok"},
                                 ]
                             }
                         ),
@@ -571,22 +572,10 @@ def test_stateful_topk_pushdown_pipeline() -> None:
                         "mock_delay_s": 0.05,
                         "mock_response": json.dumps(
                             {
-                                "scored_candidates": [
-                                    {
-                                        "candidate": {"candidate_id": "c2", "text": "Budget risk"},
-                                        "score": 0.97,
-                                        "reason": "best",
-                                    },
-                                    {
-                                        "candidate": {"candidate_id": "c1", "text": "Budget plan"},
-                                        "score": 0.88,
-                                        "reason": "good",
-                                    },
-                                    {
-                                        "candidate": {"candidate_id": "c3", "text": "Travel itinerary"},
-                                        "score": 0.21,
-                                        "reason": "low",
-                                    },
+                                "scores": [
+                                    {"item_idx": 0, "score": 0.88, "confidence": 0.85, "reason": "good"},
+                                    {"item_idx": 1, "score": 0.97, "confidence": 0.95, "reason": "best"},
+                                    {"item_idx": 2, "score": 0.21, "confidence": 0.2, "reason": "low"},
                                 ]
                             }
                         ),

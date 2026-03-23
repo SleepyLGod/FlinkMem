@@ -40,6 +40,11 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.sem_spec import TopKQuerySpec, TriggerPolicy
+from pyflink.semantic_runtime.runtime.steps import (
+    evaluate_sem_rerank_block,
+    evaluate_sem_score,
+    evaluate_sem_score_block,
+)
 from pyflink.semantic_runtime.runtime.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,
@@ -481,32 +486,6 @@ class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
             self._client.close()
             self._client = None
 
-    @staticmethod
-    def _parse_json_object(text: str) -> Dict[str, Any]:
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise
-            parsed = json.loads(text[start:end + 1])
-        if not isinstance(parsed, dict):
-            raise RuntimeError(f"Expected JSON object, got {type(parsed).__name__}")
-        return parsed
-
-    def _build_prompt(self, value: Dict[str, Any]) -> str:
-        criterion = self._query_spec.semantic.instruction or "Score candidate relevance."
-        query_text = self._query_text(value)
-        candidate_text = self._extract_candidate_text(value)
-        return (
-            "You are scoring one candidate for a continuous semantic top-k query.\n"
-            "Return JSON only with key score and a float in [0, 1].\n"
-            f"Criterion: {criterion}\n"
-            f"Query: {query_text}\n"
-            f"Candidate: {candidate_text}\n"
-        )
-
     async def _ensure_client(self):
         if self._client is None:
             self._client = create_llm_client(self._llm_config)
@@ -524,10 +503,16 @@ class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
             else:
                 await self._ensure_client()
                 assert self._client is not None
-                prompt = self._build_prompt(value)
-                text, _ = await self._client.call(prompt)
-                parsed = self._parse_json_object(text)
-                score = float(parsed.get("score", 0.0))
+                payload = await evaluate_sem_score(
+                    client=self._client,
+                    llm_config=self._llm_config,
+                    intent=self._query_spec.semantic.instruction or "Score candidate relevance.",
+                    item={
+                        "query": self._query_text(value),
+                        "candidate": self._extract_candidate_text(value),
+                    },
+                )
+                score = payload["score"]
 
             return [
                 build_scored_topk_candidate(
@@ -638,22 +623,6 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
         if self._client is None:
             self._client = create_llm_client(self._llm_config)
 
-    def _build_prompt(self, value: Dict[str, Any]) -> str:
-        query_text = self._query_text(value)
-        criterion = self._query_spec.semantic.instruction or "Rerank bounded candidate pool."
-        lines = []
-        for cand in self._extract_pool(value):
-            lines.append(f"- {cand['candidate_id']}: {self._candidate_text(cand)}")
-        return (
-            "You are reranking a bounded candidate pool for a continuous semantic top-k query.\n"
-            "Return JSON only with key ranked_candidate_ids and a ranked list of candidate ids.\n"
-            f"Method: {self._query_spec.ranking_method}\n"
-            f"Criterion: {criterion}\n"
-            f"Query: {query_text}\n"
-            "Candidates:\n"
-            + "\n".join(lines)
-        )
-
     async def async_invoke(self, value):
         if not is_topk_candidate_pool(value):
             raise ValueError("topk_contextual_reranker_requires_bounded_pool")
@@ -663,10 +632,20 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
             else:
                 await self._ensure_client()
                 assert self._client is not None
-                prompt = self._build_prompt(value)
-                text, _ = await self._client.call(prompt)
-                parsed = json.loads(text)
-                ranked_ids = parsed.get("ranked_candidate_ids", []) if isinstance(parsed, dict) else []
+                ranked_ids = await evaluate_sem_rerank_block(
+                    client=self._client,
+                    llm_config=self._llm_config,
+                    intent=self._query_spec.semantic.instruction or "Rerank bounded candidate pool.",
+                    method=self._query_spec.ranking_method,
+                    rerank_block=[
+                        {
+                            "item_id": str(cand["candidate_id"]),
+                            "query": self._query_text(value),
+                            "candidate": self._candidate_text(cand),
+                        }
+                        for cand in self._extract_pool(value)
+                    ],
+                )
                 pool = {cand["candidate_id"]: cand for cand in self._extract_pool(value)}
                 ranked = []
                 for cid in ranked_ids:
@@ -804,25 +783,40 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
 
     async def _rank_pointwise(self, value: Dict[str, Any]) -> List[Tuple[Dict[str, Any], float]]:
         query_text = self._query_text(value)
+        pool = self._extract_pool(value)
         ranked: List[Tuple[Dict[str, Any], float]] = []
-        for cand in self._extract_pool(value):
+        for cand in pool:
             candidate_text = self._candidate_text(cand)
             if self._llm_config.backend == "mock":
                 score = lexical_similarity(query_text, candidate_text)
+                ranked.append((cand, max(0.0, min(1.0, score))))
             else:
-                await self._ensure_client()
-                assert self._client is not None
-                prompt = (
-                    "You are scoring one candidate for a continuous semantic top-k query.\n"
-                    "Return JSON only with key score and a float in [0, 1].\n"
-                    f"Criterion: {self._query_spec.semantic.instruction or 'Score candidate relevance.'}\n"
-                    f"Query: {query_text}\n"
-                    f"Candidate: {candidate_text}\n"
-                )
-                text, _ = await self._client.call(prompt)
-                parsed = _PointwiseLLMScorerWorker._parse_json_object(text)
-                score = float(parsed.get("score", 0.0))
-            ranked.append((cand, max(0.0, min(1.0, score))))
+                ranked = []
+                break
+
+        if self._llm_config.backend != "mock":
+            await self._ensure_client()
+            assert self._client is not None
+            score_block = [
+                {
+                    "item_idx": idx,
+                    "query": query_text,
+                    "candidate": self._candidate_text(cand),
+                }
+                for idx, cand in enumerate(pool)
+            ]
+            score_rows = await evaluate_sem_score_block(
+                client=self._client,
+                llm_config=self._llm_config,
+                intent=self._query_spec.semantic.instruction or "Score candidate relevance.",
+                score_block=score_block,
+            )
+            score_map = {row["item_idx"]: row["score"] for row in score_rows}
+            for idx, cand in enumerate(pool):
+                if idx not in score_map:
+                    raise ValueError("topk_pointwise_score_block_missing_item")
+                score = float(score_map[idx])
+                ranked.append((cand, max(0.0, min(1.0, score))))
         return sorted(ranked, key=lambda item: item[1], reverse=True)
 
     async def _rank_contextual(self, value: Dict[str, Any]) -> List[Tuple[Dict[str, Any], float]]:
@@ -832,18 +826,20 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
         if self._llm_config.backend != "mock":
             await self._ensure_client()
             assert self._client is not None
-            lines = [f"- {cand['candidate_id']}: {self._candidate_text(cand)}" for cand in pool]
-            prompt = (
-                "You are reranking a bounded candidate pool for a continuous semantic top-k query.\n"
-                "Return JSON only with key ranked_candidate_ids and a ranked list of candidate ids.\n"
-                f"Method: {self._query_spec.ranking_method}\n"
-                f"Criterion: {self._query_spec.semantic.instruction or 'Rerank bounded candidate pool.'}\n"
-                f"Query: {query_text}\n"
-                "Candidates:\n" + "\n".join(lines)
+            ranked_ids = await evaluate_sem_rerank_block(
+                client=self._client,
+                llm_config=self._llm_config,
+                intent=self._query_spec.semantic.instruction or "Rerank bounded candidate pool.",
+                method=self._query_spec.ranking_method,
+                rerank_block=[
+                    {
+                        "item_id": str(cand["candidate_id"]),
+                        "query": query_text,
+                        "candidate": self._candidate_text(cand),
+                    }
+                    for cand in pool
+                ],
             )
-            text, _ = await self._client.call(prompt)
-            parsed = json.loads(text)
-            ranked_ids = parsed.get("ranked_candidate_ids", []) if isinstance(parsed, dict) else []
             scored_map = {cand["candidate_id"]: (cand, score) for cand, score in scored}
             ranked = [scored_map.pop(cid) for cid in ranked_ids if cid in scored_map]
             ranked.extend(scored_map.values())

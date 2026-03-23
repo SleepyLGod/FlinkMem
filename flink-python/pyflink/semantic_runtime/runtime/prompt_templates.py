@@ -51,6 +51,37 @@ def build_sem_filter_prompt(intent: str) -> str:
     )
 
 
+def build_sem_score_prompt(intent: str) -> str:
+    """Build the internal semantic scoring prompt for one item."""
+    return (
+        f"{intent}\n\n"
+        "Item to score:\n{input}\n\n"
+        'Return one JSON object with exactly these fields: '
+        '{{"score": float, "confidence": float, "reason": str}}.'
+    )
+
+
+def build_sem_score_block_prompt(intent: str) -> str:
+    """Build the internal semantic scoring prompt for one bounded item block."""
+    return (
+        f"{intent}\n\n"
+        "Items to score:\n{input}\n\n"
+        'Return one JSON object with exactly this shape: '
+        '{{"scores": [{{"item_idx": int, "score": float, "confidence": float, "reason": str}}]}}.'
+    )
+
+
+def build_sem_rerank_block_prompt(intent: str, *, method: str) -> str:
+    """Build the internal semantic rerank prompt for one bounded item block."""
+    return (
+        f"{intent}\n\n"
+        f"Rerank method: {method}\n\n"
+        "Items to rerank:\n{input}\n\n"
+        'Return one JSON object with exactly this shape: '
+        '{{"ranked_item_ids": [str, ...]}}.'
+    )
+
+
 def build_sem_local_topk_scoring_prompt(intent: str) -> str:
     """Build the internal semantic scoring prompt for local top-k."""
     return (
@@ -87,11 +118,11 @@ def build_sem_groupby_scope_prompt(intent: str) -> str:
     )
 
 
-def build_sem_join_block_prompt(intent: str) -> str:
-    """Build the internal semantic pair-block prompt for sem_join."""
+def build_sem_match_block_prompt(intent: str) -> str:
+    """Build the internal semantic pair-block prompt for sem_match."""
     return (
         f"{intent}\n\n"
-        "Candidate pairs:\n{pair_block}\n\n"
+        "Candidate pairs:\n{input}\n\n"
         "For each pair, decide whether the pair semantically joins.\n"
         'Return one JSON object with exactly this shape: '
         '{{"matches": [{{"pair_idx": int, "matched": bool, "match_score": float, "reason": str}}]}}.'

@@ -147,7 +147,7 @@ def test_apply_sem_local_topk_pushdown_builds_async_then_native_topk(monkeypatch
         request=sem_local_topk(intent="Rank candidates", k=2),
         runtime_config=_row_runtime_config(
             "sem_local_topk",
-            response='{"scored_candidates":[{"candidate":"a","score":0.4},{"candidate":"b","score":0.9},{"candidate":"c","score":0.7}]}',
+            response='{"scores":[{"item_idx":0,"score":0.4,"confidence":0.4,"reason":"ok"},{"item_idx":1,"score":0.9,"confidence":0.9,"reason":"best"},{"item_idx":2,"score":0.7,"confidence":0.7,"reason":"good"}]}',
         ),
     )
 

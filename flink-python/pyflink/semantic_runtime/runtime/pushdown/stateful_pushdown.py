@@ -19,7 +19,6 @@ from pyflink.semantic_runtime.runtime.plans import (
 )
 from pyflink.semantic_runtime.runtime.prompt_templates import (
     build_sem_groupby_scope_prompt,
-    build_sem_local_topk_scoring_prompt,
 )
 from pyflink.semantic_runtime.runtime.pushdown.common import (
     parse_candidate_pool,
@@ -543,7 +542,7 @@ def apply_sem_topk_pushdown(
         scored = AsyncDataStream.unordered_wait(
             input_stream,
             SemLocalTopKScoringFunction(
-                prompt_template=build_sem_local_topk_scoring_prompt(plan.intent),
+                score_intent=plan.intent,
                 llm_config=runtime_config.get_operator_llm_client_config(
                     "sem_topk",
                     allow_query_spec=True,
