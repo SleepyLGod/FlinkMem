@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from unittest.mock import sentinel
 
+import pytest
+
 from pyflink.semantic_runtime.public_api import (
     context,
     sem_agg,
     sem_filter,
     sem_groupby,
+    sem_join,
     sem_lookup_join,
     sem_local_topk,
     sem_map,
@@ -43,9 +46,35 @@ def _stateful_runtime_config() -> RuntimeConfig:
                 "sem_topk": {"query_spec": {}, "kernel": {}},
                 "sem_groupby": {"query_spec": {}, "kernel": {}},
                 "sem_agg": {"query_spec": {}, "kernel": {}},
+                "sem_join": {"query_spec": {}, "kernel": {}},
             }
         }
     )
+
+
+class _FakeDataStream:
+    def __init__(self):
+        self.connected = None
+
+    def key_by(self, selector):
+        self.selector = selector
+        return self
+
+    def connect(self, other):
+        connected = _FakeConnectedStreams(self, other)
+        self.connected = connected
+        return connected
+
+
+class _FakeConnectedStreams:
+    def __init__(self, left, right):
+        self.left = left
+        self.right = right
+        self.processed_with = None
+
+    def process(self, func):
+        self.processed_with = func
+        return sentinel.join_stream
 
 
 def test_apply_sem_map_from_request_uses_pushdown(monkeypatch) -> None:
@@ -246,3 +275,68 @@ def test_apply_sem_agg_from_request_uses_pushdown_for_window_algebraic(monkeypat
 
     assert result is sentinel.agg_stream
     assert captured["args"] == (sentinel.input_ds,)
+
+
+def test_apply_sem_join_from_request_connects_two_streams() -> None:
+    left_ds = _FakeDataStream()
+    right_ds = _FakeDataStream()
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {"backend": "llm"},
+                    "kernel": {
+                        "mock_delay_s": 0.01,
+                        "mock_response": '{"matches": [{"pair_idx": 0, "matched": true, "match_score": 0.9, "reason": "ok"}]}',
+                    },
+                }
+            },
+        }
+    )
+
+    result = facade_builders.apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match if same issue",
+            context=context("stream"),
+            right_input=right_ds,
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row["key"],
+        right_key_selector=lambda row: row["key"],
+    )
+
+    assert result is sentinel.join_stream
+    assert left_ds.connected is not None
+    assert left_ds.connected.right is right_ds
+    assert left_ds.connected.processed_with.__class__.__name__ == "SemJoinFunction"
+
+
+def test_apply_sem_join_from_request_uses_window_owned_runtime() -> None:
+    left_ds = _FakeDataStream()
+    right_ds = _FakeDataStream()
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {"backend": "llm"},
+                    "kernel": {"mock_delay_s": 0.01, "mock_response": '{"matches": []}'},
+                }
+            },
+        }
+    )
+    result = facade_builders.apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match if same issue",
+            context=context("window"),
+            right_input=right_ds,
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row["key"],
+        right_key_selector=lambda row: row["key"],
+    )
+    assert result is sentinel.join_stream
+    assert left_ds.connected.processed_with.__class__.__name__ == "WindowOwnedSemJoinFunction"

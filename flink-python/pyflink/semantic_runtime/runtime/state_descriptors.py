@@ -230,3 +230,51 @@ def sem_topk_snapshot_descriptor(
     desc = ValueStateDescriptor("sem_topk_snapshot", Types.PICKLED_BYTE_ARRAY())
     desc.enable_time_to_live(build_ttl_config(ttl_seconds))
     return desc
+
+
+# ---------------------------------------------------------------------------
+# sem_join descriptors
+# ---------------------------------------------------------------------------
+
+def sem_join_left_buffer_descriptor(
+    ttl_seconds: int = 3600,
+) -> ListStateDescriptor:
+    """ListState descriptor for the left-side sem_join event buffer."""
+    desc = ListStateDescriptor("sem_join_left_buffer", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_join_right_buffer_descriptor(
+    ttl_seconds: int = 3600,
+) -> ListStateDescriptor:
+    """ListState descriptor for the right-side sem_join event buffer."""
+    desc = ListStateDescriptor("sem_join_right_buffer", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_join_left_windows_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for left-side window-owned sem_join snapshots."""
+    desc = MapStateDescriptor(
+        "sem_join_left_windows",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_join_right_windows_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for right-side window-owned sem_join snapshots."""
+    desc = MapStateDescriptor(
+        "sem_join_right_windows",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc

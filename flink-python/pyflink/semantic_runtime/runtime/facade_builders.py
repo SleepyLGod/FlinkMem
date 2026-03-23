@@ -14,6 +14,7 @@ from pyflink.semantic_runtime.public_api import (
     SemAggRequest,
     SemFilterRequest,
     SemGroupbyRequest,
+    SemJoinRequest,
     SemLookupJoinRequest,
     SemLocalTopKRequest,
     SemMapRequest,
@@ -23,6 +24,7 @@ from pyflink.semantic_runtime.public_api import (
 from pyflink.semantic_runtime.runtime.plans import (
     lower_sem_agg_request,
     lower_sem_groupby_request,
+    lower_sem_join_request,
     lower_sem_topk_request,
     lower_sem_window_request,
 )
@@ -238,4 +240,50 @@ def build_sem_agg_from_request(
         config=plan.kernel_config,
         query_spec=plan.query_spec,
         input_kind=plan.input_kind,
+    )
+
+
+def apply_sem_join_from_request(
+    left_input_ds: DataStream,
+    *,
+    request: SemJoinRequest,
+    runtime_config: RuntimeConfig,
+    left_key_selector: Callable,
+    right_key_selector: Callable,
+) -> DataStream:
+    """Apply a public semantic join request to two keyed streams."""
+    from pyflink.semantic_runtime.operators.stateful.sem_join import (
+        build_sem_join_operator,
+        build_window_owned_sem_join_operator,
+    )
+
+    if request.context.kind not in {"stream", "window"}:
+        raise ValueError(f"sem_join does not support context {request.context.kind!r}")
+    if not hasattr(request.right_input, "key_by"):
+        raise TypeError(
+            "sem_join right_input must be a stream-like object with key_by(...) "
+            "for true two-input runtime"
+        )
+
+    plan = lower_sem_join_request(request, runtime_config)
+    llm_config = runtime_config.get_operator_llm_client_config(
+        "sem_join",
+        allow_query_spec=True,
+    )
+    if request.context.kind == "window":
+        op = build_window_owned_sem_join_operator(
+            query_spec=plan.query_spec,
+            llm_config=llm_config,
+            kernel_config=plan.kernel_config,
+        )
+    else:
+        op = build_sem_join_operator(
+            query_spec=plan.query_spec,
+            llm_config=llm_config,
+            kernel_config=plan.kernel_config,
+        )
+    return (
+        left_input_ds.key_by(left_key_selector)
+        .connect(request.right_input.key_by(right_key_selector))
+        .process(op)
     )

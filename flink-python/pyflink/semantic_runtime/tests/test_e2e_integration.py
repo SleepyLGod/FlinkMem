@@ -52,6 +52,7 @@ from pyflink.semantic_runtime.public_api import (
     sem_agg,
     sem_filter,
     sem_groupby,
+    sem_join,
     sem_local_topk,
     sem_lookup_join,
     sem_map,
@@ -61,6 +62,7 @@ from pyflink.semantic_runtime.runtime import (
     apply_sem_agg_pushdown,
     apply_sem_filter_pushdown,
     apply_sem_groupby_pushdown,
+    apply_sem_join_from_request,
     apply_sem_local_topk_pushdown,
     apply_sem_lookup_join_pushdown,
     apply_sem_map_pushdown,
@@ -648,6 +650,139 @@ def test_window_algebraic_agg_pushdown_pipeline() -> None:
     assert parsed["aggregate"]["total"] == 8
 
 
+def test_true_two_input_sem_join_pipeline() -> None:
+    """Positive path for true two-input sem_join should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_rows = [
+        ("alice", "Alice lives in Beijing"),
+    ]
+    right_rows = [
+        ("alice", "Alice lives in Shanghai"),
+    ]
+    left_ds = env.from_collection(left_rows, type_info=Types.TUPLE([Types.STRING(), Types.STRING()]))
+    right_ds = env.from_collection(
+        right_rows,
+        type_info=Types.TUPLE([Types.STRING(), Types.STRING()]),
+    )
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {"backend": "llm"},
+                    "kernel": {
+                        "pair_block_size": 1,
+                        "mock_delay_s": 0.01,
+                        "mock_response": json.dumps(
+                            {
+                                "matches": [
+                                    {
+                                        "pair_idx": 0,
+                                        "matched": True,
+                                        "match_score": 0.97,
+                                        "reason": "contradiction",
+                                    }
+                                ]
+                            }
+                        ),
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match contradictory facts",
+            context=context("stream"),
+            right_input=right_ds,
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row[0],
+        right_key_selector=lambda row: row[0],
+    )
+    results = collect_results(env, result, "test_true_two_input_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["match_score"] == 0.97
+    assert parsed["left"][0] == "alice"
+    assert parsed["right"][0] == "alice"
+
+
+def test_window_owned_sem_join_pipeline() -> None:
+    """Positive path for window-owned sem_join should succeed."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_snapshots = [
+        json.dumps(
+            {
+                "key": "alice",
+                "window_id": "w1",
+                "events": [{"key": "alice", "payload": "Alice lives in Beijing", "seq_id": 1}],
+                "trigger_reason": "close",
+            }
+        )
+    ]
+    right_snapshots = [
+        json.dumps(
+            {
+                "key": "alice",
+                "window_id": "w1",
+                "events": [{"key": "alice", "payload": "Alice lives in Shanghai", "seq_id": 2}],
+                "trigger_reason": "close",
+            }
+        )
+    ]
+    left_ds = env.from_collection(left_snapshots, type_info=Types.STRING())
+    right_ds = env.from_collection(right_snapshots, type_info=Types.STRING())
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {"backend": "llm"},
+                    "kernel": {
+                        "pair_block_size": 1,
+                        "mock_delay_s": 0.01,
+                        "mock_response": json.dumps(
+                            {
+                                "matches": [
+                                    {
+                                        "pair_idx": 0,
+                                        "matched": True,
+                                        "match_score": 0.93,
+                                        "reason": "contradiction",
+                                    }
+                                ]
+                            }
+                        ),
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match contradictory facts",
+            context=context("window"),
+            right_input=right_ds,
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: json.loads(row)["key"],
+        right_key_selector=lambda row: json.loads(row)["key"],
+    )
+    results = collect_results(env, result, "test_window_owned_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["window_id"] == "w1"
+
+
 TESTS = {
     "normal": test_normal_pipeline,
     "timeout": test_timeout_pipeline_fails,
@@ -658,6 +793,8 @@ TESTS = {
     "groupby": test_window_groupby_pushdown_pipeline,
     "stateful_topk": test_stateful_topk_pushdown_pipeline,
     "agg": test_window_algebraic_agg_pushdown_pipeline,
+    "sem_join": test_true_two_input_sem_join_pipeline,
+    "window_sem_join": test_window_owned_sem_join_pipeline,
     "real": test_real_pipeline_if_enabled,
 }
 
@@ -677,6 +814,8 @@ if __name__ == "__main__":
             "groupby",
             "stateful_topk",
             "agg",
+            "sem_join",
+            "window_sem_join",
         ):
             fn = TESTS[name]
             try:

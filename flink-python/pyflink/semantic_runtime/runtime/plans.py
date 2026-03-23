@@ -37,6 +37,7 @@ from pyflink.semantic_runtime.public_api import (
     SemAggRequest,
     SemFilterRequest,
     SemGroupbyRequest,
+    SemJoinRequest,
     SemLookupJoinRequest,
     SemLocalTopKRequest,
     SemMapRequest,
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
     from pyflink.semantic_runtime.operators.row.sem_lookup_join import SemLookupJoinConfig
     from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
     from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_join import SemJoinConfig
     from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
     from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
     from pyflink.semantic_runtime.runtime_config import RuntimeConfig
@@ -185,6 +187,17 @@ class SemAggPlan:
     kernel_config: "SemAggConfig"
 
 
+@dataclass(frozen=True)
+class SemJoinPlan:
+    """Merged internal plan for stateful semantic join."""
+
+    intent: str
+    context_kind: str
+    query_spec: JoinQuerySpec
+    kernel_config: "SemJoinConfig"
+    right_input: Any
+
+
 def lower_sem_map_request(
     request: SemMapRequest,
     runtime_config: "RuntimeConfig",
@@ -258,6 +271,14 @@ def _context_to_input_kind(kind: str) -> str:
     if kind in {"session", "semantic_segment"}:
         return "event_stream"
     raise ValueError(f"Stateful semantic operators do not support context {kind!r}.")
+
+
+def _join_context_to_runtime_kind(kind: str) -> str:
+    if kind == "stream":
+        return "two_input_stream"
+    if kind == "window":
+        return "window_owned"
+    raise ValueError(f"sem_join does not support context {kind!r}.")
 
 
 def _topk_scope_policy_from_context(kind: str) -> TopKScopePolicy:
@@ -358,6 +379,27 @@ def lower_sem_agg_request(
         input_kind=input_kind,
         query_spec=query_spec,
         kernel_config=runtime_config.get_agg_kernel_config(),
+    )
+
+
+def lower_sem_join_request(
+    request: SemJoinRequest,
+    runtime_config: "RuntimeConfig",
+) -> SemJoinPlan:
+    """Lower a public stateful semantic join request into one internal plan."""
+    query_spec = runtime_config.get_join_query_spec()
+    query_spec.semantic.instruction = request.intent
+    runtime_kind = _join_context_to_runtime_kind(request.context.kind)
+    if runtime_kind == "window_owned":
+        query_spec.scope_policy.window_kind = "tumbling"
+    else:
+        query_spec.scope_policy.window_kind = None
+    return SemJoinPlan(
+        intent=request.intent,
+        context_kind=request.context.kind,
+        query_spec=query_spec,
+        kernel_config=runtime_config.get_join_kernel_config(),
+        right_input=request.right_input,
     )
 
 

@@ -9,6 +9,7 @@ from pyflink.semantic_runtime import (
     sem_agg,
     sem_filter,
     sem_groupby,
+    sem_join,
     sem_local_topk,
     sem_lookup_join,
     sem_map,
@@ -27,6 +28,12 @@ def test_context_creation() -> None:
 def test_context_rejects_invalid_kind() -> None:
     with pytest.raises(ValueError, match="Invalid context kind"):
         context("periodic")
+
+
+def test_stream_context_creation() -> None:
+    ctx = context("stream", domain="join")
+    assert ctx.kind == "stream"
+    assert ctx.metadata == {"domain": "join"}
 
 
 def test_sem_map_request() -> None:
@@ -72,6 +79,18 @@ def test_sem_groupby_request() -> None:
 def test_sem_agg_request_rejects_invalid_mode() -> None:
     with pytest.raises(ValueError, match="Invalid sem_agg mode"):
         sem_agg(intent="Summarize session", mode="periodic", context=context("session"))
+
+
+def test_sem_join_request() -> None:
+    right_input = object()
+    req = sem_join(
+        intent="Match contradictory facts",
+        context=context("stream"),
+        right_input=right_input,
+    )
+    assert req.intent == "Match contradictory facts"
+    assert req.context.kind == "stream"
+    assert req.right_input is right_input
 
 
 def test_top_level_public_surface_exposes_only_facade() -> None:

@@ -85,3 +85,14 @@ def build_sem_groupby_scope_prompt(intent: str) -> str:
         'Return one JSON object with exactly this shape: '
         '{{"assignments": [{{"event_seq_id": int, "group_id": str, "confidence": float, "label": str}}]}}.'
     )
+
+
+def build_sem_join_block_prompt(intent: str) -> str:
+    """Build the internal semantic pair-block prompt for sem_join."""
+    return (
+        f"{intent}\n\n"
+        "Candidate pairs:\n{pair_block}\n\n"
+        "For each pair, decide whether the pair semantically joins.\n"
+        'Return one JSON object with exactly this shape: '
+        '{{"matches": [{{"pair_idx": int, "matched": bool, "match_score": float, "reason": str}}]}}.'
+    )

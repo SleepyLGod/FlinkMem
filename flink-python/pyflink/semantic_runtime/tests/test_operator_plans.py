@@ -7,6 +7,7 @@ from pyflink.semantic_runtime.public_api import (
     sem_agg,
     sem_filter,
     sem_groupby,
+    sem_join,
     sem_lookup_join,
     sem_local_topk,
     sem_map,
@@ -17,6 +18,7 @@ from pyflink.semantic_runtime.runtime.plans import (
     lower_sem_agg_request,
     lower_sem_filter_request,
     lower_sem_groupby_request,
+    lower_sem_join_request,
     lower_sem_lookup_join_request,
     lower_sem_local_topk_request,
     lower_sem_map_request,
@@ -50,6 +52,7 @@ def _stateful_runtime_config() -> RuntimeConfig:
                 "sem_topk": {"query_spec": {}, "kernel": {}},
                 "sem_groupby": {"query_spec": {}, "kernel": {}},
                 "sem_agg": {"query_spec": {}, "kernel": {}},
+                "sem_join": {"query_spec": {}, "kernel": {}},
             }
         }
     )
@@ -163,3 +166,37 @@ def test_lower_sem_agg_request_semantic_segment() -> None:
     assert plan.query_spec.agg_method == "summarize"
     assert plan.query_spec.trigger_policy.mode == "on_scope_close"
     assert plan.query_spec.scope_policy.window_kind == "semantic"
+
+
+def test_lower_sem_join_request_stream() -> None:
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "backend": "llm",
+                        "pairing_method": "candidate_pruned",
+                    },
+                    "kernel": {
+                        "pair_block_size": 4,
+                        "ttl_seconds": 90,
+                    },
+                }
+            },
+        }
+    )
+    right_input = object()
+    plan = lower_sem_join_request(
+        sem_join(
+            intent="Match contradictory facts",
+            context=context("stream"),
+            right_input=right_input,
+        ),
+        runtime_config,
+    )
+    assert plan.intent == "Match contradictory facts"
+    assert plan.context_kind == "stream"
+    assert plan.right_input is right_input
+    assert plan.query_spec.semantic.instruction == "Match contradictory facts"
+    assert plan.kernel_config.pair_block_size == 4

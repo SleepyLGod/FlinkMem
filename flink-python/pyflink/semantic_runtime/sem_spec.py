@@ -709,7 +709,7 @@ class JoinScopePolicy:
 
 @dataclass
 class JoinQuerySpec:
-    """Continuous query definition for future true two-input ``sem_join``."""
+    """Continuous query definition for true two-input and window-owned ``sem_join``."""
 
     semantic: SemSpec = field(
         default_factory=lambda: SemSpec(

@@ -32,6 +32,7 @@ from typing import Any, Dict, Optional
 
 VALID_CONTEXT_KINDS = {
     "record",
+    "stream",
     "window",
     "session",
     "semantic_segment",
@@ -139,6 +140,15 @@ class SemAggRequest:
             )
 
 
+@dataclass(frozen=True)
+class SemJoinRequest:
+    """Public stateful semantic join request."""
+
+    intent: str
+    context: SemContext
+    right_input: Any
+
+
 def context(kind: str, **metadata: Any) -> SemContext:
     """Create a public semantic context."""
     return SemContext(kind=kind, metadata=dict(metadata))
@@ -187,3 +197,8 @@ def sem_groupby(*, intent: str, context: SemContext) -> SemGroupbyRequest:
 def sem_agg(*, intent: str, mode: str, context: SemContext) -> SemAggRequest:
     """Create a public stateful semantic aggregation request."""
     return SemAggRequest(intent=intent, mode=mode, context=context)
+
+
+def sem_join(*, intent: str, context: SemContext, right_input: Any) -> SemJoinRequest:
+    """Create a public stateful semantic join request."""
+    return SemJoinRequest(intent=intent, context=context, right_input=right_input)

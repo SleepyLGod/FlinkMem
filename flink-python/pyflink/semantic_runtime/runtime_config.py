@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from pyflink.semantic_runtime.runtime.plans import SemLoweringPlan
     from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
     from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_join import SemJoinConfig
     from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
     from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
     from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig
@@ -144,6 +145,7 @@ class AggRuntimeBundle:
 @dataclass(frozen=True)
 class JoinRuntimeBundle:
     query_spec: JoinQuerySpec
+    kernel_config: "SemJoinConfig"
     lowering_plan: "SemLoweringPlan"
 
 
@@ -667,6 +669,19 @@ class RuntimeConfig:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return SemSearchConfig(**kwargs)
 
+    def get_join_kernel_config(self) -> "SemJoinConfig":
+        from pyflink.semantic_runtime.operators.stateful.sem_join import SemJoinConfig
+
+        _query_raw, kernel_raw = self._get_operator_sections(
+            "sem_join",
+            allow_query_spec=True,
+        )
+        kwargs: Dict[str, Any] = {}
+        for field_name in SemJoinConfig.__dataclass_fields__:
+            if field_name in kernel_raw:
+                kwargs[field_name] = kernel_raw[field_name]
+        return SemJoinConfig(**kwargs)
+
     def get_window_config(self) -> "SemWindowConfig":
         from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
 
@@ -732,5 +747,6 @@ class RuntimeConfig:
         query_spec = self.get_join_query_spec()
         return JoinRuntimeBundle(
             query_spec=query_spec,
+            kernel_config=self.get_join_kernel_config(),
             lowering_plan=resolve_join_lowering_plan(query_spec),
         )
