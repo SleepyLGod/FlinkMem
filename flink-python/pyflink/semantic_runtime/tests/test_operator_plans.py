@@ -100,13 +100,13 @@ def test_lower_sem_local_topk_request() -> None:
     plan = lower_sem_local_topk_request(
         sem_local_topk(intent="Rank candidates", k=2),
         runtime_config,
-        candidates_field="items",
+        items_field="items",
     )
     assert plan.intent == "Rank candidates"
     assert plan.k == 2
     assert plan.semantic.output_mode == "score"
     assert plan.semantic.backend == "hybrid"
-    assert plan.candidates_field == "items"
+    assert plan.items_field == "items"
 
 
 def test_lower_sem_lookup_join_request() -> None:

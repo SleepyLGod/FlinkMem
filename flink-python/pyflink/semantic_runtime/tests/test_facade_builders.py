@@ -143,12 +143,12 @@ def test_apply_sem_local_topk_from_request_uses_pushdown(monkeypatch) -> None:
         sentinel.input_ds,
         request=sem_local_topk(intent="Rank candidates", k=2),
         runtime_config=_row_runtime_config("sem_local_topk", response='["B","A"]'),
-        candidates_field="items",
+        items_field="items",
     )
 
     assert result is sentinel.topk_stream
     assert captured["args"] == (sentinel.input_ds,)
-    assert captured["kwargs"]["candidates_field"] == "items"
+    assert captured["kwargs"]["items_field"] == "items"
 
 
 def test_apply_sem_lookup_join_from_request_uses_pushdown(monkeypatch) -> None:

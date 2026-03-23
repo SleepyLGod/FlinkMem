@@ -250,11 +250,15 @@ def extract_topk_candidate_text(
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def resolve_topk_query_text(value: Dict[str, Any], query_spec: TopKQuerySpec) -> str:
-    """Resolve the active query text for scoring a candidate."""
-    query_text = value.get("query")
-    if query_text not in (None, ""):
-        return str(query_text)
+def resolve_topk_ranking_text(value: Dict[str, Any], query_spec: TopKQuerySpec) -> str:
+    """Resolve the active ranking text for one top-k scoring step.
+
+    ``value["query"]`` is treated as an optional per-record ranking-text
+    override. If absent, the semantic intent remains the ranking text.
+    """
+    ranking_text = value.get("query")
+    if ranking_text not in (None, ""):
+        return str(ranking_text)
     return str(query_spec.semantic.instruction or "")
 
 
@@ -360,7 +364,7 @@ class _BaseTopKScorerWorker(AsyncFunction):
         return extract_topk_candidate_text(value, self._candidate_text_fields)
 
     def _query_text(self, value: Dict[str, Any]) -> str:
-        return resolve_topk_query_text(value, self._query_spec)
+        return resolve_topk_ranking_text(value, self._query_spec)
 
 
 class _BaseBoundedPoolRerankerWorker(AsyncFunction):
@@ -379,7 +383,7 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
         self._candidate_text_fields = tuple(candidate_text_fields)
 
     def _query_text(self, value: Dict[str, Any]) -> str:
-        return resolve_topk_query_text(value, self._query_spec)
+        return resolve_topk_ranking_text(value, self._query_spec)
 
     def _extract_pool(self, value: Dict[str, Any]) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
@@ -506,10 +510,10 @@ class _PointwiseLLMScorerWorker(_BaseTopKScorerWorker):
                 payload = await evaluate_sem_score(
                     client=self._client,
                     llm_config=self._llm_config,
-                    intent=self._query_spec.semantic.instruction or "Score candidate relevance.",
+                    intent=self._query_spec.semantic.instruction or "Score item relevance.",
                     item={
                         "query": self._query_text(value),
-                        "candidate": self._extract_candidate_text(value),
+                        "item": self._extract_candidate_text(value),
                     },
                 )
                 score = payload["score"]
@@ -635,13 +639,13 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
                 ranked_ids = await evaluate_sem_rerank_block(
                     client=self._client,
                     llm_config=self._llm_config,
-                    intent=self._query_spec.semantic.instruction or "Rerank bounded candidate pool.",
+                    intent=self._query_spec.semantic.instruction or "Rerank bounded items.",
                     method=self._query_spec.ranking_method,
                     rerank_block=[
                         {
                             "item_id": str(cand["candidate_id"]),
                             "query": self._query_text(value),
-                            "candidate": self._candidate_text(cand),
+                            "item": self._candidate_text(cand),
                         }
                         for cand in self._extract_pool(value)
                     ],
@@ -801,14 +805,14 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
                 {
                     "item_idx": idx,
                     "query": query_text,
-                    "candidate": self._candidate_text(cand),
+                    "item": self._candidate_text(cand),
                 }
                 for idx, cand in enumerate(pool)
             ]
             score_rows = await evaluate_sem_score_block(
                 client=self._client,
                 llm_config=self._llm_config,
-                intent=self._query_spec.semantic.instruction or "Score candidate relevance.",
+                intent=self._query_spec.semantic.instruction or "Score item relevance.",
                 score_block=score_block,
             )
             score_map = {row["item_idx"]: row["score"] for row in score_rows}
@@ -829,13 +833,13 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
             ranked_ids = await evaluate_sem_rerank_block(
                 client=self._client,
                 llm_config=self._llm_config,
-                intent=self._query_spec.semantic.instruction or "Rerank bounded candidate pool.",
+                intent=self._query_spec.semantic.instruction or "Rerank bounded items.",
                 method=self._query_spec.ranking_method,
                 rerank_block=[
                     {
                         "item_id": str(cand["candidate_id"]),
                         "query": query_text,
-                        "candidate": self._candidate_text(cand),
+                        "item": self._candidate_text(cand),
                     }
                     for cand in pool
                 ],

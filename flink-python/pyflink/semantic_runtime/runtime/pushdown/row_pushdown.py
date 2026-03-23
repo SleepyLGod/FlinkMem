@@ -26,7 +26,6 @@ from pyflink.semantic_runtime.runtime.prompt_templates import (
     build_sem_lookup_join_prompt,
     build_sem_map_prompt,
 )
-from pyflink.semantic_runtime.runtime.pushdown.common import parse_candidate_pool
 
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.runtime_config import RuntimeConfig
@@ -67,34 +66,33 @@ class SemMapProjector(MapFunction):
 
 
 class SemLocalTopKProjector(MapFunction):
-    """Project scored candidate lists into top-k outputs."""
+    """Project scored item lists into top-k outputs."""
 
-    def __init__(self, *, k: int, candidates_field: str) -> None:
+    def __init__(self, *, k: int) -> None:
         self._k = k
-        self._candidates_field = candidates_field
 
     def map(self, value: str) -> str:
-        """Sort scored candidates and return the top-k envelope."""
+        """Sort scored items and return the top-k envelope."""
         try:
             payload = json.loads(value)
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError("sem_local_topk pushdown expected valid JSON output") from exc
 
-        if not isinstance(payload, dict) or "scored_candidates" not in payload:
-            raise ValueError("sem_local_topk pushdown expected scored_candidates")
-        scored_candidates = payload["scored_candidates"]
-        if not isinstance(scored_candidates, list):
-            raise ValueError("sem_local_topk pushdown expected scored_candidates list")
+        if not isinstance(payload, dict) or "scored_items" not in payload:
+            raise ValueError("sem_local_topk pushdown expected scored_items")
+        scored_items = payload["scored_items"]
+        if not isinstance(scored_items, list):
+            raise ValueError("sem_local_topk pushdown expected scored_items list")
 
         normalized = []
-        for item in scored_candidates:
+        for item in scored_items:
             if not isinstance(item, dict):
                 raise ValueError("sem_local_topk pushdown expected dict items")
-            if "score" not in item or "candidate" not in item:
-                raise ValueError("sem_local_topk pushdown expected candidate and score")
+            if "score" not in item or "item" not in item:
+                raise ValueError("sem_local_topk pushdown expected item and score")
             normalized.append(
                 {
-                    "candidate": item["candidate"],
+                    "item": item["item"],
                     "score": float(item["score"]),
                     "reason": str(item.get("reason", "")),
                 }
@@ -190,9 +188,9 @@ def apply_sem_local_topk_pushdown(
     runtime_config: "RuntimeConfig",
     timeout_ms: int = 30_000,
     async_capacity: int = 20,
-    candidates_field: str = "candidates",
+    items_field: str = "items",
 ) -> DataStream:
-    """Apply semantic candidate scoring plus native local top-k projection."""
+    """Apply semantic item scoring plus native local top-k projection."""
     if timeout_ms <= 0:
         raise ValueError("sem_local_topk pushdown requires timeout_ms > 0")
     if async_capacity <= 0:
@@ -203,12 +201,12 @@ def apply_sem_local_topk_pushdown(
     plan = lower_sem_local_topk_request(
         request,
         runtime_config,
-        candidates_field=candidates_field,
+        items_field=items_field,
     )
     scoring_fn = SemLocalTopKScoringFunction(
         score_intent=plan.intent,
         llm_config=plan.llm_config,
-        candidates_field=plan.candidates_field,
+        items_field=plan.items_field,
     )
     scored = AsyncDataStream.unordered_wait(
         input_stream,
@@ -218,7 +216,7 @@ def apply_sem_local_topk_pushdown(
         Types.STRING(),
     )
     return scored.map(
-        SemLocalTopKProjector(k=plan.k, candidates_field=plan.candidates_field),
+        SemLocalTopKProjector(k=plan.k),
         output_type=Types.STRING(),
     )
 

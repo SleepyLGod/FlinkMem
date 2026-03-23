@@ -110,7 +110,7 @@ def recompute_topk_snapshot(
         "key": meta.get("key", ""),
         "topk": new_snapshot["top_records"],
         "top_ids": new_topk_ids,
-        "query": meta.get("last_query", ""),
+        "query": meta.get("last_ranking_text", ""),
         "query_seq_id": meta.get("last_query_seq_id", 0),
         "source": meta.get("last_source", ""),
         "total_candidates": len(scored),

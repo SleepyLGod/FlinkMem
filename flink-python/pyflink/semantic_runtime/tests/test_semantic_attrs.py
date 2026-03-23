@@ -64,7 +64,7 @@ def test_sem_score_block_execution_parses_scores() -> None:
             client=client,
             llm_config=llm_config,
             intent="Score these items",
-            score_block=[{"item_idx": 0, "candidate": {"id": 1}}],
+            score_block=[{"item_idx": 0, "item": {"id": 1}}],
         )
     finally:
         client.close()
@@ -200,8 +200,8 @@ def test_sem_rerank_block_execution_parses_ranked_ids() -> None:
             intent="Rerank these items",
             method="listwise",
             rerank_block=[
-                {"item_id": "a", "candidate": {"id": "a"}},
-                {"item_id": "b", "candidate": {"id": "b"}},
+                {"item_id": "a", "item": {"id": "a"}},
+                {"item_id": "b", "item": {"id": "b"}},
             ],
         )
     finally:

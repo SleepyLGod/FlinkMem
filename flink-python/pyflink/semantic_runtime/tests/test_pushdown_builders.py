@@ -154,10 +154,10 @@ def test_apply_sem_local_topk_pushdown_builds_async_then_native_topk(monkeypatch
     assert result is sentinel.mapped_stream
     assert captured["async_fn"].__class__.__name__ == "SemLocalTopKScoringFunction"
     projected = projected_stream.map_func.map(
-        '{"scored_candidates":[{"candidate":"a","score":0.4},{"candidate":"b","score":0.9},{"candidate":"c","score":0.7}]}'
+        '{"scored_items":[{"item":"a","score":0.4},{"item":"b","score":0.9},{"item":"c","score":0.7}]}'
     )
-    assert '"candidate": "b"' in projected
-    assert '"candidate": "c"' in projected
+    assert '"item": "b"' in projected
+    assert '"item": "c"' in projected
 
 
 def test_apply_sem_lookup_join_pushdown_builds_async_runtime(monkeypatch) -> None:
@@ -323,10 +323,10 @@ def test_json_decision_filter_crashes_on_invalid_json() -> None:
 
 
 def test_sem_local_topk_projector_crashes_on_invalid_payload() -> None:
-    projector = row_pushdown.SemLocalTopKProjector(k=2, candidates_field="candidates")
+    projector = row_pushdown.SemLocalTopKProjector(k=2)
 
     with pytest.raises(ValueError, match="valid JSON"):
         projector.map("not-json")
 
-    with pytest.raises(ValueError, match="scored_candidates"):
+    with pytest.raises(ValueError, match="scored_items"):
         projector.map('{"top_k":[]}')

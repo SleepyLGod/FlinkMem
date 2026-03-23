@@ -226,7 +226,7 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             "scope_epoch": 0,
             "scope_last_time_ms": 0,
             "scope_bucket_id": None,
-            "last_query": "",
+            "last_ranking_text": "",
             "last_query_seq_id": 0,
             "last_source": "",
             "last_error": "",
@@ -240,7 +240,7 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             self._reset_scope_state(meta, reason=decision.pre_reset_reason)
 
         meta["update_count"] += 1
-        meta["last_query"] = value.get("query", meta.get("last_query", ""))
+        meta["last_ranking_text"] = value.get("query", meta.get("last_ranking_text", ""))
         meta["last_query_seq_id"] = int(
             value.get("query_seq_id", meta.get("last_query_seq_id", 0))
         )
@@ -372,7 +372,7 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
         )
         out = {
             "key": meta.get("key", ""),
-            "query": meta.get("last_query", ""),
+            "query": meta.get("last_ranking_text", ""),
             "query_seq_id": meta.get("last_query_seq_id", 0),
             "candidates": candidates,
             "candidate_count": len(candidates),

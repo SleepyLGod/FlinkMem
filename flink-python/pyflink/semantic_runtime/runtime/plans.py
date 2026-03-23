@@ -129,7 +129,7 @@ class SemLocalTopKPlan:
     k: int
     semantic: SemSpec
     llm_config: LLMClientConfig
-    candidates_field: str
+    items_field: str
 
 
 @dataclass(frozen=True)
@@ -234,7 +234,7 @@ def lower_sem_local_topk_request(
     request: SemLocalTopKRequest,
     runtime_config: "RuntimeConfig",
     *,
-    candidates_field: str = "candidates",
+    items_field: str = "items",
 ) -> SemLocalTopKPlan:
     """Lower a public local top-k request into one internal plan."""
     semantic = SemSpec.for_sem_topk(request.intent)
@@ -243,7 +243,7 @@ def lower_sem_local_topk_request(
         k=request.k,
         semantic=semantic,
         llm_config=runtime_config.get_row_llm_client_config("sem_local_topk"),
-        candidates_field=candidates_field,
+        items_field=items_field,
     )
 
 

@@ -83,7 +83,7 @@ def apply_sem_local_topk_from_request(
     runtime_config: RuntimeConfig,
     timeout_ms: int = 30_000,
     async_capacity: int = 20,
-    candidates_field: str = "candidates",
+    items_field: str = "items",
 ) -> DataStream:
     """Apply a row-level local semantic top-k request through the pushdown path."""
     return apply_sem_local_topk_pushdown(
@@ -92,7 +92,7 @@ def apply_sem_local_topk_from_request(
         runtime_config=runtime_config,
         timeout_ms=timeout_ms,
         async_capacity=async_capacity,
-        candidates_field=candidates_field,
+        items_field=items_field,
     )
 
 

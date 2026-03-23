@@ -82,18 +82,6 @@ def build_sem_rerank_block_prompt(intent: str, *, method: str) -> str:
     )
 
 
-def build_sem_local_topk_scoring_prompt(intent: str) -> str:
-    """Build the internal semantic scoring prompt for local top-k."""
-    return (
-        f"{intent}\n\n"
-        "Input record:\n{input}\n\n"
-        "Candidate list:\n{candidates}\n\n"
-        'Return one JSON object with a "scored_candidates" field. '
-        'Each item must be an object with fields: '
-        '{{"candidate": any, "score": float, "reason": str}}.'
-    )
-
-
 def build_sem_lookup_join_prompt(intent: str) -> str:
     """Build the internal semantic match prompt for lookup join blocks."""
     return (

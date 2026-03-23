@@ -92,13 +92,13 @@ def run_sem_filter():
 
 
 def run_sem_local_topk():
-    """Verify sem_local_topk reranks candidates and returns top-k."""
+    """Verify sem_local_topk reranks bounded items and returns top-k."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
     records = [
-        json.dumps({"query": "best restaurant", "candidates": ["A", "B", "C", "D"]}),
-        json.dumps({"query": "cheap hotel", "candidates": ["X", "Y", "Z"]}),
+        json.dumps({"query": "best restaurant", "items": ["A", "B", "C", "D"]}),
+        json.dumps({"query": "cheap hotel", "items": ["X", "Y", "Z"]}),
     ]
     ds = env.from_collection(records, type_info=Types.STRING())
 
@@ -114,7 +114,7 @@ def run_sem_local_topk():
     )
     runtime_config = _mock_runtime_config("sem_local_topk", response=mock_resp)
     fn = build_sem_local_topk_operator(
-        SemSpec.for_sem_topk("Rank these for '{input}': {candidates}"),
+        SemSpec.for_sem_topk("Rank these items for '{input}'."),
         k=2,
         runtime_config=runtime_config,
     )

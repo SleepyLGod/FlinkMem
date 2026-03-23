@@ -415,7 +415,7 @@ def test_local_topk_pushdown_pipeline() -> None:
     env.set_parallelism(1)
 
     records = [
-        json.dumps({"query": "best restaurant", "candidates": ["A", "B", "C", "D"]}),
+        json.dumps({"query": "best restaurant", "items": ["A", "B", "C", "D"]}),
     ]
     ds = env.from_collection(records, type_info=Types.STRING())
     runtime_config = RuntimeConfig.from_dict(
@@ -448,7 +448,7 @@ def test_local_topk_pushdown_pipeline() -> None:
     results = collect_results(env, result, "test_local_topk_pushdown_pipeline")
     assert len(results) == 1
     parsed = json.loads(results[0])
-    assert parsed["top_k"][0]["candidate"] == "C"
+    assert parsed["top_k"][0]["item"] == "C"
     assert len(parsed["top_k"]) == 2
 
 

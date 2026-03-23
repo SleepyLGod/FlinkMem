@@ -268,7 +268,7 @@ class SemTopKFunction(KeyedProcessFunction):
             "scope_epoch": 0,
             "scope_last_time_ms": 0,
             "scope_bucket_id": None,
-            "last_query": "",
+            "last_ranking_text": "",
             "last_query_seq_id": 0,
             "last_source": "",
             "last_error": "",
@@ -283,10 +283,10 @@ class SemTopKFunction(KeyedProcessFunction):
 
         meta["update_count"] += 1
 
-        # Propagate query + envelope metadata from the flat candidate into
-        # meta so downstream snapshot emissions retain query, source, and
-        # error context from upstream retrieval/scoring stages.
-        meta["last_query"] = value.get("query", meta.get("last_query", ""))
+        # Propagate optional ranking-text override and envelope metadata from
+        # the flat candidate into meta so downstream snapshot emissions retain
+        # the effective ranking text, source, and error context.
+        meta["last_ranking_text"] = value.get("query", meta.get("last_ranking_text", ""))
         meta["last_query_seq_id"] = int(
             value.get("query_seq_id", meta.get("last_query_seq_id", 0))
         )

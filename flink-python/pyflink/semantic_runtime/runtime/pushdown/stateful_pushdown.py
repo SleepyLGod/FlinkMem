@@ -357,22 +357,22 @@ class TopKExternalScoreEnvelopeBuilder(MapFunction):
         self._score_field = score_field
 
     def map(self, value: Any) -> Dict[str, Any]:
-        """Normalize one bounded candidate pool into scored_candidates."""
+        """Normalize one bounded candidate pool into scored_items."""
         record = parse_candidate_pool(value, operator_name="sem_topk pushdown")
-        scored_candidates: List[Dict[str, Any]] = []
+        scored_items: List[Dict[str, Any]] = []
         for candidate in record["candidates"]:
             if not isinstance(candidate, dict):
                 raise ValueError("sem_topk pushdown expected candidate dicts")
             if self._score_field not in candidate or candidate[self._score_field] is None:
                 raise ValueError(f"sem_topk pushdown expected external score field {self._score_field!r}")
-            scored_candidates.append(
+            scored_items.append(
                 {
-                    "candidate": dict(candidate),
+                    "item": dict(candidate),
                     "score": float(candidate[self._score_field]),
                     "reason": str(candidate.get("reason", "")),
                 }
             )
-        return {"scored_candidates": scored_candidates, "original_count": len(scored_candidates)}
+        return {"scored_items": scored_items, "original_count": len(scored_items)}
 
 
 class TopKEmbeddingEnvelopeBuilder(MapFunction):
@@ -385,19 +385,19 @@ class TopKEmbeddingEnvelopeBuilder(MapFunction):
         """Score one bounded candidate pool locally."""
         record = parse_candidate_pool(value, operator_name="sem_topk pushdown")
         query_text = str(record.get("query", ""))
-        scored_candidates: List[Dict[str, Any]] = []
+        scored_items: List[Dict[str, Any]] = []
         for candidate in record["candidates"]:
             if not isinstance(candidate, dict):
                 raise ValueError("sem_topk pushdown expected candidate dicts")
             candidate_text = extract_topk_candidate_text(candidate)
-            scored_candidates.append(
+            scored_items.append(
                 {
-                    "candidate": dict(candidate),
+                    "item": dict(candidate),
                     "score": float(lexical_similarity(query_text, candidate_text)),
                     "reason": "embedding_similarity",
                 }
             )
-        return {"scored_candidates": scored_candidates, "original_count": len(scored_candidates)}
+        return {"scored_items": scored_items, "original_count": len(scored_items)}
 
 
 class StatefulTopKProjector(MapFunction):
@@ -409,16 +409,16 @@ class StatefulTopKProjector(MapFunction):
     def map(self, value: Any) -> Dict[str, Any]:
         """Sort one scored pool and emit one top-k snapshot envelope."""
         payload = parse_json_or_passthrough(value, operator_name="sem_topk pushdown")
-        if not isinstance(payload, dict) or not isinstance(payload.get("scored_candidates"), list):
-            raise ValueError("sem_topk pushdown expected scored_candidates envelope")
-        scored_candidates = payload["scored_candidates"]
+        if not isinstance(payload, dict) or not isinstance(payload.get("scored_items"), list):
+            raise ValueError("sem_topk pushdown expected scored_items envelope")
+        scored_items = payload["scored_items"]
         normalized: List[Tuple[Dict[str, Any], float]] = []
-        for item in scored_candidates:
+        for item in scored_items:
             if not isinstance(item, dict):
-                raise ValueError("sem_topk pushdown expected scored candidate objects")
-            candidate = item.get("candidate")
+                raise ValueError("sem_topk pushdown expected scored item objects")
+            candidate = item.get("item")
             if not isinstance(candidate, dict) or not candidate.get("candidate_id"):
-                raise ValueError("sem_topk pushdown expected candidate dicts with candidate_id")
+                raise ValueError("sem_topk pushdown expected item dicts with candidate_id")
             normalized.append((dict(candidate), float(item.get("score", 0.0))))
         normalized.sort(key=lambda entry: entry[1], reverse=True)
         top_records = [candidate for candidate, _score in normalized[: self._k]]
@@ -547,7 +547,7 @@ def apply_sem_topk_pushdown(
                     "sem_topk",
                     allow_query_spec=True,
                 ),
-                candidates_field="candidates",
+                items_field="candidates",
             ),
             Time.milliseconds(timeout_ms),
             async_capacity,

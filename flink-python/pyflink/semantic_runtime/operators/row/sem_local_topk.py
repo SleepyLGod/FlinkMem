@@ -16,11 +16,11 @@
 # under the License.
 
 """
-sem_local_topk — local (row-level) semantic top-k over a bounded candidate list.
+sem_local_topk — local (row-level) semantic top-k over a bounded item list.
 
-The input record is expected to be a JSON string carrying a ``candidates``
+The input record is expected to be a JSON string carrying an ``items``
 list. The operator uses the internal ``sem_score`` step to score these
-candidates and returns the top-k.
+items and returns the top-k.
 
 This is the **local** V0.1 variant (no keyed state).  The continuous,
 stateful ``sem_topk`` lives in ``operators/stateful/sem_topk.py``.
@@ -60,11 +60,11 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
         self,
         score_intent: str,
         llm_config: LLMClientConfig,
-        candidates_field: str = "candidates",
+        items_field: str = "items",
     ) -> None:
         self._score_intent = score_intent
         self._llm_config = llm_config
-        self._candidates_field = candidates_field
+        self._items_field = items_field
         self._client: Optional[LLMClient] = None
         self._op_metrics: Optional[OperatorMetrics] = None
 
@@ -85,26 +85,26 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
         raise TimeoutError(f"sem_local_topk timed out for input: {value!r}")
 
     def _parse_input_record(self, value: Any) -> tuple[Any, List[Any]]:
-        """Parse one bounded candidate input record."""
+        """Parse one bounded item input record."""
         try:
             record = json.loads(value) if isinstance(value, str) else value
-            candidates = record[self._candidates_field]
+            items = record[self._items_field]
         except (json.JSONDecodeError, TypeError, KeyError) as exc:
             logger.warning("sem_topk input parse failed: %s", exc)
             if self._op_metrics:
                 self._op_metrics.record_invalid_output()
             raise ValueError(
-                f"sem_local_topk input is missing '{self._candidates_field}': {exc}"
+                f"sem_local_topk input is missing '{self._items_field}': {exc}"
             ) from exc
-        if not isinstance(candidates, list):
-            raise ValueError("sem_local_topk candidates must be a list")
-        return record, candidates
+        if not isinstance(items, list):
+            raise ValueError("sem_local_topk items must be a list")
+        return record, items
 
-    async def _score_candidates(self, value: Any) -> tuple[List[dict], int]:
-        """Call the semantic scoring backend and return one scored candidate list."""
+    async def _score_items(self, value: Any) -> tuple[List[dict], int]:
+        """Call the semantic scoring backend and return one scored item list."""
         assert self._client is not None, "open() was not called"
 
-        record, candidates = self._parse_input_record(value)
+        record, items = self._parse_input_record(value)
         try:
             payload = await evaluate_sem_score_block_payload(
                 client=self._client,
@@ -114,9 +114,9 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
                     {
                         "item_idx": idx,
                         "input_record": record,
-                        "candidate": candidate,
+                        "item": item,
                     }
-                    for idx, candidate in enumerate(candidates)
+                    for idx, item in enumerate(items)
                 ],
             )
         except Exception as exc:
@@ -135,7 +135,7 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
             )
 
         try:
-            score_rows = parse_sem_score_block(payload, expected_size=len(candidates))
+            score_rows = parse_sem_score_block(payload, expected_size=len(items))
         except ValueError as exc:
             if self._op_metrics:
                 self._op_metrics.record_invalid_output()
@@ -143,31 +143,31 @@ class _BaseSemLocalTopKAsyncFunction(AsyncFunction):
 
         score_map = {row["item_idx"]: row for row in score_rows}
         normalized: List[dict] = []
-        for idx, candidate in enumerate(candidates):
+        for idx, item in enumerate(items):
             if idx not in score_map:
                 if self._op_metrics:
                     self._op_metrics.record_invalid_output()
-                raise ValueError("sem_local_topk sem_score block is missing candidate score")
+                raise ValueError("sem_local_topk sem_score block is missing item score")
             row = score_map[idx]
             normalized.append(
                 {
-                    "candidate": candidate,
+                    "item": item,
                     "score": float(row["score"]),
                     "reason": str(row["reason"]),
                 }
             )
-        return normalized, len(candidates)
+        return normalized, len(items)
 
 
 class SemLocalTopKScoringFunction(_BaseSemLocalTopKAsyncFunction):
     """Internal async scoring step for local top-k pushdown."""
 
     async def async_invoke(self, value) -> List[str]:
-        scored_candidates, original_count = await self._score_candidates(value)
+        scored_items, original_count = await self._score_items(value)
         return [
             json.dumps(
                 {
-                    "scored_candidates": scored_candidates,
+                    "scored_items": scored_items,
                     "original_count": original_count,
                 }
             )
@@ -185,9 +185,9 @@ class SemLocalTopKFunction(_BaseSemLocalTopKAsyncFunction):
         Number of top results to return.
     llm_config : LLMClientConfig
         Picklable LLM backend configuration.
-    candidates_field : str
-        JSON key in the input record that holds the candidate list
-        (default ``"candidates"``).
+    items_field : str
+        JSON key in the input record that holds the item list
+        (default ``"items"``).
     """
 
     def __init__(
@@ -195,21 +195,21 @@ class SemLocalTopKFunction(_BaseSemLocalTopKAsyncFunction):
         prompt_template: str,
         k: int,
         llm_config: LLMClientConfig,
-        candidates_field: str = "candidates",
+        items_field: str = "items",
     ) -> None:
         super().__init__(
             score_intent=prompt_template,
             llm_config=llm_config,
-            candidates_field=candidates_field,
+            items_field=items_field,
         )
         self._k = k
 
     # -- core ----------------------------------------------------------------
 
     async def async_invoke(self, value) -> List[str]:
-        scored_candidates, original_count = await self._score_candidates(value)
+        scored_items, original_count = await self._score_items(value)
         # Truncate to k
-        top = scored_candidates[: self._k]
+        top = scored_items[: self._k]
 
         result = {
             "_input": value,
@@ -225,7 +225,7 @@ def build_sem_local_topk_operator(
     *,
     k: int,
     runtime_config: "RuntimeConfig",
-    candidates_field: str = "candidates",
+    items_field: str = "items",
 ) -> SemLocalTopKFunction:
     """Build a public row-style semantic local top-k operator."""
     validate_generic_sem_spec(
@@ -241,11 +241,11 @@ def build_sem_local_topk_operator(
     plan = lower_sem_local_topk_request(
         sem_local_topk(intent=semantic.instruction, k=k),
         runtime_config,
-        candidates_field=candidates_field,
+        items_field=items_field,
     )
     return SemLocalTopKFunction(
         prompt_template=plan.intent,
         k=plan.k,
         llm_config=plan.llm_config,
-        candidates_field=plan.candidates_field,
+        items_field=plan.items_field,
     )
