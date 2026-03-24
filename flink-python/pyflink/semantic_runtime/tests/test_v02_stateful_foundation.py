@@ -1207,7 +1207,7 @@ class TestSemTopKPureStateMachine:
     def test_sliding_scope_evicts_old_candidates(self):
         func = self._make_func(
             k=1,
-            scope_policy=TopKScopePolicy(window_kind="sliding", window_size_ms=100),
+            scope_policy=TopKScopePolicy(window_kind="sliding", window_size_ms=100, slide_ms=25),
         )
         list(func.process_element(
             {"candidate_id": "c1", "score": 0.9, "event_time_ms": 10},

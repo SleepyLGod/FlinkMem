@@ -29,6 +29,7 @@ This module is not public API.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -311,6 +312,70 @@ def _agg_scope_policy_from_context(kind: str) -> AggScopePolicy:
     raise ValueError(f"Unsupported sem_agg context {kind!r}.")
 
 
+def _is_default_on_event_trigger(policy: TriggerPolicy) -> bool:
+    """Return True when a trigger policy is still the default row-by-row form."""
+    return (
+        policy.mode == "on_event"
+        and policy.interval_ms is None
+        and policy.idle_ms is None
+        and policy.count_threshold is None
+    )
+
+
+def _preserve_topk_scope_policy(
+    query_spec: TopKQuerySpec,
+    *,
+    context_kind: str,
+) -> TopKScopePolicy:
+    """Preserve internal top-k window details while applying public context."""
+    scope = deepcopy(query_spec.scope_policy)
+    if context_kind == "window":
+        return scope
+    if context_kind == "session":
+        scope.window_kind = "session"
+        return scope
+    if context_kind == "semantic_segment":
+        scope.window_kind = "semantic"
+        return scope
+    raise ValueError(f"Unsupported sem_topk context {context_kind!r}.")
+
+
+def _preserve_groupby_scope_policy(
+    query_spec: GroupbyQuerySpec,
+    *,
+    context_kind: str,
+) -> GroupbyScopePolicy:
+    """Preserve internal groupby window details while applying public context."""
+    scope = deepcopy(query_spec.scope_policy)
+    if context_kind == "window":
+        return scope
+    if context_kind == "session":
+        scope.window_kind = "session"
+        return scope
+    if context_kind == "semantic_segment":
+        scope.window_kind = "semantic"
+        return scope
+    raise ValueError(f"Unsupported sem_groupby context {context_kind!r}.")
+
+
+def _preserve_agg_scope_policy(
+    query_spec: AggQuerySpec,
+    *,
+    context_kind: str,
+) -> AggScopePolicy:
+    """Preserve internal aggregation window details while applying public context."""
+    scope = deepcopy(query_spec.scope_policy)
+    if context_kind == "window":
+        return scope
+    if context_kind == "session":
+        scope.window_kind = "session"
+        return scope
+    if context_kind == "semantic_segment":
+        scope.window_kind = "semantic"
+        return scope
+    raise ValueError(f"Unsupported sem_agg context {context_kind!r}.")
+
+
 def lower_sem_window_request(
     request: SemWindowRequest,
     runtime_config: "RuntimeConfig",
@@ -330,9 +395,15 @@ def lower_sem_topk_request(
 ) -> SemTopKPlan:
     """Lower a public stateful semantic top-k request into one internal plan."""
     input_kind = _context_to_input_kind(request.context.kind)
-    query_spec = TopKQuerySpec.simple(request.intent, k=request.k)
-    query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
-    query_spec.scope_policy = _topk_scope_policy_from_context(request.context.kind)
+    query_spec = runtime_config.get_topk_query_spec()
+    query_spec.semantic.instruction = request.intent
+    query_spec.k = request.k
+    if request.context.kind == "window" and _is_default_on_event_trigger(query_spec.trigger_policy):
+        query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
+    query_spec.scope_policy = _preserve_topk_scope_policy(
+        query_spec,
+        context_kind=request.context.kind,
+    )
     return SemTopKPlan(
         intent=request.intent,
         k=request.k,
@@ -349,10 +420,15 @@ def lower_sem_groupby_request(
 ) -> SemGroupbyPlan:
     """Lower a public stateful semantic groupby request into one internal plan."""
     input_kind = _context_to_input_kind(request.context.kind)
-    query_spec = GroupbyQuerySpec.simple(request.intent)
-    query_spec.scope_policy = _groupby_scope_policy_from_context(request.context.kind)
+    query_spec = runtime_config.get_groupby_query_spec()
+    query_spec.semantic.instruction = request.intent
+    query_spec.scope_policy = _preserve_groupby_scope_policy(
+        query_spec,
+        context_kind=request.context.kind,
+    )
     if request.context.kind == "window":
-        query_spec.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
+        if query_spec.maintenance_trigger_policy is None:
+            query_spec.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
     return SemGroupbyPlan(
         intent=request.intent,
         context_kind=request.context.kind,
@@ -368,10 +444,17 @@ def lower_sem_agg_request(
 ) -> SemAggPlan:
     """Lower a public stateful semantic aggregation request into one internal plan."""
     input_kind = _context_to_input_kind(request.context.kind)
-    query_spec = AggQuerySpec.simple(request.intent, agg_method=request.mode)
+    query_spec = runtime_config.get_agg_query_spec()
+    query_spec.semantic.instruction = request.intent
+    query_spec.agg_method = request.mode
     if request.context.kind != "window":
         query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
-    query_spec.scope_policy = _agg_scope_policy_from_context(request.context.kind)
+    elif _is_default_on_event_trigger(query_spec.trigger_policy):
+        query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
+    query_spec.scope_policy = _preserve_agg_scope_policy(
+        query_spec,
+        context_kind=request.context.kind,
+    )
     return SemAggPlan(
         intent=request.intent,
         mode=request.mode,
@@ -390,9 +473,9 @@ def lower_sem_join_request(
     query_spec = runtime_config.get_join_query_spec()
     query_spec.semantic.instruction = request.intent
     runtime_kind = _join_context_to_runtime_kind(request.context.kind)
-    if runtime_kind == "window_owned":
-        query_spec.scope_policy.window_kind = "tumbling"
-    else:
+    if runtime_kind == "window_owned" and _is_default_on_event_trigger(query_spec.trigger_policy):
+        query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
+    if runtime_kind != "window_owned":
         query_spec.scope_policy.window_kind = None
     return SemJoinPlan(
         intent=request.intent,

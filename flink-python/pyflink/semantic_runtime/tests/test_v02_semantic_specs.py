@@ -446,7 +446,7 @@ class TestGroupbyQuerySpec:
         import pytest
         with pytest.raises(NotImplementedError, match="close-capable scopes"):
             spec = GroupbyQuerySpec(
-                scope_policy=GroupbyScopePolicy(window_kind="sliding", window_size_ms=1000),
+                scope_policy=GroupbyScopePolicy(window_kind="sliding", window_size_ms=1000, slide_ms=250),
                 maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
             )
             build_sem_groupby_operator(
@@ -1190,7 +1190,7 @@ class TestAggQuerySpec:
                 SemAggConfig(),
                 AggQuerySpec(
                     trigger_policy=TriggerPolicy(mode="on_scope_close"),
-                    scope_policy=AggScopePolicy(window_kind="sliding", window_size_ms=1000),
+                    scope_policy=AggScopePolicy(window_kind="sliding", window_size_ms=1000, slide_ms=250),
                 ),
                 input_kind="event_stream",
             )
@@ -1517,6 +1517,7 @@ class TestJoinQuerySpec:
                 max_right_buffer=25,
                 window_kind="sliding",
                 window_size_ms=10000,
+                slide_ms=2000,
             ),
         )
         restored = JoinQuerySpec.from_dict(spec.to_dict())

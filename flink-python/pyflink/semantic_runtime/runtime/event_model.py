@@ -293,6 +293,28 @@ def retrieve_to_topk_items(
     return result
 
 
+def window_snapshot_to_topk_pool(
+    snap: Dict[str, Any],
+    *,
+    ranking_text: str = "",
+) -> Dict[str, Any]:
+    """Normalize one WindowSnapshot into a bounded top-k candidate pool."""
+    events = window_snapshot_to_sem_events(snap)
+    candidates: List[Dict[str, Any]] = []
+    for index, event in enumerate(events):
+        candidate = dict(event)
+        candidate.setdefault("candidate_id", str(candidate.get("seq_id", index)))
+        candidates.append(candidate)
+    return {
+        "key": snap.get("key", ""),
+        "query": ranking_text,
+        "query_seq_id": 0,
+        "candidates": candidates,
+        "source": "window_snapshot",
+        "window_id": snap.get("window_id", ""),
+    }
+
+
 def retrieve_to_answer_context(
     retrieve_output: Dict[str, Any],
 ) -> Dict[str, Any]:

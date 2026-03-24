@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from pyflink.common import Types
 from pyflink.datastream import DataStream
 
 from pyflink.semantic_runtime.public_api import (
@@ -21,6 +22,7 @@ from pyflink.semantic_runtime.public_api import (
     SemTopKRequest,
     SemWindowRequest,
 )
+from pyflink.semantic_runtime.runtime.event_model import window_snapshot_to_topk_pool
 from pyflink.semantic_runtime.runtime.plans import (
     lower_sem_agg_request,
     lower_sem_groupby_request,
@@ -37,6 +39,8 @@ from pyflink.semantic_runtime.runtime.pushdown import (
     apply_sem_map_pushdown,
     apply_sem_topk_pushdown,
 )
+from pyflink.semantic_runtime.runtime.pushdown.common import parse_json_or_passthrough, parse_window_snapshot
+from pyflink.semantic_runtime.runtime.window_materialization import materialize_window_stream
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 
@@ -140,9 +144,26 @@ def build_sem_topk_from_request(
     )
 
     plan = lower_sem_topk_request(request, runtime_config)
+    topk_input = input_ds
+    if plan.context_kind == "window":
+        snapshots = materialize_window_stream(
+            input_ds,
+            scope_policy=plan.query_spec.scope_policy,
+            trigger_policy=plan.query_spec.trigger_policy,
+            runtime_config=runtime_config,
+            operator_name="sem_topk",
+        )
+        topk_input = snapshots.map(
+            lambda value: window_snapshot_to_topk_pool(
+                parse_window_snapshot(value, operator_name="sem_topk window materialization"),
+                ranking_text=plan.intent,
+            ),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+
     if plan.context_kind == "window" and plan.query_spec.ranking_method == "pointwise":
         return apply_sem_topk_pushdown(
-            input_ds,
+            topk_input,
             request=request,
             runtime_config=runtime_config,
             timeout_ms=async_timeout_ms,
@@ -157,9 +178,14 @@ def build_sem_topk_from_request(
         )
 
     embedding_config = runtime_config.to_embedding_backend_config()
+    effective_key_selector = key_selector
+    if plan.context_kind == "window":
+        effective_key_selector = lambda value: str(
+            parse_json_or_passthrough(value, operator_name="sem_topk window pool").get("key", "")
+        )
     return build_sem_topk_pipeline(
-        input_ds,
-        key_selector=key_selector,
+        topk_input,
+        key_selector=effective_key_selector,
         topk_config=plan.kernel_config,
         query_spec=plan.query_spec,
         llm_config=llm_config,
@@ -179,16 +205,24 @@ def apply_sem_groupby_from_request(
 ) -> DataStream:
     """Apply a stateful semantic groupby request to one input stream."""
     plan = lower_sem_groupby_request(request, runtime_config)
+    groupby_input = input_ds
     if plan.context_kind == "window":
-        return apply_sem_groupby_pushdown(
+        groupby_input = materialize_window_stream(
             input_ds,
+            scope_policy=plan.query_spec.scope_policy,
+            trigger_policy=plan.query_spec.trigger_policy,
+            runtime_config=runtime_config,
+            operator_name="sem_groupby",
+        )
+        return apply_sem_groupby_pushdown(
+            groupby_input,
             request=request,
             runtime_config=runtime_config,
             timeout_ms=timeout_ms,
             async_capacity=async_capacity,
         )
     op = build_sem_groupby_from_request(request, runtime_config)
-    return input_ds.key_by(lambda value: value.get("key", "")).process(op)
+    return groupby_input.key_by(lambda value: value.get("key", "")).process(op)
 
 
 def build_sem_groupby_from_request(
@@ -216,14 +250,22 @@ def apply_sem_agg_from_request(
 ) -> DataStream:
     """Apply a stateful semantic aggregation request to one input stream."""
     plan = lower_sem_agg_request(request, runtime_config)
+    agg_input = input_ds
     if plan.context_kind == "window" and plan.mode == "algebraic":
-        return apply_sem_agg_pushdown(
+        agg_input = materialize_window_stream(
             input_ds,
+            scope_policy=plan.query_spec.scope_policy,
+            trigger_policy=plan.query_spec.trigger_policy,
+            runtime_config=runtime_config,
+            operator_name="sem_agg",
+        )
+        return apply_sem_agg_pushdown(
+            agg_input,
             request=request,
             runtime_config=runtime_config,
         )
     op = build_sem_agg_from_request(request, runtime_config)
-    return input_ds.key_by(lambda value: value.get("key", "")).process(op)
+    return agg_input.key_by(lambda value: value.get("key", "")).process(op)
 
 
 def build_sem_agg_from_request(
@@ -266,6 +308,33 @@ def apply_sem_join_from_request(
         )
 
     plan = lower_sem_join_request(request, runtime_config)
+    left_stream = left_input_ds
+    right_stream = request.right_input
+    if request.context.kind == "window":
+        if plan.query_spec.scope_policy.window_kind == "semantic":
+            raise NotImplementedError(
+                "window-owned sem_join does not support semantic-window pairing yet"
+            )
+        left_stream = materialize_window_stream(
+            left_input_ds,
+            scope_policy=plan.query_spec.scope_policy,
+            trigger_policy=plan.query_spec.trigger_policy,
+            runtime_config=runtime_config,
+            operator_name="sem_join(left)",
+        )
+        right_stream = materialize_window_stream(
+            request.right_input,
+            scope_policy=plan.query_spec.scope_policy,
+            trigger_policy=plan.query_spec.trigger_policy,
+            runtime_config=runtime_config,
+            operator_name="sem_join(right)",
+        )
+        left_key_selector = lambda value: str(
+            parse_json_or_passthrough(value, operator_name="sem_join(left window)").get("key", "")
+        )
+        right_key_selector = lambda value: str(
+            parse_json_or_passthrough(value, operator_name="sem_join(right window)").get("key", "")
+        )
     llm_config = runtime_config.get_operator_llm_client_config(
         "sem_join",
         allow_query_spec=True,
@@ -283,7 +352,7 @@ def apply_sem_join_from_request(
             kernel_config=plan.kernel_config,
         )
     return (
-        left_input_ds.key_by(left_key_selector)
-        .connect(request.right_input.key_by(right_key_selector))
+        left_stream.key_by(left_key_selector)
+        .connect(right_stream.key_by(right_key_selector))
         .process(op)
     )

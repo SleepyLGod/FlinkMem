@@ -162,6 +162,7 @@ class TestRuntimeConfig:
                             "pairing_method": "blocking",
                             "window_kind": "sliding",
                             "window_size_ms": 3000,
+                            "slide_ms": 1000,
                         },
                         "kernel": {},
                     }

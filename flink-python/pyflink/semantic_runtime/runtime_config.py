@@ -240,6 +240,9 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
     )
     if "max_candidates" in raw and "max_candidates" not in scope:
         scope["max_candidates"] = raw["max_candidates"]
+    for field in ("window_kind", "window_size_ms", "slide_ms", "session_gap_ms", "time_basis", "boundary_flag"):
+        if field in raw and field not in scope:
+            scope[field] = raw[field]
 
     out: Dict[str, Any] = {
         "semantic": SemSpec.for_sem_topk(
@@ -291,6 +294,9 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
     )
     if "max_groups_per_key" in raw and "max_groups_per_key" not in scope:
         scope["max_groups_per_key"] = raw["max_groups_per_key"]
+    for field in ("window_kind", "window_size_ms", "slide_ms", "session_gap_ms", "time_basis", "boundary_flag"):
+        if field in raw and field not in scope:
+            scope[field] = raw[field]
 
     return {
         "semantic": SemSpec(
@@ -337,6 +343,9 @@ def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) 
         scope["max_buffer_events"] = raw["max_buffer_events"]
     if "flush_interval_ms" in raw and "flush_interval_ms" not in scope:
         scope["flush_interval_ms"] = raw["flush_interval_ms"]
+    for field in ("window_kind", "window_size_ms", "slide_ms", "session_gap_ms", "time_basis", "boundary_flag"):
+        if field in raw and field not in scope:
+            scope[field] = raw[field]
 
     return {
         "semantic": SemSpec(
@@ -364,7 +373,16 @@ def _normalize_join_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
     scope = dict(raw.get("scope_policy", {}))
     if "ttl_seconds" not in scope:
         scope["ttl_seconds"] = defaults_ttl_seconds
-    for field in ("max_left_buffer", "max_right_buffer", "window_kind", "window_size_ms"):
+    for field in (
+        "max_left_buffer",
+        "max_right_buffer",
+        "window_kind",
+        "window_size_ms",
+        "slide_ms",
+        "session_gap_ms",
+        "time_basis",
+        "boundary_flag",
+    ):
         if field in raw and field not in scope:
             scope[field] = raw[field]
 

@@ -206,12 +206,25 @@ def test_build_sem_agg_from_request() -> None:
 
 def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    sentinel.window_snapshots = _FakeDataStream()
+    sentinel.window_pools = _FakeDataStream()
+
+    def fake_materialize_window_stream(*args, **kwargs):
+        return sentinel.window_snapshots
+
+    def fake_map(self, func, output_type=None):
+        return sentinel.window_pools
 
     def fake_apply_sem_topk_pushdown(*args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
         return sentinel.stream
 
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.materialize_window_stream",
+        fake_materialize_window_stream,
+    )
+    monkeypatch.setattr(_FakeDataStream, "map", fake_map, raising=False)
     monkeypatch.setattr(
         "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_topk_pushdown",
         fake_apply_sem_topk_pushdown,
@@ -225,7 +238,7 @@ def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
     )
 
     assert result is sentinel.stream
-    assert captured["args"] == (sentinel.input_ds,)
+    assert captured["args"] == (sentinel.window_pools,)
     kwargs = captured["kwargs"]
     assert kwargs["request"].k == 3
     assert kwargs["runtime_config"].__class__.__name__ == "RuntimeConfig"
@@ -252,6 +265,54 @@ def test_apply_sem_groupby_from_request_uses_pushdown_for_window(monkeypatch) ->
 
     assert result is sentinel.grouped_stream
     assert captured["args"] == (sentinel.input_ds,)
+
+
+def test_apply_sem_groupby_from_request_materializes_native_window(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_materialize_window_stream(*args, **kwargs):
+        captured["materialize_args"] = args
+        captured["materialize_kwargs"] = kwargs
+        return sentinel.window_snapshots
+
+    def fake_apply_sem_groupby_pushdown(*args, **kwargs):
+        captured["pushdown_args"] = args
+        return sentinel.grouped_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.materialize_window_stream",
+        fake_materialize_window_stream,
+    )
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_groupby_pushdown",
+        fake_apply_sem_groupby_pushdown,
+    )
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "operators": {
+                "sem_groupby": {
+                    "query_spec": {
+                        "scope_policy": {
+                            "window_kind": "tumbling",
+                            "window_size_ms": 1000,
+                        }
+                    },
+                    "kernel": {},
+                }
+            }
+        }
+    )
+
+    result = facade_builders.apply_sem_groupby_from_request(
+        sentinel.input_ds,
+        request=sem_groupby(intent="Group by topic", context=context("window")),
+        runtime_config=runtime_config,
+    )
+
+    assert result is sentinel.grouped_stream
+    assert captured["materialize_args"] == (sentinel.input_ds,)
+    assert captured["pushdown_args"] == (sentinel.window_snapshots,)
 
 
 def test_apply_sem_agg_from_request_uses_pushdown_for_window_algebraic(monkeypatch) -> None:
@@ -340,3 +401,55 @@ def test_apply_sem_join_from_request_uses_window_owned_runtime() -> None:
     )
     assert result is sentinel.join_stream
     assert left_ds.connected.processed_with.__class__.__name__ == "WindowOwnedSemJoinFunction"
+
+
+def test_apply_sem_join_from_request_materializes_native_windows(monkeypatch) -> None:
+    left_ds = _FakeDataStream()
+    right_ds = _FakeDataStream()
+    materialized_left = _FakeDataStream()
+    materialized_right = _FakeDataStream()
+    captured: dict[str, object] = {"count": 0}
+
+    def fake_materialize_window_stream(*args, **kwargs):
+        captured["count"] = int(captured["count"]) + 1
+        if captured["count"] == 1:
+            return materialized_left
+        return materialized_right
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.materialize_window_stream",
+        fake_materialize_window_stream,
+    )
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "backend": "llm",
+                        "scope_policy": {
+                            "window_kind": "tumbling",
+                            "window_size_ms": 1000,
+                        },
+                    },
+                    "kernel": {"mock_delay_s": 0.01, "mock_response": '{"matches": []}'},
+                }
+            },
+        }
+    )
+    result = facade_builders.apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match if same issue",
+            context=context("window"),
+            right_input=right_ds,
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row["key"],
+        right_key_selector=lambda row: row["key"],
+    )
+    assert result is sentinel.join_stream
+    assert captured["count"] == 2
+    assert materialized_left.connected is not None
+    assert materialized_left.connected.right is materialized_right

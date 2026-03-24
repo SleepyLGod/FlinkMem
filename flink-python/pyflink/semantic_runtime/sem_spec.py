@@ -181,6 +181,40 @@ class SemSpec:
 # ---------------------------------------------------------------------------
 
 VALID_WINDOW_KINDS = {"tumbling", "sliding", "semantic", "session", None}
+VALID_TIME_BASES = {"processing", "event"}
+
+
+def _validate_window_scope(
+    *,
+    window_kind: Optional[str],
+    window_size_ms: Optional[int],
+    slide_ms: Optional[int],
+    session_gap_ms: Optional[int],
+    boundary_flag: Optional[str],
+    time_basis: str,
+) -> None:
+    """Validate one internal window scope definition."""
+    if window_kind is not None and window_kind not in VALID_WINDOW_KINDS:
+        raise ValueError(
+            f"Invalid window_kind={window_kind!r}. "
+            f"Must be one of {VALID_WINDOW_KINDS}."
+        )
+    if time_basis not in VALID_TIME_BASES:
+        raise ValueError(
+            f"Invalid time_basis={time_basis!r}. "
+            f"Must be one of {VALID_TIME_BASES}."
+        )
+    if window_kind in {"tumbling", "sliding"}:
+        if window_size_ms is None or int(window_size_ms) <= 0:
+            raise ValueError("window_size_ms must be > 0 for tumbling/sliding windows")
+    if window_kind == "sliding":
+        if slide_ms is None or int(slide_ms) <= 0:
+            raise ValueError("slide_ms must be > 0 for sliding windows")
+    if window_kind == "session":
+        if session_gap_ms is None or int(session_gap_ms) <= 0:
+            raise ValueError("session_gap_ms must be > 0 for session windows")
+    if window_kind == "semantic" and not boundary_flag:
+        raise ValueError("boundary_flag must be non-empty for semantic scopes")
 
 
 @dataclass
@@ -207,9 +241,15 @@ class TopKScopePolicy:
     window_size_ms : int or None
         Window size in milliseconds (only meaningful when ``window_kind``
         is set).
+    slide_ms : int or None
+        Slide interval in milliseconds. Only meaningful when
+        ``window_kind="sliding"``.
     session_gap_ms : int or None
         Idle-gap boundary for operator-owned session scopes.  Only meaningful
         when ``window_kind="session"``.
+    time_basis : str
+        Native window time basis for standard windows. One of
+        ``"processing"`` or ``"event"``.
     boundary_flag : str
         Semantic boundary flag name used by operator-owned semantic scopes.
         Only meaningful when ``window_kind="semantic"``.
@@ -219,19 +259,20 @@ class TopKScopePolicy:
     max_candidates: Optional[int] = None
     window_kind: Optional[str] = None
     window_size_ms: Optional[int] = None
+    slide_ms: Optional[int] = None
     session_gap_ms: Optional[int] = None
+    time_basis: str = "processing"
     boundary_flag: str = "topic_shift"
 
     def __post_init__(self):
-        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
-            raise ValueError(
-                f"Invalid window_kind={self.window_kind!r}. "
-                f"Must be one of {VALID_WINDOW_KINDS}."
-            )
-        if self.window_kind == "session" and self.session_gap_ms is not None and self.session_gap_ms <= 0:
-            raise ValueError("session_gap_ms must be > 0 when provided")
-        if self.window_kind == "semantic" and not self.boundary_flag:
-            raise ValueError("boundary_flag must be non-empty for semantic scopes")
+        _validate_window_scope(
+            window_kind=self.window_kind,
+            window_size_ms=self.window_size_ms,
+            slide_ms=self.slide_ms,
+            session_gap_ms=self.session_gap_ms,
+            boundary_flag=self.boundary_flag,
+            time_basis=self.time_basis,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -239,7 +280,9 @@ class TopKScopePolicy:
             "max_candidates": self.max_candidates,
             "window_kind": self.window_kind,
             "window_size_ms": self.window_size_ms,
+            "slide_ms": self.slide_ms,
             "session_gap_ms": self.session_gap_ms,
+            "time_basis": self.time_basis,
             "boundary_flag": self.boundary_flag,
         }
 
@@ -441,19 +484,20 @@ class GroupbyScopePolicy:
     max_groups_per_key: Optional[int] = None
     window_kind: Optional[str] = None
     window_size_ms: Optional[int] = None
+    slide_ms: Optional[int] = None
     session_gap_ms: Optional[int] = None
+    time_basis: str = "processing"
     boundary_flag: str = "topic_shift"
 
     def __post_init__(self):
-        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
-            raise ValueError(
-                f"Invalid window_kind={self.window_kind!r}. "
-                f"Must be one of {VALID_WINDOW_KINDS}."
-            )
-        if self.window_kind == "session" and self.session_gap_ms is not None and self.session_gap_ms <= 0:
-            raise ValueError("session_gap_ms must be > 0 when provided")
-        if self.window_kind == "semantic" and not self.boundary_flag:
-            raise ValueError("boundary_flag must be non-empty for semantic scopes")
+        _validate_window_scope(
+            window_kind=self.window_kind,
+            window_size_ms=self.window_size_ms,
+            slide_ms=self.slide_ms,
+            session_gap_ms=self.session_gap_ms,
+            boundary_flag=self.boundary_flag,
+            time_basis=self.time_basis,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -461,7 +505,9 @@ class GroupbyScopePolicy:
             "max_groups_per_key": self.max_groups_per_key,
             "window_kind": self.window_kind,
             "window_size_ms": self.window_size_ms,
+            "slide_ms": self.slide_ms,
             "session_gap_ms": self.session_gap_ms,
+            "time_basis": self.time_basis,
             "boundary_flag": self.boundary_flag,
         }
 
@@ -566,19 +612,20 @@ class AggScopePolicy:
     flush_interval_ms: Optional[int] = None
     window_kind: Optional[str] = None
     window_size_ms: Optional[int] = None
+    slide_ms: Optional[int] = None
     session_gap_ms: Optional[int] = None
+    time_basis: str = "processing"
     boundary_flag: str = "topic_shift"
 
     def __post_init__(self):
-        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
-            raise ValueError(
-                f"Invalid window_kind={self.window_kind!r}. "
-                f"Must be one of {VALID_WINDOW_KINDS}."
-            )
-        if self.window_kind == "session" and self.session_gap_ms is not None and self.session_gap_ms <= 0:
-            raise ValueError("session_gap_ms must be > 0 when provided")
-        if self.window_kind == "semantic" and not self.boundary_flag:
-            raise ValueError("boundary_flag must be non-empty for semantic scopes")
+        _validate_window_scope(
+            window_kind=self.window_kind,
+            window_size_ms=self.window_size_ms,
+            slide_ms=self.slide_ms,
+            session_gap_ms=self.session_gap_ms,
+            boundary_flag=self.boundary_flag,
+            time_basis=self.time_basis,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -587,7 +634,9 @@ class AggScopePolicy:
             "flush_interval_ms": self.flush_interval_ms,
             "window_kind": self.window_kind,
             "window_size_ms": self.window_size_ms,
+            "slide_ms": self.slide_ms,
             "session_gap_ms": self.session_gap_ms,
+            "time_basis": self.time_basis,
             "boundary_flag": self.boundary_flag,
         }
 
@@ -678,20 +727,27 @@ class AggQuerySpec:
 
 @dataclass
 class JoinScopePolicy:
-    """Scope boundary for future true two-input semantic join."""
+    """Scope boundary for true two-input and window-owned semantic join."""
 
     ttl_seconds: Optional[int] = None
     max_left_buffer: Optional[int] = None
     max_right_buffer: Optional[int] = None
     window_kind: Optional[str] = None
     window_size_ms: Optional[int] = None
+    slide_ms: Optional[int] = None
+    session_gap_ms: Optional[int] = None
+    time_basis: str = "processing"
+    boundary_flag: str = "topic_shift"
 
     def __post_init__(self):
-        if self.window_kind is not None and self.window_kind not in VALID_WINDOW_KINDS:
-            raise ValueError(
-                f"Invalid window_kind={self.window_kind!r}. "
-                f"Must be one of {VALID_WINDOW_KINDS}."
-            )
+        _validate_window_scope(
+            window_kind=self.window_kind,
+            window_size_ms=self.window_size_ms,
+            slide_ms=self.slide_ms,
+            session_gap_ms=self.session_gap_ms,
+            boundary_flag=self.boundary_flag,
+            time_basis=self.time_basis,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -700,6 +756,10 @@ class JoinScopePolicy:
             "max_right_buffer": self.max_right_buffer,
             "window_kind": self.window_kind,
             "window_size_ms": self.window_size_ms,
+            "slide_ms": self.slide_ms,
+            "session_gap_ms": self.session_gap_ms,
+            "time_basis": self.time_basis,
+            "boundary_flag": self.boundary_flag,
         }
 
     @classmethod

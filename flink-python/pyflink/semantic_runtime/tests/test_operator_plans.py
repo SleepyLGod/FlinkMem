@@ -143,6 +143,35 @@ def test_lower_sem_topk_request_window() -> None:
     assert plan.query_spec.scope_policy.window_kind is None
 
 
+def test_lower_sem_topk_request_preserves_internal_window_spec() -> None:
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "operators": {
+                "sem_topk": {
+                    "query_spec": {
+                        "scope_policy": {
+                            "window_kind": "sliding",
+                            "window_size_ms": 1000,
+                            "slide_ms": 250,
+                            "time_basis": "event",
+                        }
+                    },
+                    "kernel": {},
+                }
+            }
+        }
+    )
+    plan = lower_sem_topk_request(
+        sem_topk(intent="Rank by relevance", k=3, context=context("window")),
+        runtime_config,
+    )
+    assert plan.query_spec.scope_policy.window_kind == "sliding"
+    assert plan.query_spec.scope_policy.window_size_ms == 1000
+    assert plan.query_spec.scope_policy.slide_ms == 250
+    assert plan.query_spec.scope_policy.time_basis == "event"
+    assert plan.query_spec.trigger_policy.mode == "on_scope_close"
+
+
 def test_lower_sem_groupby_request_session() -> None:
     plan = lower_sem_groupby_request(
         sem_groupby(intent="Group by topic", context=context("session")),
@@ -200,3 +229,36 @@ def test_lower_sem_join_request_stream() -> None:
     assert plan.right_input is right_input
     assert plan.query_spec.semantic.instruction == "Match contradictory facts"
     assert plan.kernel_config.pair_block_size == 4
+
+
+def test_lower_sem_join_request_preserves_internal_window_spec() -> None:
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "backend": "llm",
+                        "scope_policy": {
+                            "window_kind": "session",
+                            "session_gap_ms": 500,
+                            "time_basis": "processing",
+                        },
+                    },
+                    "kernel": {},
+                }
+            },
+        }
+    )
+    plan = lower_sem_join_request(
+        sem_join(
+            intent="Match related rows",
+            context=context("window"),
+            right_input=object(),
+        ),
+        runtime_config,
+    )
+    assert plan.query_spec.scope_policy.window_kind == "session"
+    assert plan.query_spec.scope_policy.session_gap_ms == 500
+    assert plan.query_spec.scope_policy.time_basis == "processing"
+    assert plan.query_spec.trigger_policy.mode == "on_scope_close"
