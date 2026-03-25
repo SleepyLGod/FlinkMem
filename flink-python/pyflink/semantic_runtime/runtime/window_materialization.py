@@ -187,7 +187,14 @@ def materialize_window_stream(
             boundary_flag=scope_policy.boundary_flag,
         )
         return normalized_stream.key_by(simple_key_selector).process(
-            SemWindowFunction(sem_window_config),
+            SemWindowFunction(
+                sem_window_config,
+                llm_config=runtime_config.get_operator_llm_client_config(
+                    "sem_window",
+                    allow_query_spec=False,
+                ),
+                embedding_config=runtime_config.to_embedding_backend_config(),
+            ),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
 
@@ -205,4 +212,3 @@ def materialize_window_stream(
         ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
-

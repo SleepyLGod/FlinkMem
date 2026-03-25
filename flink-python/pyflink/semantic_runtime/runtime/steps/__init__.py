@@ -1,5 +1,12 @@
 """Internal semantic execution steps."""
 
+from pyflink.semantic_runtime.runtime.steps.sem_continuity import (
+    SemContinuityFunction,
+    evaluate_all_history_sem_continuity_sync,
+    evaluate_pairwise_sem_continuity_sync,
+    evaluate_summary_sem_continuity_sync,
+    parse_sem_continuity,
+)
 from pyflink.semantic_runtime.runtime.steps.sem_label import SemLabelFunction
 from pyflink.semantic_runtime.runtime.steps.sem_match import (
     SemMatchFunction,
@@ -22,23 +29,36 @@ from pyflink.semantic_runtime.runtime.steps.sem_score import (
     parse_sem_score_block,
 )
 from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig, SemSearchFunction
+from pyflink.semantic_runtime.runtime.steps.sem_window_summary import (
+    SemWindowSummaryFunction,
+    parse_sem_window_summary,
+    update_sem_window_summary_sync,
+)
 
 __all__ = [
+    "SemContinuityFunction",
+    "SemWindowSummaryFunction",
     "SemScoreFunction",
     "SemLabelFunction",
     "SemMatchFunction",
     "SemRerankFunction",
     "SemSearchConfig",
     "SemSearchFunction",
+    "evaluate_all_history_sem_continuity_sync",
+    "evaluate_pairwise_sem_continuity_sync",
+    "evaluate_summary_sem_continuity_sync",
     "evaluate_sem_rerank_block",
     "evaluate_sem_rerank_block_sync",
     "evaluate_sem_score",
     "evaluate_sem_score_block",
     "evaluate_sem_score_block_payload",
     "evaluate_sem_score_block_sync",
+    "parse_sem_continuity",
+    "parse_sem_window_summary",
     "parse_sem_score",
     "parse_sem_score_block",
     "parse_sem_rerank_block",
     "evaluate_sem_match_block_sync",
     "parse_sem_match_block",
+    "update_sem_window_summary_sync",
 ]

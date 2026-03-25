@@ -115,3 +115,46 @@ def build_sem_match_block_prompt(intent: str) -> str:
         'Return one JSON object with exactly this shape: '
         '{{"matches": [{{"pair_idx": int, "matched": bool, "match_score": float, "reason": str}}]}}.'
     )
+
+
+def build_sem_window_pairwise_prompt() -> str:
+    """Build the internal semantic continuity prompt for pairwise sem_window."""
+    return (
+        "Decide whether the current event continues the same semantic window as the "
+        "previous event.\n\n"
+        "Input payload:\n{input}\n\n"
+        'Return one JSON object with exactly these fields: '
+        '{{"continue_window": bool, "confidence": float, "reason": str}}.'
+    )
+
+
+def build_sem_window_summary_continuity_prompt() -> str:
+    """Build the internal semantic continuity prompt for summary sem_window."""
+    return (
+        "Decide whether the current event continues the same semantic window as the "
+        "current window summary.\n\n"
+        "Input payload:\n{input}\n\n"
+        'Return one JSON object with exactly these fields: '
+        '{{"continue_window": bool, "confidence": float, "reason": str}}.'
+    )
+
+
+def build_sem_window_summary_update_prompt() -> str:
+    """Build the internal semantic summary-update prompt for summary sem_window."""
+    return (
+        "Update the current semantic window summary after appending the new event.\n\n"
+        "Input payload:\n{input}\n\n"
+        'Return one JSON object with exactly these fields: '
+        '{{"summary": str}}.'
+    )
+
+
+def build_sem_window_all_history_prompt() -> str:
+    """Build the internal semantic membership prompt for all-history sem_window."""
+    return (
+        "Decide whether the current event still belongs to the active semantic "
+        "window formed by the full active window history.\n\n"
+        "Input payload:\n{input}\n\n"
+        'Return one JSON object with exactly these fields: '
+        '{{"continue_window": bool, "confidence": float, "reason": str}}.'
+    )

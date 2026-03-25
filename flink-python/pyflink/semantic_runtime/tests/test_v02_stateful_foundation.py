@@ -19,6 +19,9 @@ import time
 
 import pytest
 
+from pyflink.semantic_runtime.llm_client import LLMClientConfig
+from pyflink.semantic_runtime.runtime.embedding_runtime import create_embedding_runtime
+from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.runtime.event_model import (
     SemEvent,
     WindowSnapshot,
@@ -234,6 +237,7 @@ class TestSemWindowConfig:
         assert cfg.max_window_events == 50
         assert cfg.window_timeout_ms == 30_000
         assert cfg.boundary_flag == "topic_shift"
+        assert cfg.continuity_variant == "boundary_flag"
 
 class TestNewWindowMeta:
     def test_structure(self):
@@ -276,6 +280,304 @@ class TestSemWindowBoundaryLogic:
                               boundary_flags={"topic_shift": True})
         meta = {"event_count": 1}
         assert func._check_triggers(event, meta) == "semantic_boundary"
+
+
+class TestSemWindowPairwiseContinuity:
+    """Test pairwise sem_window continuity without a Flink runtime."""
+
+    def test_pairwise_split_starts_new_window(self):
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="pairwise",
+        )
+        func = SemWindowFunction(
+            cfg,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_response=json.dumps(
+                    {
+                        "continue_window": False,
+                        "confidence": 0.95,
+                        "reason": "topic shift",
+                    }
+                ),
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha topic", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="travel booking", seq_id=2).to_dict()
+
+        first_out = list(func.process_element(first, ctx))
+        second_out = list(func.process_element(second, ctx))
+
+        assert first_out == []
+        assert len(second_out) == 1
+        snapshot = WindowSnapshot.from_dict(second_out[0])
+        assert snapshot.event_count == 1
+        assert snapshot.events[0]["payload"] == "alpha topic"
+        remaining = func._event_buffer.get()
+        assert len(remaining) == 1
+        assert remaining[0]["payload"] == "travel booking"
+
+
+class TestSemWindowEmbeddingContinuity:
+    """Test embedding sem_window continuity without a Flink runtime."""
+
+    def test_embedding_similarity_keeps_same_window(self):
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="embedding",
+            continuity_threshold=0.2,
+        )
+        func = SemWindowFunction(
+            cfg,
+            embedding_config=EmbeddingBackendConfig(
+                backend="local_hashing",
+                dimensions=64,
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="alpha budget roadmap", seq_id=2).to_dict()
+
+        first_out = list(func.process_element(first, ctx))
+        second_out = list(func.process_element(second, ctx))
+
+        assert first_out == []
+        assert second_out == []
+        remaining = func._event_buffer.get()
+        assert len(remaining) == 2
+
+
+class TestSemWindowSummaryContinuity:
+    """Test summary sem_window continuity without a Flink runtime."""
+
+    def test_summary_split_starts_new_window(self):
+        continuity_response = json.dumps(
+            {
+                "continue_window": False,
+                "confidence": 0.9,
+                "reason": "new topic",
+            }
+        )
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="summary",
+        )
+        func = SemWindowFunction(
+            cfg,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_response=continuity_response,
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="travel booking", seq_id=2).to_dict()
+
+        first_out = list(func.process_element(first, ctx))
+        second_out = list(func.process_element(second, ctx))
+
+        assert first_out == []
+        assert len(second_out) == 1
+        snapshot = WindowSnapshot.from_dict(second_out[0])
+        assert snapshot.events[0]["payload"] == "alpha budget planning"
+        active_meta = func._window_meta.value()
+        assert active_meta["window_summary"] == "travel booking"
+
+
+class TestSemWindowAllHistoryContinuity:
+    """Test all-history sem_window continuity without a Flink runtime."""
+
+    def test_all_history_membership_keeps_same_window(self):
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="all_history",
+        )
+        func = SemWindowFunction(
+            cfg,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_response=json.dumps(
+                    {
+                        "continue_window": True,
+                        "confidence": 0.92,
+                        "reason": "same topic",
+                    }
+                ),
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="alpha budget roadmap", seq_id=2).to_dict()
+
+        first_out = list(func.process_element(first, ctx))
+        second_out = list(func.process_element(second, ctx))
+
+        assert first_out == []
+        assert second_out == []
+        remaining = func._event_buffer.get()
+        assert len(remaining) == 2
+
+    def test_all_history_membership_splits_window(self):
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="all_history",
+        )
+        func = SemWindowFunction(
+            cfg,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_response=json.dumps(
+                    {
+                        "continue_window": False,
+                        "confidence": 0.88,
+                        "reason": "different topic",
+                    }
+                ),
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="travel booking", seq_id=2).to_dict()
+
+        first_out = list(func.process_element(first, ctx))
+        second_out = list(func.process_element(second, ctx))
+
+        assert first_out == []
+        assert len(second_out) == 1
+        snapshot = WindowSnapshot.from_dict(second_out[0])
+        assert snapshot.event_count == 1
+        assert snapshot.events[0]["payload"] == "alpha budget planning"
+        remaining = func._event_buffer.get()
+        assert len(remaining) == 1
+        assert remaining[0]["payload"] == "travel booking"
+
+    def test_all_history_rolls_before_llm_when_window_is_full(self):
+        cfg = SemWindowConfig(
+            max_window_events=2,
+            continuity_variant="all_history",
+        )
+        func = SemWindowFunction(
+            cfg,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_response=json.dumps(
+                    {
+                        "continue_window": True,
+                        "confidence": 0.9,
+                        "reason": "same topic",
+                    }
+                ),
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        third = SemEvent(key="k", payload="alpha 3", seq_id=3).to_dict()
+        func._event_buffer.add(SemEvent(key="k", payload="alpha 1", seq_id=1).to_dict())
+        func._event_buffer.add(SemEvent(key="k", payload="alpha 2", seq_id=2).to_dict())
+        func._window_meta.update(
+            {
+                "window_id": "w1",
+                "open_time_ms": 1000,
+                "event_count": 2,
+                "window_summary": None,
+                "key": "k",
+            }
+        )
+        func._evaluate_all_history_continuity = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("all_history LLM continuity should not run once the window is full")
+        )
+        outputs = list(func.process_element(third, ctx))
+
+        assert len(outputs) == 1
+        snapshot = WindowSnapshot.from_dict(outputs[0])
+        assert snapshot.trigger_reason == "count"
+        assert snapshot.event_count == 2
+        assert [event["payload"] for event in snapshot.events] == ["alpha 1", "alpha 2"]
+        remaining = func._event_buffer.get()
+        assert len(remaining) == 1
+        assert remaining[0]["payload"] == "alpha 3"
+
+
+class TestEmbeddingRuntime:
+    """Test the internal embedding runtime factory."""
+
+    def test_local_hashing_runtime_scores_similarity(self):
+        runtime = create_embedding_runtime(
+            EmbeddingBackendConfig(
+                backend="local_hashing",
+                dimensions=64,
+            )
+        )
+        score = runtime.similarity("alpha budget", "alpha roadmap")
+        assert isinstance(score, float)
+        assert score >= 0.0
+
+    def test_faiss_runtime_scores_similarity(self):
+        pytest.importorskip("faiss")
+        runtime = create_embedding_runtime(
+            EmbeddingBackendConfig(
+                backend="faiss",
+                dimensions=64,
+            )
+        )
+        score = runtime.similarity("alpha budget", "alpha roadmap")
+        assert isinstance(score, float)
+        assert score >= 0.0
+
+    def test_sem_window_embedding_faiss_keeps_same_window(self):
+        pytest.importorskip("faiss")
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="embedding",
+            continuity_threshold=0.2,
+        )
+        func = SemWindowFunction(
+            cfg,
+            embedding_config=EmbeddingBackendConfig(
+                backend="faiss",
+                dimensions=64,
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="alpha budget roadmap", seq_id=2).to_dict()
+
+        first_out = list(func.process_element(first, ctx))
+        second_out = list(func.process_element(second, ctx))
+
+        assert first_out == []
+        assert second_out == []
+        remaining = func._event_buffer.get()
+        assert len(remaining) == 2
 
 
 # ============================================================================
@@ -582,16 +884,32 @@ class _FakeValueState:
         self._value = None
 
 
+class _FakeTimerService:
+    def __init__(self):
+        self.processing_timers = []
+        self.event_timers = []
+
+    def register_processing_time_timer(self, timestamp):
+        self.processing_timers.append(timestamp)
+
+    def register_event_time_timer(self, timestamp):
+        self.event_timers.append(timestamp)
+
+
 class _FakeContext:
     def __init__(self, key="k"):
         self._key = key
         self.outputs = []
+        self._timer_service = _FakeTimerService()
 
     def get_current_key(self):
         return self._key
 
     def output(self, tag, value):
         self.outputs.append((tag, value))
+
+    def timer_service(self):
+        return self._timer_service
 
 
 # ============================================================================

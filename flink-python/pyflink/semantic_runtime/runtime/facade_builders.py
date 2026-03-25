@@ -126,7 +126,14 @@ def build_sem_window_from_request(
     from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowFunction
 
     plan = lower_sem_window_request(request, runtime_config)
-    return SemWindowFunction(plan.kernel_config)
+    return SemWindowFunction(
+        plan.kernel_config,
+        llm_config=runtime_config.get_operator_llm_client_config(
+            "sem_window",
+            allow_query_spec=False,
+        ),
+        embedding_config=runtime_config.to_embedding_backend_config(),
+    )
 
 
 def build_sem_topk_from_request(
