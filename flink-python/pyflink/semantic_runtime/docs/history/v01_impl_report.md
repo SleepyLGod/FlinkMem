@@ -1,3 +1,5 @@
+> Historical note: this document is retained as implementation history. It is not the current cleanup source of truth. The canonical cleanup status and active constraints live in `v02_semantic_runtime_cleanup_plan.md`.
+
 <!--
 Licensed to the Apache Software Foundation (ASF) under one
 or more contributor license agreements.  See the NOTICE file
