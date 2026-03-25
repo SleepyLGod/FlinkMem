@@ -119,6 +119,22 @@ def sem_window_meta_descriptor(
     return desc
 
 
+def sem_window_active_windows_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for active semantic windows in multi-window mode.
+
+    Key: window_id (str), Value: pickled active-window record dict.
+    """
+    desc = MapStateDescriptor(
+        "sem_window_active_windows",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 # ---------------------------------------------------------------------------
 # sem_groupby descriptors
 # ---------------------------------------------------------------------------

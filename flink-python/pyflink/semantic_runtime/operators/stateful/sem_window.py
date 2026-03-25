@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
-from pyflink.datastream.state import ListState, ValueState
+from pyflink.datastream.state import ListState, MapState, ValueState
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime.embedding_runtime import (
@@ -64,6 +64,7 @@ from pyflink.semantic_runtime.runtime.steps.sem_window_summary import (
 )
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
+    sem_window_active_windows_descriptor,
     sem_window_event_buffer_descriptor,
     sem_window_meta_descriptor,
 )
@@ -129,6 +130,26 @@ def _new_window_meta(open_time_ms: int) -> Dict[str, Any]:
     }
 
 
+def _new_active_window_record(
+    *,
+    key: str,
+    first_event: Dict[str, Any],
+    now_ms: int,
+) -> Dict[str, Any]:
+    """Build one new active semantic-window record."""
+    payload = str(first_event.get("payload", ""))
+    return {
+        "window_id": uuid.uuid4().hex[:12],
+        "key": key,
+        "events": [first_event],
+        "event_count": 1,
+        "open_time_ms": now_ms,
+        "last_update_ms": now_ms,
+        "window_summary": payload,
+        "representative_text": payload,
+    }
+
+
 # ---------------------------------------------------------------------------
 # SemWindowFunction
 # ---------------------------------------------------------------------------
@@ -156,6 +177,7 @@ class SemWindowFunction(KeyedProcessFunction):
         # State handles — initialised in open()
         self._event_buffer: Optional[ListState] = None
         self._window_meta: Optional[ValueState] = None
+        self._active_windows: Optional[MapState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
         self._client: Optional[LLMClient] = None
         self._embedding_runtime: Optional[EmbeddingRuntime] = None
@@ -169,6 +191,9 @@ class SemWindowFunction(KeyedProcessFunction):
         )
         self._window_meta = runtime_context.get_state(
             sem_window_meta_descriptor(ttl)
+        )
+        self._active_windows = runtime_context.get_map_state(
+            sem_window_active_windows_descriptor(ttl)
         )
         self._metrics = StatefulOperatorMetrics.from_runtime_context(
             runtime_context, "sem_window",
@@ -218,6 +243,15 @@ class SemWindowFunction(KeyedProcessFunction):
         if self._metrics:
             self._metrics.record_event_processed()
 
+        if self._uses_multi_active_windows():
+            yield from self._process_multi_active_event(
+                event=event,
+                event_dict=event_dict,
+                ctx=ctx,
+                now_ms=now_ms,
+            )
+            return
+
         # --- ensure window is open ---
         meta = self._window_meta.value()
         if meta is None:
@@ -249,6 +283,10 @@ class SemWindowFunction(KeyedProcessFunction):
         This fires when ``window_timeout_ms`` elapses since the window opened.
         Only performs local state operations — no LLM calls.
         """
+        if self._uses_multi_active_windows():
+            yield from self._on_multi_active_timer(timestamp)
+            return
+
         meta = self._window_meta.value()
         if meta is None:
             return  # window already closed/emitted
@@ -289,6 +327,10 @@ class SemWindowFunction(KeyedProcessFunction):
             return "count"
         return None
 
+    def _uses_multi_active_windows(self) -> bool:
+        """Return whether the variant uses CP-style multi-active windows."""
+        return self._config.continuity_variant in {"summary", "embedding"}
+
     def _emit_snapshot(
         self, meta: Dict[str, Any], trigger_reason: str, close_time_ms: int
     ):
@@ -327,6 +369,27 @@ class SemWindowFunction(KeyedProcessFunction):
             now_ms + self._config.window_timeout_ms,
         )
         return meta
+
+    def _open_active_window_record(
+        self,
+        ctx: "KeyedProcessFunction.Context",
+        event: SemEvent,
+        event_dict: Dict[str, Any],
+        now_ms: int,
+    ) -> Dict[str, Any]:
+        """Create and register one new active semantic window."""
+        record = _new_active_window_record(
+            key=event.key,
+            first_event=event_dict,
+            now_ms=now_ms,
+        )
+        self._register_active_window_flush_timer(
+            ctx=ctx,
+            record=record,
+            base_time_ms=now_ms,
+        )
+        self._put_active_window_record(record)
+        return record
 
     def _append_event(self, meta: Dict[str, Any], event_dict: Dict[str, Any]) -> None:
         """Append one event to the active buffer and enforce overflow policy."""
@@ -374,6 +437,198 @@ class SemWindowFunction(KeyedProcessFunction):
             return
         raise ValueError(f"Unsupported continuity variant {variant!r}")
 
+    def _process_multi_active_event(
+        self,
+        *,
+        event: SemEvent,
+        event_dict: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ):
+        """Process one event with a CP-style multi-active window assignment model."""
+        variant = self._config.continuity_variant
+        if variant == "summary":
+            matched_window = self._select_summary_window(current_event=event_dict)
+        elif variant == "embedding":
+            matched_window = self._select_embedding_window(current_event=event_dict)
+        else:
+            raise ValueError(
+                f"Multi-active processing does not support variant {variant!r}"
+            )
+
+        if matched_window is None:
+            record = self._open_active_window_record(ctx, event, event_dict, now_ms)
+        else:
+            record = matched_window
+            self._append_event_to_active_window(record, event_dict, now_ms)
+            self._register_active_window_flush_timer(
+                ctx=ctx,
+                record=record,
+                base_time_ms=now_ms,
+            )
+            self._put_active_window_record(record)
+
+        if int(record["event_count"]) >= self._config.max_window_events:
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
+            yield self._build_active_window_snapshot(
+                record=record,
+                trigger_reason="count",
+                close_time_ms=now_ms,
+            ).to_dict()
+            self._remove_active_window_record(str(record["window_id"]))
+
+    def _on_multi_active_timer(self, timestamp: int):
+        """Flush any active semantic windows whose inactivity timer has expired."""
+        if self._metrics:
+            self._metrics.record_timer_fire()
+        for record in self._list_active_window_records():
+            category = resolve_timer_category(record, timestamp)
+            if category != TimerCategory.FLUSH:
+                continue
+            clear_timer_registration(record, TimerCategory.FLUSH)
+            close_time_ms = int(time.time() * 1000)
+            yield self._build_active_window_snapshot(
+                record=record,
+                trigger_reason="time",
+                close_time_ms=close_time_ms,
+            ).to_dict()
+            self._remove_active_window_record(str(record["window_id"]))
+
+    def _list_active_window_records(self) -> list[Dict[str, Any]]:
+        """Return all active semantic windows for the current keyed partition."""
+        assert self._active_windows is not None
+        records: list[Dict[str, Any]] = []
+        for window_id in self._active_windows.keys():
+            record = self._active_windows.get(window_id)
+            if record is None:
+                continue
+            records.append(record)
+        return records
+
+    def _put_active_window_record(self, record: Dict[str, Any]) -> None:
+        """Persist one active semantic-window record."""
+        assert self._active_windows is not None
+        self._active_windows.put(str(record["window_id"]), record)
+
+    def _remove_active_window_record(self, window_id: str) -> None:
+        """Remove one active semantic window."""
+        assert self._active_windows is not None
+        self._active_windows.remove(window_id)
+
+    def _register_active_window_flush_timer(
+        self,
+        *,
+        ctx: "KeyedProcessFunction.Context",
+        record: Dict[str, Any],
+        base_time_ms: int,
+    ) -> None:
+        """Register one inactivity-based flush timer for an active semantic window."""
+        register_timer(
+            ctx.timer_service(),
+            record,
+            TimerCategory.FLUSH,
+            base_time_ms + self._config.window_timeout_ms,
+        )
+
+    def _append_event_to_active_window(
+        self,
+        record: Dict[str, Any],
+        event_dict: Dict[str, Any],
+        now_ms: int,
+    ) -> None:
+        """Append one event to one active semantic window record."""
+        events = list(record.get("events", []))
+        events.append(event_dict)
+        record["events"] = events
+        record["event_count"] = len(events)
+        record["last_update_ms"] = now_ms
+        if self._config.continuity_variant == "summary":
+            self._update_active_window_summary(record, event_dict)
+            record["representative_text"] = str(record.get("window_summary") or "")
+            return
+        if self._config.continuity_variant == "embedding":
+            record["representative_text"] = self._build_embedding_representative(record)
+            return
+        raise ValueError(
+            f"Active-window append does not support variant {self._config.continuity_variant!r}"
+        )
+
+    def _build_active_window_snapshot(
+        self,
+        *,
+        record: Dict[str, Any],
+        trigger_reason: str,
+        close_time_ms: int,
+    ) -> WindowSnapshot:
+        """Convert one active semantic-window record into a WindowSnapshot."""
+        events = list(record.get("events", []))
+        return WindowSnapshot(
+            key=str(record.get("key", "")),
+            window_id=str(record["window_id"]),
+            events=events,
+            event_count=len(events),
+            open_time_ms=int(record.get("open_time_ms", 0)),
+            close_time_ms=close_time_ms,
+            trigger_reason=trigger_reason,
+        )
+
+    def _select_summary_window(
+        self,
+        *,
+        current_event: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Select the best active window for one event using summary continuity."""
+        best_record: Optional[Dict[str, Any]] = None
+        best_confidence = float("-inf")
+        for record in self._list_active_window_records():
+            summary = str(record.get("window_summary") or "").strip()
+            if not summary:
+                continue
+            result = self._evaluate_summary_continuity(
+                meta=record,
+                current_event=current_event,
+            )
+            if not result["continue_window"]:
+                continue
+            if result["confidence"] <= best_confidence:
+                continue
+            best_record = record
+            best_confidence = result["confidence"]
+        return best_record
+
+    def _select_embedding_window(
+        self,
+        *,
+        current_event: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Select the best active window for one event using embedding similarity."""
+        if self._embedding_runtime is None:
+            raise RuntimeError("sem_window embedding continuity runtime is not initialized")
+        current_text = str(current_event.get("payload", ""))
+        best_record: Optional[Dict[str, Any]] = None
+        best_score = float("-inf")
+        threshold = float(self._config.continuity_threshold)
+        for record in self._list_active_window_records():
+            representative = str(
+                record.get("representative_text")
+                or self._build_embedding_representative(record)
+            )
+            score = self._embedding_runtime.similarity(representative, current_text)
+            if score < threshold:
+                continue
+            if score <= best_score:
+                continue
+            best_record = record
+            best_score = score
+        return best_record
+
+    def _build_embedding_representative(self, record: Dict[str, Any]) -> str:
+        """Build one deterministic representative text for an active window."""
+        events = list(record.get("events", []))
+        payloads = [str(event.get("payload", "")) for event in events]
+        return "\n".join(payloads).strip()
+
     def _should_roll_window_before_continuity_check(self) -> bool:
         """Return whether local hard limits require a split before LLM continuity."""
         if self._config.continuity_variant != "all_history":
@@ -397,10 +652,11 @@ class SemWindowFunction(KeyedProcessFunction):
         if variant == "embedding":
             return self._evaluate_embedding_continuity(events[-1], event.to_dict())
         if variant == "summary":
-            return self._evaluate_summary_continuity(
+            result = self._evaluate_summary_continuity(
                 meta=self._window_meta.value(),
                 current_event=event.to_dict(),
             )
+            return bool(result["continue_window"])
         if variant == "all_history":
             return self._evaluate_all_history_continuity(
                 active_window_events=events,
@@ -442,22 +698,29 @@ class SemWindowFunction(KeyedProcessFunction):
         *,
         meta: Optional[Dict[str, Any]],
         current_event: Dict[str, Any],
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Evaluate summary-based continuity using the internal sem_continuity step."""
         if meta is None:
-            return True
+            return {
+                "continue_window": True,
+                "confidence": 1.0,
+                "reason": "no active summary",
+            }
         current_summary = str(meta.get("window_summary") or "").strip()
         if not current_summary:
-            return True
+            return {
+                "continue_window": True,
+                "confidence": 1.0,
+                "reason": "empty active summary",
+            }
         if self._client is None or self._llm_config is None:
             raise RuntimeError("sem_window summary continuity runtime is not initialized")
-        result = evaluate_summary_sem_continuity_sync(
+        return evaluate_summary_sem_continuity_sync(
             client=self._client,
             llm_config=self._llm_config,
             current_summary=current_summary,
             current_event=current_event,
         )
-        return bool(result["continue_window"])
 
     def _evaluate_all_history_continuity(
         self,
@@ -493,6 +756,25 @@ class SemWindowFunction(KeyedProcessFunction):
         latest_event = events[-1]
         current_summary = str(meta.get("window_summary") or events[-2].get("payload", ""))
         meta["window_summary"] = update_sem_window_summary_sync(
+            client=self._client,
+            llm_config=self._llm_config,
+            current_summary=current_summary,
+            current_event=latest_event,
+        )
+
+    def _update_active_window_summary(
+        self,
+        record: Dict[str, Any],
+        latest_event: Dict[str, Any],
+    ) -> None:
+        """Refresh one active semantic-window summary after an append."""
+        current_summary = str(record.get("window_summary") or "").strip()
+        if not current_summary:
+            record["window_summary"] = str(latest_event.get("payload", ""))
+            return
+        if self._client is None or self._llm_config is None:
+            raise RuntimeError("sem_window summary continuity runtime is not initialized")
+        record["window_summary"] = update_sem_window_summary_sync(
             client=self._client,
             llm_config=self._llm_config,
             current_summary=current_summary,

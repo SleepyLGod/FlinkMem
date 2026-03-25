@@ -32,6 +32,7 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
     StateSafetyConfig,
     OverflowPolicy,
     build_ttl_config,
+    sem_window_active_windows_descriptor,
     sem_window_event_buffer_descriptor,
     sem_window_meta_descriptor,
     sem_groupby_profiles_descriptor,
@@ -136,6 +137,10 @@ class TestDescriptors:
     def test_meta_descriptor(self):
         desc = sem_window_meta_descriptor()
         assert desc.name == "sem_window_meta"
+
+    def test_active_windows_descriptor(self):
+        desc = sem_window_active_windows_descriptor()
+        assert desc.name == "sem_window_active_windows"
 
     def test_groupby_descriptor(self):
         desc = sem_groupby_profiles_descriptor()
@@ -305,6 +310,7 @@ class TestSemWindowPairwiseContinuity:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -327,7 +333,7 @@ class TestSemWindowPairwiseContinuity:
 class TestSemWindowEmbeddingContinuity:
     """Test embedding sem_window continuity without a Flink runtime."""
 
-    def test_embedding_similarity_keeps_same_window(self):
+    def test_embedding_similarity_assigns_to_existing_active_window(self):
         cfg = SemWindowConfig(
             max_window_events=10,
             continuity_variant="embedding",
@@ -342,6 +348,7 @@ class TestSemWindowEmbeddingContinuity:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -353,14 +360,44 @@ class TestSemWindowEmbeddingContinuity:
 
         assert first_out == []
         assert second_out == []
-        remaining = func._event_buffer.get()
-        assert len(remaining) == 2
+        records = func._active_windows.values()
+        assert len(records) == 1
+        assert records[0]["event_count"] == 2
+
+    def test_embedding_opens_second_active_window_for_different_topic(self):
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="embedding",
+            continuity_threshold=0.6,
+        )
+        func = SemWindowFunction(
+            cfg,
+            embedding_config=EmbeddingBackendConfig(
+                backend="local_hashing",
+                dimensions=64,
+            ),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
+        func._initialize_continuity_runtime()
+
+        ctx = _FakeContext("k")
+        first = SemEvent(key="k", payload="alpha budget planning", seq_id=1).to_dict()
+        second = SemEvent(key="k", payload="travel booking itinerary", seq_id=2).to_dict()
+
+        outputs = list(func.process_element(first, ctx))
+        outputs += list(func.process_element(second, ctx))
+
+        assert outputs == []
+        records = func._active_windows.values()
+        assert len(records) == 2
 
 
 class TestSemWindowSummaryContinuity:
     """Test summary sem_window continuity without a Flink runtime."""
 
-    def test_summary_split_starts_new_window(self):
+    def test_summary_opens_new_active_window_for_new_topic(self):
         continuity_response = json.dumps(
             {
                 "continue_window": False,
@@ -381,6 +418,7 @@ class TestSemWindowSummaryContinuity:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -391,11 +429,99 @@ class TestSemWindowSummaryContinuity:
         second_out = list(func.process_element(second, ctx))
 
         assert first_out == []
-        assert len(second_out) == 1
-        snapshot = WindowSnapshot.from_dict(second_out[0])
-        assert snapshot.events[0]["payload"] == "alpha budget planning"
-        active_meta = func._window_meta.value()
-        assert active_meta["window_summary"] == "travel booking"
+        assert second_out == []
+        records = func._active_windows.values()
+        assert len(records) == 2
+        summaries = {record["window_summary"] for record in records}
+        assert "alpha budget planning" in summaries
+        assert "travel booking" in summaries
+
+    def test_summary_assigns_to_best_existing_active_window(self):
+        responses = [
+            json.dumps(
+                {
+                    "continue_window": False,
+                    "confidence": 0.20,
+                    "reason": "not budget",
+                }
+            ),
+            json.dumps(
+                {
+                    "continue_window": True,
+                    "confidence": 0.91,
+                    "reason": "budget follow-up",
+                }
+            ),
+            json.dumps({"summary": "alpha budget roadmap"}),
+        ]
+
+        class _SequentialMockClient:
+            def __init__(self, payloads):
+                self._payloads = list(payloads)
+
+            async def call(self, prompt, **kwargs):
+                if not self._payloads:
+                    raise AssertionError("sequential mock ran out of payloads")
+                metrics = type(
+                    "_MockMetrics",
+                    (),
+                    {
+                        "latency_ms": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "attempts": 1,
+                    },
+                )()
+                return self._payloads.pop(0), metrics
+
+            def close(self):
+                return None
+
+        cfg = SemWindowConfig(
+            max_window_events=10,
+            continuity_variant="summary",
+        )
+        func = SemWindowFunction(
+            cfg,
+            llm_config=LLMClientConfig(backend="mock", mock_response="{}"),
+        )
+        func._event_buffer = _FakeListState()
+        func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState(
+            {
+                "w1": {
+                    "window_id": "w1",
+                    "key": "k",
+                    "events": [SemEvent(key="k", payload="travel booking", seq_id=1).to_dict()],
+                    "event_count": 1,
+                    "open_time_ms": 1000,
+                    "last_update_ms": 1000,
+                    "window_summary": "travel booking",
+                    "representative_text": "travel booking",
+                },
+                "w2": {
+                    "window_id": "w2",
+                    "key": "k",
+                    "events": [SemEvent(key="k", payload="alpha budget planning", seq_id=2).to_dict()],
+                    "event_count": 1,
+                    "open_time_ms": 1100,
+                    "last_update_ms": 1100,
+                    "window_summary": "alpha budget planning",
+                    "representative_text": "alpha budget planning",
+                },
+            }
+        )
+        func._initialize_continuity_runtime()
+        func._client = _SequentialMockClient(responses)
+
+        ctx = _FakeContext("k")
+        third = SemEvent(key="k", payload="alpha budget roadmap", seq_id=3).to_dict()
+        outputs = list(func.process_element(third, ctx))
+
+        assert outputs == []
+        updated = func._active_windows.get("w2")
+        assert updated["event_count"] == 2
+        assert updated["window_summary"] == "alpha budget roadmap"
 
 
 class TestSemWindowAllHistoryContinuity:
@@ -421,6 +547,7 @@ class TestSemWindowAllHistoryContinuity:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -455,6 +582,7 @@ class TestSemWindowAllHistoryContinuity:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -493,6 +621,7 @@ class TestSemWindowAllHistoryContinuity:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -565,6 +694,7 @@ class TestEmbeddingRuntime:
         )
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
+        func._active_windows = _FakeMapState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -576,8 +706,9 @@ class TestEmbeddingRuntime:
 
         assert first_out == []
         assert second_out == []
-        remaining = func._event_buffer.get()
-        assert len(remaining) == 2
+        records = func._active_windows.values()
+        assert len(records) == 1
+        assert records[0]["event_count"] == 2
 
 
 # ============================================================================
