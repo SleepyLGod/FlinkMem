@@ -33,6 +33,7 @@ from pyflink.semantic_runtime.runtime.event_model import (
 )
 from pyflink.semantic_runtime.operators.stateful.sem_agg import (
     SemAggConfig,
+    _aggregate_event_records,
     resolve_agg_runtime_params,
 )
 
@@ -98,18 +99,7 @@ class WindowOwnedSemAggFunction(KeyedProcessFunction):
         ).to_dict()
 
     def _aggregate_algebraic(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
-        reduce_fn = self._config.reduce_fn
-        if not events:
-            return {}
-        current = events[0]
-        if reduce_fn is None:
-            return current
-        for event in events[1:]:
-            try:
-                current = reduce_fn(current, event)
-            except Exception:
-                current = event
-        return current
+        return _aggregate_event_records(events, reduce_fn=self._config.reduce_fn)
 
     def _compress_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if len(events) <= 2:

@@ -37,8 +37,8 @@ from pyflink.semantic_runtime.runtime.continuous_rag_components import (
     _RetrievalEnvelopeExpander,
     _RetrievalToAnswerEnvelope,
     _RetrieveAsyncMergeFunction,
-    _SummarizeAsyncMergeFunction,
 )
+from pyflink.semantic_runtime.runtime.timer_policy import TimerCategory, encode_timer_key
 from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig, SemSearchFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import build_sem_agg_operator
@@ -876,20 +876,25 @@ def _run_memory_path(
         agg_cfg,
         agg_query_spec,
         input_kind="event_stream",
+        llm_config=LLMClientConfig(
+            backend="mock",
+            mock_delay_s=0.0,
+            mock_response='{"summary":"summary"}',
+        ),
     )
     assert isinstance(sem_agg, SemAggFunction)
     sem_agg._buffer = _FakeListState()
     sem_agg._agg_value = _FakeValueState(None)
     sem_agg._meta = _FakeValueState(None)
+    sem_agg._scope_contributions = _FakeMapState()
+    sem_agg._scope_progress = _FakeMapState()
 
     to_agg = _GroupbyToAggEnvelope()
-    summarize_merge = _SummarizeAsyncMergeFunction()
 
     window_ctx = _FakeContext(key)
     groupby_ctx = _FakeContext(key)
     to_agg_ctx = _FakeContext(key)
     agg_ctx = _FakeContext(key)
-    summarize_ctx = _FakeContext(key)
 
     snapshots: List[Dict[str, Any]] = []
     for event in events:
@@ -910,25 +915,21 @@ def _run_memory_path(
         agg_inputs.extend(list(to_agg.process_element(row, to_agg_ctx)))
 
     agg_main: List[Dict[str, Any]] = []
-    agg_side: List[Dict[str, Any]] = []
     for event in agg_inputs:
         outs = list(sem_agg.process_element(event, agg_ctx))
-        main, side = _split_outputs(outs)
-        agg_main.extend(main)
-        agg_side.extend(side)
+        agg_main.extend(outs)
+        recompute_at = (sem_agg._meta.value() or {}).get(encode_timer_key(TimerCategory.RECOMPUTE))
+        if recompute_at:
+            time.sleep(0.01)
+            agg_main.extend(list(sem_agg.on_timer(recompute_at, agg_ctx)))
 
-    agg_merged = _merge_with_async(
-        agg_main,
-        agg_side,
-        summarize_merge,
-        summarize_async_fn,
-        "summarize",
-        key,
-    )
-    final_rows: List[Dict[str, Any]] = []
-    for row in agg_merged:
-        final_rows.extend(list(summarize_merge.process_element(row, summarize_ctx)))
-    return final_rows
+    while True:
+        recompute_at = (sem_agg._meta.value() or {}).get(encode_timer_key(TimerCategory.RECOMPUTE))
+        if not recompute_at:
+            break
+        time.sleep(0.01)
+        agg_main.extend(list(sem_agg.on_timer(recompute_at, agg_ctx)))
+    return agg_main
 
 
 def _run_retrieval_path(
@@ -1342,7 +1343,6 @@ def test_v02_workflow_retrieve_path_pairwise_topk():
 def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
     events = _build_use_case_events()
 
-    # Summarize async merge-back path
     memory_rows = _run_memory_path(
         events,
         agg_mode="summarize",
@@ -1357,16 +1357,12 @@ def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
     else:
         raise AssertionError("Expected missing retrieve async worker to fail fast")
 
-    try:
-        _run_memory_path(
-            events,
-            agg_mode="summarize",
-            summarize_async_fn=None,
-        )
-    except ValueError as exc:
-        assert "summarize" in str(exc)
-    else:
-        raise AssertionError("Expected missing summarize async worker to fail fast")
+    memory_rows_without_bridge = _run_memory_path(
+        events,
+        agg_mode="summarize",
+        summarize_async_fn=None,
+    )
+    assert any(r.get("mode") == "summarize_async" for r in memory_rows_without_bridge)
 
 
 def test_v02_workflow_groupby_sync_assignment_window_scope_close():

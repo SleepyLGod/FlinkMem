@@ -311,9 +311,18 @@ def apply_sem_agg_from_request(
     runtime_config: RuntimeConfig,
 ) -> DataStream:
     """Apply a stateful semantic aggregation request to one input stream."""
+    from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
+        resolve_agg_execution_plan,
+    )
+
     plan = lower_sem_agg_request(request, runtime_config)
     agg_input = input_ds
-    if plan.context_kind == "window" and plan.mode == "algebraic":
+    execution_plan = resolve_agg_execution_plan(
+        plan.query_spec,
+        config=plan.kernel_config,
+        input_kind=plan.input_kind,
+    )
+    if plan.context_kind == "window":
         agg_input = materialize_window_stream(
             input_ds,
             scope_policy=plan.query_spec.scope_policy,
@@ -321,6 +330,11 @@ def apply_sem_agg_from_request(
             runtime_config=runtime_config,
             operator_name="sem_agg",
         )
+    if (
+        execution_plan.scope_source == "external_window"
+        and execution_plan.persistence_policy == "reset_per_scope"
+        and plan.mode == "algebraic"
+    ):
         return apply_sem_agg_pushdown(
             agg_input,
             request=request,
@@ -344,6 +358,7 @@ def build_sem_agg_from_request(
         config=plan.kernel_config,
         query_spec=plan.query_spec,
         input_kind=plan.input_kind,
+        llm_config=runtime_config.to_llm_client_config(),
     )
 
 

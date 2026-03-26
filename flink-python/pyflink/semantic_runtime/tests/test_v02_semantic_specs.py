@@ -1515,19 +1515,31 @@ class TestAggQuerySpec:
 
     def test_execution_plan_auto_resolves_operator_owned(self):
         plan = resolve_agg_execution_plan(AggQuerySpec())
-        assert plan.execution_path == "operator_owned"
+        assert plan.scope_source == "internal_scope"
+        assert plan.persistence_policy == "persistent_across_scopes"
 
     def test_execution_plan_auto_window_snapshot_resolves_window_owned(self):
         plan = resolve_agg_execution_plan(
             AggQuerySpec(),
             input_kind="window_snapshot",
         )
-        assert plan.execution_path == "window_owned"
+        assert plan.scope_source == "external_window"
+        assert plan.persistence_policy == "persistent_across_scopes"
 
-    def test_builder_window_owned_returns_bounded_runtime(self):
+    def test_builder_window_snapshot_defaults_to_persistent_runtime(self):
         spec = AggQuerySpec()
         op = build_sem_agg_operator(
             SemAggConfig(),
+            spec,
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, SemAggFunction)
+        assert op._scope_source == "external_window"
+
+    def test_builder_window_reset_per_scope_returns_bounded_runtime(self):
+        spec = AggQuerySpec()
+        op = build_sem_agg_operator(
+            SemAggConfig(persistence_policy="reset_per_scope"),
             spec,
             input_kind="window_snapshot",
         )
@@ -1588,6 +1600,51 @@ class TestAggQuerySpec:
         assert outs[0]["mode"] == "algebraic_window"
         assert outs[0]["aggregate"]["total"] == 8
 
+    def test_external_window_persistent_algebraic_replaces_scope_contribution(self):
+        def sum_reduce(a, b):
+            return {"key": a.get("key", "k"), "total": a.get("total", 0) + b.get("total", 0)}
+
+        func = SemAggFunction(
+            SemAggConfig(mode="algebraic", reduce_fn=sum_reduce),
+            AggQuerySpec(agg_method="algebraic"),
+            scope_source="external_window",
+        )
+        func._buffer = _FakeListState()
+        func._agg_value = _FakeValueState(None)
+        func._meta = _FakeValueState(None)
+        func._scope_contributions = _FakeMapState()
+
+        first = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "close",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "a", "total": 3, "seq_id": 1},
+                {"key": "k", "payload": "b", "total": 5, "seq_id": 2},
+            ],
+        }
+        first_outs = list(func.process_element(first, _FakeContext("k")))
+        assert len(first_outs) == 1
+        assert first_outs[0]["mode"] == "algebraic_scope_fire"
+        assert first_outs[0]["aggregate"]["total"] == 8
+
+        second = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "early_fire",
+            "close_time_ms": 1200,
+            "events": [
+                {"key": "k", "payload": "a", "total": 3, "seq_id": 1},
+                {"key": "k", "payload": "b", "total": 5, "seq_id": 2},
+                {"key": "k", "payload": "c", "total": 7, "seq_id": 3},
+            ],
+        }
+        second_outs = list(func.process_element(second, _FakeContext("k")))
+        assert len(second_outs) == 1
+        assert second_outs[0]["aggregate"]["total"] == 15
+        assert func._meta.value()["event_count"] == 3
+
     def test_window_owned_summarize_emits_async_work(self):
         func = WindowOwnedSemAggFunction(
             SemAggConfig(mode="summarize", max_buffer_events=10),
@@ -1630,6 +1687,14 @@ class TestAggQuerySpec:
         assert isinstance(op, SemAggFunction)
         assert op._resolved_mode == "summarize"
 
+    def test_builder_window_persistent_summarize_rejects_unsupported_path(self):
+        op = build_sem_agg_operator(
+            SemAggConfig(mode="summarize"),
+            AggQuerySpec(agg_method="summarize"),
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, SemAggFunction)
+
 
 class TestSemAggTriggerRuntime:
     class _CaptureContext:
@@ -1659,10 +1724,20 @@ class TestSemAggTriggerRuntime:
             pass
 
     def _make_func(self, cfg, spec):
-        func = SemAggFunction(cfg, spec)
+        func = SemAggFunction(
+            cfg,
+            spec,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_delay_s=0.0,
+                mock_response='{"summary":"summary"}',
+            ),
+        )
         func._buffer = _FakeListState()
         func._agg_value = _FakeValueState(None)
         func._meta = _FakeValueState(None)
+        func._scope_contributions = _FakeMapState()
+        func._scope_progress = _FakeMapState()
         return func
 
     def test_algebraic_periodic_emits_only_on_timer(self):
@@ -1711,15 +1786,15 @@ class TestSemAggTriggerRuntime:
         ctx = self._CaptureContext("k")
 
         outs1 = list(func.process_element({"key": "k", "payload": "a", "seq_id": 1}, ctx))
-        main1, side1 = _split_outputs(outs1)
-        assert main1 == []
-        assert side1 == []
+        assert outs1 == []
 
         outs2 = list(func.process_element({"key": "k", "payload": "b", "seq_id": 2}, ctx))
-        main2, side2 = _split_outputs(outs2)
-        assert main2 == []
-        assert len(side2) == 1
-        assert side2[0]["task_type"] == "summarize"
+        assert outs2 == []
+        time.sleep(0.01)
+        recompute_at = func._meta.value()[encode_timer_key(TimerCategory.RECOMPUTE)]
+        timer_outs = list(func.on_timer(recompute_at, ctx))
+        assert len(timer_outs) == 1
+        assert timer_outs[0]["mode"] == "summarize_async"
 
     def test_summarize_result_preserves_post_request_events(self):
         cfg = SemAggConfig(mode="summarize", max_buffer_events=10)
@@ -1731,26 +1806,19 @@ class TestSemAggTriggerRuntime:
         ctx = self._CaptureContext("k")
 
         first = list(func.process_element({"key": "k", "payload": "a", "seq_id": 1}, ctx))
-        _, first_side = _split_outputs(first)
-        assert len(first_side) == 1
+        assert first == []
 
         second = list(func.process_element({"key": "k", "payload": "b", "seq_id": 2}, ctx))
-        _, second_side = _split_outputs(second)
-        assert second_side == []
-        assert len(list(func._buffer.get())) == 2
-
-        merged = list(func._handle_summarize_result({
-            "task_type": "summarize",
-            "key": "k",
-            "success": True,
-            "result": {"summary": "summary(a)"},
-        }, 3000))
-        main, side = _split_outputs(merged)
-        assert len(main) == 1
-        assert main[0]["mode"] == "summarize"
-        assert len(side) == 1
-        assert side[0]["task_type"] == "summarize"
+        assert second == []
         assert len(list(func._buffer.get())) == 1
+
+        time.sleep(0.01)
+        recompute_at = func._meta.value()[encode_timer_key(TimerCategory.RECOMPUTE)]
+        merged = list(func.on_timer(recompute_at, ctx))
+        assert len(merged) == 1
+        assert merged[0]["mode"] == "summarize_async"
+        assert len(list(func._buffer.get())) == 0
+        assert func._meta.value()["pending_summarize"] is True
 
     def test_algebraic_semantic_on_scope_close_emits_final_and_resets(self):
         cfg = SemAggConfig(mode="algebraic")
@@ -1790,26 +1858,15 @@ class TestSemAggTriggerRuntime:
             "seq_id": 1,
             "boundary_flags": {"topic_shift": True},
         }, ctx))
-        main, side = _split_outputs(outs)
-        assert main == []
-        assert len(side) == 1
-        assert side[0]["task_type"] == "summarize"
-        assert side[0]["payload"]["scope_close_pending"] is True
+        assert outs == []
         assert func._meta.value()["scope_epoch"] == 1
         assert len(list(func._buffer.get())) == 0
 
-        merged = list(func._handle_summarize_result({
-            "task_type": "summarize",
-            "key": "k",
-            "success": True,
-            "result": {
-                "summary": "summary(alpha)",
-                "scope_epoch": 0,
-                "scope_close_pending": True,
-            },
-        }, 4000))
+        time.sleep(0.01)
+        recompute_at = func._meta.value()[encode_timer_key(TimerCategory.RECOMPUTE)]
+        merged = list(func.on_timer(recompute_at, ctx))
         assert len(merged) == 1
-        assert merged[0]["mode"] == "summarize_scope_close"
+        assert merged[0]["mode"] == "summarize_scope_close_async"
         assert merged[0]["scope_epoch"] == 0
 
     def test_algebraic_session_on_scope_close_timer_emits_and_resets(self):

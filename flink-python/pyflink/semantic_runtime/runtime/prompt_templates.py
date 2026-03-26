@@ -181,3 +181,24 @@ def build_sem_window_all_history_prompt() -> str:
         'Return one JSON object with exactly these fields: '
         '{{"continue_window": bool, "confidence": float, "reason": str}}.'
     )
+
+
+def build_sem_agg_summary_update_prompt(*, mode: str) -> str:
+    """Build the internal summary-update prompt for ``sem_agg``."""
+    if mode == "compressive":
+        task_line = (
+            "Update the running compressed memory using the current summary and "
+            "the newly added events. Keep only the information that should "
+            "remain in long-lived memory."
+        )
+    else:
+        task_line = (
+            "Update the running semantic summary using the current summary and "
+            "the newly added events."
+        )
+    return (
+        f"{task_line}\n\n"
+        "Input payload:\n{input}\n\n"
+        'Return one JSON object with exactly these fields: '
+        '{{"summary": str}}.'
+    )

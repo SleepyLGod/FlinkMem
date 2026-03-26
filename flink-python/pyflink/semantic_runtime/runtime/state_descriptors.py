@@ -238,6 +238,40 @@ def sem_agg_meta_descriptor(
     return desc
 
 
+def sem_agg_scope_contributions_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for external-scope aggregate contributions.
+
+    Key: scope_id (str), Value: pickled contribution dict with the current
+    aggregate and visible event count for that scope.
+    """
+    desc = MapStateDescriptor(
+        "sem_agg_scope_contributions",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_agg_scope_progress_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for append-only external-scope ingestion progress.
+
+    Key: scope_id (str), Value: pickled scope-progress dict with processed
+    event sequence ids for cumulative window snapshots.
+    """
+    desc = MapStateDescriptor(
+        "sem_agg_scope_progress",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 # ---------------------------------------------------------------------------
 # sem_topk descriptors
 # ---------------------------------------------------------------------------

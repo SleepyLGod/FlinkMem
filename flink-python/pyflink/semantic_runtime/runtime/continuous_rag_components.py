@@ -135,36 +135,6 @@ class _AnswerSynthesiser(KeyedProcessFunction):
         }
 
 
-class _SummarizeAsyncMergeFunction(KeyedProcessFunction):
-    """Merge summarize async results into sem_agg-style envelopes."""
-
-    def process_element(self, value, ctx: "KeyedProcessFunction.Context"):
-        if not isinstance(value, dict):
-            return
-        if value.get("task_type") != "summarize":
-            yield value
-            return
-        if not value.get("success", False):
-            error = value.get("error", "summarize_async_failed")
-            raise RuntimeError(f"summarize async bridge failed: {error}")
-
-        now_ms = int(time.time() * 1000)
-        result = value.get("result", {})
-        yield {
-            "key": value.get("key", str(ctx.get_current_key())),
-            "aggregate": {
-                "summary": result.get("summary", ""),
-                "version": int(result.get("version", 0)),
-                "updated_ms": now_ms,
-                "source": "async_summary",
-            },
-            "version": int(result.get("version", 0)),
-            "mode": "summarize_async",
-            "event_count": int(result.get("event_count", 0)),
-            "timestamp_ms": now_ms,
-        }
-
-
 class _RetrieveAsyncMergeFunction(KeyedProcessFunction):
     """Merge retrieve async results into normalized retrieval envelopes."""
 
@@ -266,16 +236,6 @@ def _wire_async_bridge_if_configured(
         capacity=config.async_capacity,
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
-
-
-def _agg_needs_summarize_bridge(config: ContinuousRAGConfig) -> bool:
-    """Return whether the configured sem_agg path can emit summarize work."""
-
-    query_spec = config.agg_query_spec
-    if query_spec is not None:
-        return query_spec.agg_method in {"summarize", "compressive"}
-    return config.agg_config.mode in {"summarize", "compressive"}
-
 
 def _resolve_retrieve_async_fn(config: ContinuousRAGConfig) -> Any:
     """Resolve the retrieve async worker from workflow config."""

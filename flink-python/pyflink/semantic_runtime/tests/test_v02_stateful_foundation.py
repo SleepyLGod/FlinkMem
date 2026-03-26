@@ -1106,49 +1106,75 @@ class TestSemAggSummarize:
 
     def _make_func(self, max_buf=3):
         cfg = SemAggConfig(mode="summarize", max_buffer_events=max_buf)
-        func = SemAggFunction(cfg)
+        func = SemAggFunction(
+            cfg,
+            llm_config=LLMClientConfig(
+                backend="mock",
+                mock_delay_s=0.0,
+                mock_response='{"summary":"A summary of events"}',
+            ),
+        )
         func._buffer = _FakeListState()
         func._agg_value = _FakeValueState()
         func._meta = _FakeValueState()
+        func._scope_contributions = _FakeMapState()
+        func._scope_progress = _FakeMapState()
         return func
+
+    @staticmethod
+    def _ctx():
+        class _TimerService:
+            def __init__(self):
+                self.proc_timers = []
+
+            def register_processing_time_timer(self, ts):
+                self.proc_timers.append(ts)
+
+            def register_event_time_timer(self, ts):
+                self.proc_timers.append(ts)
+
+        class _Ctx:
+            def __init__(self):
+                self._timer = _TimerService()
+
+            def timer_service(self):
+                return self._timer
+
+        return _Ctx()
 
     def test_buffer_accumulates(self):
         func = self._make_func(max_buf=5)
+        ctx = self._ctx()
         meta = {"key": "k", "event_count": 1, "version": 0,
-                "pending_summarize": False, "_last_summarize_count": 0}
+                "pending_summarize": False}
         func._meta.update(meta)
-        results = list(func._summarize_step(
-            {"key": "k", "payload": "hello"}, meta, 1000
-        ))
-        # Should not emit yet (1 < 5)
-        assert len(results) == 0
+        func._summarize_step({"key": "k", "payload": "hello"}, meta, ctx, 1000)
         assert len(list(func._buffer.get())) == 1
 
     def test_buffer_triggers_summarize(self):
         func = self._make_func(max_buf=2)
+        ctx = self._ctx()
         # Pre-fill buffer
         func._buffer.add({"key": "k", "payload": "a"})
         meta = {"key": "k", "event_count": 2, "version": 0,
-                "pending_summarize": False, "_last_summarize_count": 0}
+                "pending_summarize": False}
         func._meta.update(meta)
-        results = list(func._summarize_step(
-            {"key": "k", "payload": "b"}, meta, 2000
-        ))
-        # Should emit an async work item via side output
-        assert len(results) == 1
-        assert results[0][0] == ASYNC_WORK_TAG  # (tag, dict) tuple
+        func._summarize_step({"key": "k", "payload": "b"}, meta, ctx, 2000)
+        assert func._meta.value()["pending_summarize"] is True
+        assert len(list(func._buffer.get())) == 0
+        assert encode_timer_key(TimerCategory.RECOMPUTE) in func._meta.value()
 
-    def test_handle_summarize_result(self):
+    def test_poll_summarize_result(self):
         func = self._make_func()
-        func._meta.update({"key": "k", "event_count": 5, "version": 1,
-                           "pending_summarize": True})
-        result_dict = {
-            "task_type": "summarize", "key": "k", "success": True,
-            "result": {"summary": "A summary of events"},
-        }
-        results = list(func._handle_summarize_result(result_dict, 3000))
+        ctx = self._ctx()
+        meta = {"key": "k", "event_count": 1, "version": 1, "pending_summarize": False}
+        func._meta.update(meta)
+        func._buffer.add({"key": "k", "payload": "hello"})
+        func._dispatch_summary_request(meta, ctx.timer_service(), 2000)
+        time.sleep(0.01)
+        results = list(func._poll_pending_summary(func._meta.value(), ctx, 3000))
         assert len(results) == 1
-        assert results[0]["mode"] == "summarize"
+        assert results[0]["mode"] == "summarize_async"
         assert results[0]["aggregate"]["summary"] == "A summary of events"
         assert results[0]["version"] == 2
 

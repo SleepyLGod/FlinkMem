@@ -15,40 +15,33 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""
-sem_agg — stateful semantic aggregation with two modes.
+"""Continuous keyed semantic aggregation.
 
-Mode 1 — Algebraic aggregation:
-  Incremental reduction over keyed events using a user-supplied ``reduce_fn``.
-  State: ``ValueState[agg_value]``.  No async calls needed.
+Algebraic mode behaves like a keyed accumulator.
 
-Mode 2 — Summarization aggregation:
-  Accumulates events in bounded ``ListState``, then emits a side-output
-  ``AsyncWorkItem(task_type="summarize")`` to an async LLM summariser.
-  The summary result is merged back and stored in ``ValueState``.
-
-Guardrails:
-  - ``max_buffer_events``: hard cap on pending events before forced summarize.
-  - TTL via ``StateTtlConfig`` on all state handles.
-  - ``overflow_policy``: DROP_OLDEST / DROP_NEWEST.
-
-Reuses the async bridge from ``runtime/async_bridge.py``.
+Summarize/compressive modes behave like append-only semantic folds:
+``current_summary + added_events -> updated_summary``.
+The canonical state owner stays inside ``SemAggFunction`` and LLM updates run
+through an internal async executor plus timer-driven polling.
 """
 
 from __future__ import annotations
 
-import logging
+import concurrent.futures
 import time
-import uuid
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
-from pyflink.datastream.state import ListState, ValueState
+from pyflink.datastream.state import ListState, MapState, ValueState
 
+from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_agg_buffer_descriptor,
+    sem_agg_scope_contributions_descriptor,
+    sem_agg_scope_progress_descriptor,
     sem_agg_value_descriptor,
     sem_agg_meta_descriptor,
 )
@@ -57,10 +50,8 @@ from pyflink.semantic_runtime.runtime.event_model import (
     is_window_snapshot,
     window_snapshot_to_sem_events,
 )
-from pyflink.semantic_runtime.runtime.async_bridge import (
-    ASYNC_WORK_TAG,
-    AsyncWorkItem,
-    AsyncResult,
+from pyflink.semantic_runtime.runtime.steps import (
+    evaluate_sem_agg_summary_update_from_config_sync,
 )
 from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
@@ -78,6 +69,12 @@ from pyflink.semantic_runtime.sem_spec import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VALID_AGG_PERSISTENCE_POLICIES = {
+    "persistent_across_scopes",
+    "reset_per_scope",
+    "hybrid",
+}
 
 
 @dataclass
@@ -155,13 +152,61 @@ class _AggScopeRuntime:
 @dataclass
 class SemAggConfig:
     """Configuration for the semantic aggregation operator."""
-    mode: str = "algebraic"          # "algebraic" | "summarize"
-    max_buffer_events: int = 100     # summarize path: max events before flush
-    flush_interval_ms: int = 30_000  # timer-driven summarize flush
+    mode: str = "algebraic"
+    max_buffer_events: int = 100
+    flush_interval_ms: int = 30_000
     ttl_seconds: int = 3600
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
-    # Algebraic mode: user provides a 2-arg reduce function
+    persistence_policy: Optional[str] = None
     reduce_fn: Optional[Callable[[Dict, Dict], Dict]] = None
+    async_max_workers: int = 20
+    async_poll_interval_ms: int = 200
+
+    def __post_init__(self) -> None:
+        if (
+            self.persistence_policy is not None
+            and self.persistence_policy not in _VALID_AGG_PERSISTENCE_POLICIES
+        ):
+            raise ValueError(
+                f"Invalid sem_agg persistence_policy={self.persistence_policy!r}. "
+                f"Must be one of {_VALID_AGG_PERSISTENCE_POLICIES}."
+            )
+        if self.async_max_workers <= 0:
+            raise ValueError("sem_agg async_max_workers must be a positive integer.")
+        if self.async_poll_interval_ms <= 0:
+            raise ValueError("sem_agg async_poll_interval_ms must be a positive integer.")
+
+
+def resolve_agg_persistence_policy(
+    config: SemAggConfig,
+    *,
+    scope_source: str,
+) -> str:
+    """Resolve aggregate-state persistence independently from scope source."""
+    _ = scope_source
+    if config.persistence_policy is not None:
+        return str(config.persistence_policy)
+    return "persistent_across_scopes"
+
+
+def _aggregate_event_records(
+    events: List[Dict[str, Any]],
+    *,
+    reduce_fn: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Reduce one bounded event list into one algebraic aggregate."""
+    if not events:
+        raise ValueError("sem_agg algebraic aggregation requires non-empty events")
+    current = events[0]
+    if len(events) == 1:
+        return current
+    if reduce_fn is None:
+        raise ValueError(
+            "sem_agg algebraic aggregation over multiple events requires reduce_fn"
+        )
+    for event in events[1:]:
+        current = reduce_fn(current, event)
+    return current
 
 
 def resolve_agg_runtime_params(
@@ -277,14 +322,23 @@ class SemAggFunction(KeyedProcessFunction):
         self,
         config: Optional[SemAggConfig] = None,
         query_spec: Optional[AggQuerySpec] = None,
+        *,
+        scope_source: str = "internal_scope",
+        llm_config: Optional[LLMClientConfig] = None,
     ) -> None:
         self._config = config or SemAggConfig()
         self._query_spec = ensure_agg_query_spec(self._config, query_spec)
+        self._scope_source = scope_source
+        self._llm_config = llm_config or LLMClientConfig()
         self._scope_runtime = _AggScopeRuntime(self._query_spec)
         self._buffer: Optional[ListState] = None
         self._agg_value: Optional[ValueState] = None
         self._meta: Optional[ValueState] = None
+        self._scope_contributions: Optional[MapState] = None
+        self._scope_progress: Optional[MapState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._pending_futures: Dict[str, concurrent.futures.Future] = {}
         (
             self._resolved_mode,
             self._resolved_ttl_seconds,
@@ -297,10 +351,32 @@ class SemAggFunction(KeyedProcessFunction):
             self._resolved_idle_ms,
             self._resolved_count_threshold,
         ) = resolve_agg_trigger_runtime(self._query_spec)
-        if self._trigger_mode == "on_scope_close":
+        self._resolved_persistence_policy = resolve_agg_persistence_policy(
+            self._config,
+            scope_source=self._scope_source,
+        )
+        self._resolved_async_poll_interval_ms = int(self._config.async_poll_interval_ms)
+        if (
+            self._scope_source == "external_window"
+            and self._resolved_persistence_policy == "persistent_across_scopes"
+            and self._resolved_mode != "algebraic"
+            and self._resolved_mode not in {"summarize", "compressive"}
+        ):
+            raise NotImplementedError("Unsupported sem_agg mode for external_window persistent path")
+        if (
+            self._scope_source == "external_window"
+            and self._resolved_mode in {"summarize", "compressive"}
+            and self._trigger_mode in {"periodic", "idle_flush"}
+        ):
+            raise NotImplementedError(
+                "sem_agg external_window summarize/compressive path does not support "
+                "trigger_policy.mode in {'periodic', 'idle_flush'}; use "
+                "'on_event', 'count_threshold', or 'on_scope_close'."
+            )
+        if self._scope_source == "internal_scope" and self._trigger_mode == "on_scope_close":
             if not self._supports_operator_scope_close:
                 raise NotImplementedError(
-                    "sem_agg operator_owned on_scope_close requires "
+                    "sem_agg internal_scope on_scope_close requires "
                     "scope_policy.window_kind in {'session', 'tumbling', 'semantic'}"
                 )
 
@@ -317,9 +393,20 @@ class SemAggFunction(KeyedProcessFunction):
         self._meta = runtime_context.get_state(
             sem_agg_meta_descriptor(ttl)
         )
+        self._scope_contributions = runtime_context.get_map_state(
+            sem_agg_scope_contributions_descriptor(ttl)
+        )
+        self._scope_progress = runtime_context.get_map_state(
+            sem_agg_scope_progress_descriptor(ttl)
+        )
         self._metrics = StatefulOperatorMetrics.from_runtime_context(
             runtime_context, "sem_agg",
         )
+        if self._resolved_mode in {"summarize", "compressive"}:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._config.async_max_workers,
+                thread_name_prefix="sem-agg",
+            )
         logger.info(
             "SemAggFunction opened (mode=%s, max_buffer=%d)",
             self._resolved_mode, self._resolved_max_buffer_events,
@@ -329,6 +416,12 @@ class SemAggFunction(KeyedProcessFunction):
     def _supports_operator_scope_close(self) -> bool:
         return self._query_spec.scope_policy.window_kind in {"session", "tumbling", "semantic"}
 
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        self._pending_futures.clear()
+
     # -- core ----------------------------------------------------------------
 
     def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
@@ -336,15 +429,16 @@ class SemAggFunction(KeyedProcessFunction):
         if self._metrics:
             self._metrics.record_event_processed()
 
-        # Detect async summarize result merge-back
-        if isinstance(value, dict) and value.get("task_type") == "summarize":
-            yield from self._handle_summarize_result(value, now_ms)
-            return
+        meta = self._meta.value()
+        if meta is not None and self._resolved_mode in {"summarize", "compressive"}:
+            yield from self._poll_pending_summary(meta, ctx, now_ms)
 
-        # Detect WindowSnapshot input → expand into individual events
-        if isinstance(value, dict) and is_window_snapshot(value):
-            for sub_event_dict in window_snapshot_to_sem_events(value):
-                yield from self._process_single_event(sub_event_dict, ctx, now_ms)
+        if self._scope_source == "external_window":
+            if not isinstance(value, dict) or not is_window_snapshot(value):
+                raise ValueError(
+                    "sem_agg external_window path requires WindowSnapshot input"
+                )
+            yield from self._process_external_scope_snapshot(value, ctx, now_ms)
             return
 
         # Single event path
@@ -366,7 +460,6 @@ class SemAggFunction(KeyedProcessFunction):
             "key": event.key, "event_count": 0,
             "version": 0, "pending_summarize": False,
             "_last_emit_count": 0,
-            "_pending_buffer_count": 0,
             "scope_epoch": 0,
             "scope_last_time_ms": 0,
             "scope_bucket_id": None,
@@ -375,7 +468,12 @@ class SemAggFunction(KeyedProcessFunction):
         decision = self._scope_runtime.plan(event_dict, meta, now_ms)
 
         if decision.pre_reset_reason:
-            yield from self._emit_scope_close_output(meta, now_ms, decision.pre_reset_reason)
+            yield from self._emit_scope_close_output(
+                meta,
+                ctx,
+                now_ms,
+                decision.pre_reset_reason,
+            )
             self._reset_scope_state(meta, reason=decision.pre_reset_reason)
 
         meta["event_count"] += 1
@@ -387,11 +485,16 @@ class SemAggFunction(KeyedProcessFunction):
         if self._resolved_mode == "algebraic":
             yield from self._algebraic_step(event_dict, meta, now_ms)
         else:
-            yield from self._summarize_step(event_dict, meta, now_ms)
+            self._summarize_step(event_dict, meta, ctx, now_ms)
 
         if self._trigger_mode == "on_scope_close":
             if decision.post_reset_reason:
-                yield from self._emit_scope_close_output(meta, now_ms, decision.post_reset_reason)
+                yield from self._emit_scope_close_output(
+                    meta,
+                    ctx,
+                    now_ms,
+                    decision.post_reset_reason,
+                )
                 self._reset_scope_state(meta, reason=decision.post_reset_reason)
             else:
                 self._register_scope_close_timer(ctx, meta, decision, now_ms)
@@ -399,13 +502,20 @@ class SemAggFunction(KeyedProcessFunction):
             return
 
         if decision.post_reset_reason:
-            yield from self._emit_scope_close_output(meta, now_ms, decision.post_reset_reason)
+            yield from self._emit_scope_close_output(
+                meta,
+                ctx,
+                now_ms,
+                decision.post_reset_reason,
+            )
             self._reset_scope_state(meta, reason=decision.post_reset_reason)
             self._meta.update(meta)
             return
 
     def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
         """Timer-driven summarization flush."""
+        if self._scope_source != "internal_scope":
+            raise RuntimeError("sem_agg external_window path does not own internal timers")
         meta = self._meta.value()
         if meta is None:
             return
@@ -413,6 +523,13 @@ class SemAggFunction(KeyedProcessFunction):
             self._metrics.record_timer_fire()
 
         category = resolve_timer_category(meta, timestamp)
+        if category == TimerCategory.RECOMPUTE:
+            clear_timer_registration(meta, TimerCategory.RECOMPUTE)
+            if self._resolved_mode not in {"summarize", "compressive"}:
+                return
+            yield from self._poll_pending_summary(meta, ctx, timestamp)
+            self._meta.update(meta)
+            return
         if category != TimerCategory.FLUSH:
             return
 
@@ -421,7 +538,7 @@ class SemAggFunction(KeyedProcessFunction):
         now_ms = int(time.time() * 1000)
         if self._trigger_mode == "on_scope_close":
             reason = str(meta.pop("pending_scope_close_reason", "") or "scope_close")
-            yield from self._emit_scope_close_output(meta, now_ms, reason)
+            yield from self._emit_scope_close_output(meta, ctx, now_ms, reason)
             self._reset_scope_state(meta, reason=reason)
             self._meta.update(meta)
             return
@@ -429,7 +546,7 @@ class SemAggFunction(KeyedProcessFunction):
         if self._resolved_mode == "algebraic":
             yield from self._emit_current_aggregate(meta, now_ms, reason=self._trigger_mode)
         elif not meta.get("pending_summarize"):
-            yield from self._emit_summarize_request(meta)
+            self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
 
         if self._trigger_mode == "periodic" and self._resolved_periodic_ms > 0:
             register_timer(
@@ -451,12 +568,8 @@ class SemAggFunction(KeyedProcessFunction):
             # First event or no reduce_fn → store directly
             self._agg_value.update(event_dict)
         else:
-            try:
-                reduced = reduce_fn(current, event_dict)
-                self._agg_value.update(reduced)
-            except Exception as exc:
-                logger.warning("Algebraic reduce failed: %s", exc)
-                self._agg_value.update(event_dict)
+            reduced = reduce_fn(current, event_dict)
+            self._agg_value.update(reduced)
 
         meta["version"] = meta.get("version", 0) + 1
         self._meta.update(meta)
@@ -476,19 +589,21 @@ class SemAggFunction(KeyedProcessFunction):
     # -- summarize path ------------------------------------------------------
 
     def _summarize_step(
-        self, event_dict: Dict[str, Any], meta: Dict[str, Any], now_ms: int
+        self,
+        event_dict: Dict[str, Any],
+        meta: Dict[str, Any],
+        ctx: Any,
+        now_ms: int,
     ):
-        """Buffer events and trigger summarization when threshold reached."""
+        """Buffer events and dispatch one async summary update when triggered."""
         self._buffer.add(event_dict)
-
-        # Enforce buffer limit
         buf_count = len(list(self._buffer.get()))
         if buf_count > self._resolved_max_buffer_events:
             overflow = self._config.overflow_policy
             if overflow == OverflowPolicy.DROP_OLDEST:
-                self._trim_buffer_oldest(meta)
+                self._trim_buffer_oldest()
             elif overflow == OverflowPolicy.DROP_NEWEST:
-                self._trim_buffer_newest(meta)
+                self._trim_buffer_newest()
                 meta["event_count"] -= 1
                 self._meta.update(meta)
                 return
@@ -497,123 +612,21 @@ class SemAggFunction(KeyedProcessFunction):
 
         if meta.get("pending_summarize"):
             return
-
         if len(list(self._buffer.get())) >= self._resolved_max_buffer_events:
-            yield from self._emit_summarize_request(meta)
-            return
-
-        if self._trigger_mode == "on_event":
-            yield from self._emit_summarize_request(meta)
-            return
-
-        if self._trigger_mode == "count_threshold":
-            threshold = max(1, self._resolved_count_threshold)
-            if len(list(self._buffer.get())) >= threshold:
-                yield from self._emit_summarize_request(meta)
-
-    def _emit_summarize_request(self, meta: Dict[str, Any]):
-        """Emit buffered events as an async summarize work item."""
-        events = list(self._buffer.get())
-        if not events:
-            return
-
-        meta["pending_summarize"] = True
-        meta["_last_summarize_count"] = meta.get("event_count", 0)
-        meta["_pending_buffer_count"] = len(events)
-        self._meta.update(meta)
-
-        work = AsyncWorkItem(
-            key=meta.get("key", ""),
-            task_type="summarize",
-            payload={
-                "events": self._prepare_summary_events(events),
-                "event_count": len(events),
-                "current_version": meta.get("version", 0),
-                "agg_method": self._resolved_mode,
-                "scope_epoch": int(meta.get("scope_epoch", 0) or 0),
-                "scope_close_pending": bool(meta.get("_scope_close_pending", False)),
-            },
-        )
-        if self._metrics:
-            self._metrics.record_async_emit()
-        yield ASYNC_WORK_TAG, work.to_dict()
-
-    def _handle_summarize_result(
-        self, result_dict: Dict[str, Any], now_ms: int
-    ):
-        """Merge async summarize result into agg state."""
-        meta = self._meta.value() or {}
-
-        if not result_dict.get("success", False):
-            meta["pending_summarize"] = False
-            meta["_pending_buffer_count"] = 0
+            self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
             self._meta.update(meta)
-            yield {
-                "key": result_dict.get("key", ""),
-                "aggregate": None,
-                "version": meta.get("version", 0),
-                "mode": "summarize_failed",
-                "event_count": meta.get("event_count", 0),
-                "timestamp_ms": now_ms,
-            }
             return
-
-        summary = result_dict.get("result", {}).get("summary", "")
-        result_epoch = int(
-            result_dict.get("result", {}).get(
-                "scope_epoch",
-                result_dict.get("scope_epoch", meta.get("scope_epoch", 0)),
-            ) or 0
-        )
-        result_scope_close = bool(
-            result_dict.get("result", {}).get(
-                "scope_close_pending",
-                result_dict.get("scope_close_pending", False),
-            )
-        )
-        meta["version"] = meta.get("version", 0) + 1
-        meta["pending_summarize"] = False
-        emitted_count = int(meta.get("_pending_buffer_count", 0) or 0)
-        meta["_pending_buffer_count"] = 0
-
-        agg = {
-            "summary": summary,
-            "version": meta["version"],
-            "updated_ms": now_ms,
-        }
-        current_epoch = int(meta.get("scope_epoch", 0) or 0)
-        should_update_current_state = not result_scope_close and result_epoch == current_epoch
-        if should_update_current_state:
-            self._agg_value.update(agg)
-
-        # Preserve events that arrived while the summarize request was in flight.
-        if should_update_current_state:
-            self._drop_buffer_prefix(emitted_count)
-        self._meta.update(meta)
-
-        yield {
-            "key": meta.get("key", ""),
-            "aggregate": agg,
-            "version": meta["version"],
-            "mode": "summarize_scope_close" if result_scope_close else "summarize",
-            "event_count": meta.get("event_count", 0),
-            "timestamp_ms": now_ms,
-            "scope_epoch": result_epoch,
-        }
-
-        if result_scope_close:
-            return
-        if meta.get("pending_summarize"):
-            return
-        if self._trigger_mode == "on_event" and list(self._buffer.get()):
-            yield from self._emit_summarize_request(meta)
+        if self._trigger_mode == "on_event":
+            self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
+            self._meta.update(meta)
             return
         if self._trigger_mode == "count_threshold":
             threshold = max(1, self._resolved_count_threshold)
             if len(list(self._buffer.get())) >= threshold:
-                yield from self._emit_summarize_request(meta)
+                self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
+                self._meta.update(meta)
 
-    def _trim_buffer_oldest(self, meta: Dict[str, Any]) -> None:
+    def _trim_buffer_oldest(self) -> None:
         """Drop the oldest event from the buffer."""
         events = list(self._buffer.get())
         if len(events) > 1:
@@ -622,7 +635,7 @@ class SemAggFunction(KeyedProcessFunction):
         for e in events:
             self._buffer.add(e)
 
-    def _trim_buffer_newest(self, meta: Dict[str, Any]) -> None:
+    def _trim_buffer_newest(self) -> None:
         """Drop the newest event from the buffer."""
         events = list(self._buffer.get())
         if len(events) > 1:
@@ -633,23 +646,119 @@ class SemAggFunction(KeyedProcessFunction):
         for e in events:
             self._buffer.add(e)
 
-    def _drop_buffer_prefix(self, count: int) -> None:
-        """Drop the oldest ``count`` buffered events, preserving later arrivals."""
-        if count <= 0:
+    def _dispatch_summary_request(
+        self,
+        meta: Dict[str, Any],
+        timer_service: Any,
+        now_ms: int,
+        *,
+        scope_close_pending: bool = False,
+        request_scope_epoch: Optional[int] = None,
+    ) -> None:
+        """Submit one async summary update from the current buffer contents."""
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._config.async_max_workers,
+                thread_name_prefix="sem-agg",
+            )
+        if meta.get("pending_summarize"):
             return
-        events = list(self._buffer.get())
-        events = events[count:]
+        buffered_events = list(self._buffer.get())
+        if not buffered_events:
+            return
+        current_summary = ""
+        current_aggregate = self._agg_value.value()
+        if isinstance(current_aggregate, dict):
+            current_summary = str(current_aggregate.get("summary", "") or "")
+        request_id = f"{meta.get('key', '')}:{int(meta.get('version', 0) or 0)}:{now_ms}"
+        scope_epoch = int(
+            meta.get("scope_epoch", 0) if request_scope_epoch is None else request_scope_epoch
+        )
         self._buffer.clear()
-        for event in events:
-            self._buffer.add(event)
+        future = self._executor.submit(
+            evaluate_sem_agg_summary_update_from_config_sync,
+            llm_config=self._llm_config,
+            mode=self._resolved_mode,
+            current_summary=current_summary,
+            added_events=buffered_events,
+        )
+        self._pending_futures[request_id] = future
+        meta["pending_summarize"] = True
+        meta["pending_request_id"] = request_id
+        meta["pending_scope_epoch"] = scope_epoch
+        meta["pending_scope_close"] = scope_close_pending
+        meta["pending_added_event_count"] = len(buffered_events)
+        if self._metrics:
+            self._metrics.record_async_emit()
+        register_timer(
+            timer_service,
+            meta,
+            TimerCategory.RECOMPUTE,
+            now_ms + self._resolved_async_poll_interval_ms,
+        )
 
-    def _prepare_summary_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if self._resolved_mode != "compressive":
-            return events
-        if len(events) <= 2:
-            return events
-        keep = max(1, min(len(events), self._resolved_max_buffer_events // 2))
-        return events[-keep:]
+    def _poll_pending_summary(
+        self,
+        meta: Dict[str, Any],
+        ctx: Any,
+        now_ms: int,
+    ):
+        """Poll one pending summary future and merge it into canonical state."""
+        request_id = str(meta.get("pending_request_id", "") or "")
+        if not meta.get("pending_summarize") or not request_id:
+            return
+        future = self._pending_futures.get(request_id)
+        if future is None:
+            raise RuntimeError(f"sem_agg lost pending async request {request_id!r}")
+        if not future.done():
+            register_timer(
+                ctx.timer_service(),
+                meta,
+                TimerCategory.RECOMPUTE,
+                now_ms + self._resolved_async_poll_interval_ms,
+            )
+            return
+        del self._pending_futures[request_id]
+        result = future.result()
+        summary = str(result["summary"])
+        result_scope_epoch = int(meta.get("pending_scope_epoch", 0) or 0)
+        result_scope_close = bool(meta.get("pending_scope_close", False))
+        meta["pending_summarize"] = False
+        meta.pop("pending_request_id", None)
+        meta.pop("pending_scope_epoch", None)
+        meta.pop("pending_scope_close", None)
+        meta.pop("pending_added_event_count", None)
+        meta["version"] = int(meta.get("version", 0) or 0) + 1
+        aggregate = {
+            "summary": summary,
+            "version": meta["version"],
+            "updated_ms": now_ms,
+        }
+        if not result_scope_close and result_scope_epoch == int(meta.get("scope_epoch", 0) or 0):
+            self._agg_value.update(aggregate)
+        self._meta.update(meta)
+        yield {
+            "key": meta.get("key", ""),
+            "aggregate": aggregate,
+            "version": meta["version"],
+            "mode": f"{self._resolved_mode}_scope_close_async" if result_scope_close else f"{self._resolved_mode}_async",
+            "event_count": int(meta.get("event_count", 0) or 0),
+            "timestamp_ms": now_ms,
+            "scope_epoch": result_scope_epoch,
+        }
+        if result_scope_close:
+            return
+        if not list(self._buffer.get()):
+            return
+        if self._trigger_mode == "on_event":
+            self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
+            self._meta.update(meta)
+            return
+        if self._trigger_mode == "count_threshold":
+            threshold = max(1, self._resolved_count_threshold)
+            if len(list(self._buffer.get())) >= threshold:
+                self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
+                self._meta.update(meta)
 
     def _maybe_register_event_timers(self, ctx, meta: Dict[str, Any], now_ms: int) -> None:
         if self._trigger_mode == "periodic" and self._resolved_periodic_ms > 0:
@@ -695,18 +804,44 @@ class SemAggFunction(KeyedProcessFunction):
             "timestamp_ms": now_ms,
         }
 
-    def _emit_scope_close_output(self, meta: Dict[str, Any], now_ms: int, reason: str):
+    def _emit_scope_close_output(
+        self,
+        meta: Dict[str, Any],
+        ctx: Any,
+        now_ms: int,
+        reason: str,
+    ):
         if self._resolved_mode == "algebraic":
             yield from self._emit_current_aggregate(meta, now_ms, reason=reason)
             return
         if meta.get("pending_summarize"):
-            meta["_scope_close_pending"] = True
+            meta["pending_scope_close"] = True
+            self._meta.update(meta)
+            return
+        current_aggregate = self._agg_value.value()
+        if current_aggregate is not None and not list(self._buffer.get()):
+            meta["version"] = int(meta.get("version", 0) or 0) + 1
+            yield {
+                "key": meta.get("key", ""),
+                "aggregate": current_aggregate,
+                "version": meta["version"],
+                "mode": f"{self._resolved_mode}_scope_close",
+                "event_count": int(meta.get("event_count", 0) or 0),
+                "timestamp_ms": now_ms,
+                "scope_epoch": int(meta.get("scope_epoch", 0) or 0),
+            }
             self._meta.update(meta)
             return
         if not list(self._buffer.get()):
             return
-        meta["_scope_close_pending"] = True
-        yield from self._emit_summarize_request(meta)
+        self._dispatch_summary_request(
+            meta,
+            ctx.timer_service(),
+            now_ms,
+            scope_close_pending=True,
+            request_scope_epoch=int(meta.get("scope_epoch", 0) or 0),
+        )
+        self._meta.update(meta)
 
     def _register_scope_close_timer(
         self,
@@ -746,13 +881,147 @@ class SemAggFunction(KeyedProcessFunction):
         self._agg_value.clear()
         clear_timer_registration(meta, TimerCategory.FLUSH)
         meta.pop("pending_scope_close_reason", None)
-        meta.pop("_scope_close_pending", None)
         meta["event_count"] = 0
         meta["_last_emit_count"] = 0
-        meta["_last_summarize_count"] = 0
-        meta["_pending_buffer_count"] = 0
-        meta["pending_summarize"] = False
         meta["scope_epoch"] = int(meta.get("scope_epoch", 0) or 0) + 1
         meta["scope_last_time_ms"] = 0
         meta["scope_bucket_id"] = None
         meta["last_scope_reset_reason"] = reason
+
+    def _process_external_scope_snapshot(
+        self,
+        value: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ):
+        """Ingest one external scope update into the aggregate owner."""
+        if self._resolved_persistence_policy != "persistent_across_scopes":
+            raise RuntimeError(
+                "sem_agg external_window path requires persistent_across_scopes"
+            )
+        scope_id = str(value.get("window_id", "") or value.get("scope_id", "")).strip()
+        if not scope_id:
+            raise ValueError("sem_agg external_window snapshot requires window_id")
+        raw_events = list(window_snapshot_to_sem_events(value))
+        if not raw_events:
+            raise ValueError("sem_agg external_window snapshot requires non-empty events")
+        if self._resolved_mode in {"summarize", "compressive"}:
+            yield from self._process_external_scope_append_only(
+                value=value,
+                ctx=ctx,
+                now_ms=now_ms,
+                scope_id=scope_id,
+                raw_events=raw_events,
+            )
+            return
+        scoped_aggregate = _aggregate_event_records(raw_events, reduce_fn=self._config.reduce_fn)
+        self._scope_contributions.put(
+            scope_id,
+            {
+                "scope_id": scope_id,
+                "aggregate": scoped_aggregate,
+                "event_count": len(raw_events),
+                "updated_ms": now_ms,
+            },
+        )
+        global_aggregate, total_event_count = self._recompute_external_global_aggregate()
+        self._agg_value.update(global_aggregate)
+        meta = self._meta.value() or {
+            "key": str(value.get("key", str(ctx.get_current_key()))),
+            "event_count": 0,
+            "version": 0,
+        }
+        meta["event_count"] = total_event_count
+        meta["version"] = int(meta.get("version", 0) or 0) + 1
+        meta["last_scope_id"] = scope_id
+        meta["last_scope_update_ms"] = now_ms
+        self._meta.update(meta)
+        yield {
+            "key": meta.get("key", ""),
+            "aggregate": global_aggregate,
+            "version": meta["version"],
+            "mode": "algebraic_scope_fire",
+            "event_count": total_event_count,
+            "timestamp_ms": now_ms,
+            "scope_id": scope_id,
+        }
+
+    def _process_external_scope_append_only(
+        self,
+        *,
+        value: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+        scope_id: str,
+        raw_events: List[Dict[str, Any]],
+    ):
+        """Append only newly visible scope events into the summary/compression fold."""
+        meta = self._meta.value() or {
+            "key": str(value.get("key", str(ctx.get_current_key()))),
+            "event_count": 0,
+            "version": 0,
+            "scope_epoch": 0,
+            "scope_last_time_ms": 0,
+            "scope_bucket_id": None,
+            "pending_summarize": False,
+        }
+        progress = self._scope_progress.get(scope_id) if self._scope_progress is not None else None
+        seen_seq_ids = {
+            int(seq_id)
+            for seq_id in (progress or {}).get("seen_event_seq_ids", [])
+        }
+        new_events: List[Dict[str, Any]] = []
+        new_seq_ids: List[int] = []
+        for event in raw_events:
+            seq_id = int(event.get("seq_id", event.get("event_seq_id", 0)) or 0)
+            if seq_id in seen_seq_ids:
+                continue
+            seen_seq_ids.add(seq_id)
+            new_seq_ids.append(seq_id)
+            new_events.append(event)
+        if self._scope_progress is not None:
+            self._scope_progress.put(
+                scope_id,
+                {
+                    "seen_event_seq_ids": sorted(seen_seq_ids),
+                    "last_update_ms": now_ms,
+                    "newly_seen_event_seq_ids": new_seq_ids,
+                },
+            )
+        if not new_events:
+            self._meta.update(meta)
+            return
+        for event in new_events:
+            self._buffer.add(event)
+        meta["event_count"] = int(meta.get("event_count", 0) or 0) + len(new_events)
+        meta["last_scope_id"] = scope_id
+        meta["last_scope_update_ms"] = now_ms
+        self._meta.update(meta)
+        if meta.get("pending_summarize"):
+            return
+        if self._trigger_mode in {"on_scope_close", "on_event"}:
+            self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
+            self._meta.update(meta)
+            return
+        if self._trigger_mode == "count_threshold":
+            threshold = max(1, self._resolved_count_threshold)
+            if len(list(self._buffer.get())) >= threshold:
+                self._dispatch_summary_request(meta, ctx.timer_service(), now_ms)
+                self._meta.update(meta)
+
+    def _recompute_external_global_aggregate(self) -> tuple[Dict[str, Any], int]:
+        """Recompute one global aggregate from current external scope contributions."""
+        contributions = [
+            value
+            for _, value in self._scope_contributions.items()
+        ]
+        if not contributions:
+            raise ValueError(
+                "sem_agg external_window persistent path requires at least one scope contribution"
+            )
+        aggregates = [dict(item["aggregate"]) for item in contributions]
+        total_event_count = sum(int(item.get("event_count", 0) or 0) for item in contributions)
+        return _aggregate_event_records(
+            aggregates,
+            reduce_fn=self._config.reduce_fn,
+        ), total_event_count

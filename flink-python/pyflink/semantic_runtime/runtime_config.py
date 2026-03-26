@@ -663,6 +663,8 @@ class RuntimeConfig:
         for field_name in SemAggConfig.__dataclass_fields__:
             if field_name in kernel_raw:
                 kwargs[field_name] = kernel_raw[field_name]
+        if "async_max_workers" not in kwargs:
+            kwargs["async_max_workers"] = self.defaults.async_capacity
         if "overflow_policy" in kwargs:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return SemAggConfig(**kwargs)
@@ -773,12 +775,24 @@ class RuntimeConfig:
         from pyflink.semantic_runtime.runtime.plans import (
             resolve_agg_lowering_plan,
         )
+        from pyflink.semantic_runtime.operators.stateful.sem_agg import (
+            resolve_agg_persistence_policy,
+        )
 
         query_spec = self.get_agg_query_spec()
+        kernel_config = self.get_agg_kernel_config()
+        scope_source = "external_window" if input_kind == "window_snapshot" else "internal_scope"
         return AggRuntimeBundle(
             query_spec=query_spec,
-            kernel_config=self.get_agg_kernel_config(),
-            lowering_plan=resolve_agg_lowering_plan(query_spec, input_kind=input_kind),
+            kernel_config=kernel_config,
+            lowering_plan=resolve_agg_lowering_plan(
+                query_spec,
+                input_kind=input_kind,
+                persistence_policy=resolve_agg_persistence_policy(
+                    kernel_config,
+                    scope_source=scope_source,
+                ),
+            ),
         )
 
     def resolve_join_runtime_bundle(self) -> JoinRuntimeBundle:

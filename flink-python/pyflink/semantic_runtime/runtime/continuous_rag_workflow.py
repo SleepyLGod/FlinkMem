@@ -112,6 +112,7 @@ class ContinuousRAGConfig:
     groupby_llm_config: Optional[LLMClientConfig] = None
     agg_config: SemAggConfig = field(default_factory=SemAggConfig)
     agg_query_spec: Optional[AggQuerySpec] = None
+    agg_llm_config: Optional[LLMClientConfig] = None
 
     # Subflow B configs
     retrieve_config: SemSearchConfig = field(default_factory=SemSearchConfig)
@@ -134,10 +135,6 @@ class ContinuousRAGConfig:
     async_timeout_ms: int = 30_000
     async_capacity: int = 20
 
-    # Async bridge workers (None = side outputs are discarded with warning)
-    # These should be AsyncFunction instances that process AsyncWorkItem dicts
-    # and return AsyncResult dicts.
-    summarize_async_fn: Optional[Any] = None   # For sem_agg side output
     retrieve_async_fn: Optional[Any] = None    # For sem_search side output
 
     # Audit
@@ -153,7 +150,6 @@ class ContinuousRAGConfig:
         answer_prompt_template: Optional[str] = None,
         answer_output_schema: Optional[Dict[str, type]] = None,
         key_selector: Callable = simple_key_selector,
-        summarize_async_fn: Optional[Any] = None,
         retrieve_async_fn: Optional[Any] = None,
         workflow_version: str = "v0.2.0",
         config_version: str = "runtime_config",
@@ -179,6 +175,7 @@ class ContinuousRAGConfig:
             groupby_query_spec=groupby_bundle.query_spec,
             agg_config=agg_bundle.kernel_config,
             agg_query_spec=agg_bundle.query_spec,
+            agg_llm_config=runtime_config.to_llm_client_config(),
             retrieve_config=runtime_config.get_search_config(),
             topk_config=topk_bundle.kernel_config,
             topk_query_spec=topk_bundle.query_spec,
@@ -190,7 +187,6 @@ class ContinuousRAGConfig:
             async_timeout_ms=runtime_config.defaults.async_timeout_ms,
             async_capacity=runtime_config.defaults.async_capacity,
             groupby_llm_config=runtime_config.to_llm_client_config(),
-            summarize_async_fn=summarize_async_fn,
             retrieve_async_fn=retrieve_async_fn,
             workflow_version=workflow_version,
             config_version=config_version,
@@ -205,7 +201,6 @@ def build_continuous_rag_workflow_from_runtime_config(
     answer_prompt_template: Optional[str] = None,
     answer_output_schema: Optional[Dict[str, type]] = None,
     key_selector: Callable = simple_key_selector,
-    summarize_async_fn: Optional[Any] = None,
     retrieve_async_fn: Optional[Any] = None,
     workflow_version: str = "v0.2.0",
     config_version: str = "runtime_config",
@@ -220,7 +215,6 @@ def build_continuous_rag_workflow_from_runtime_config(
             answer_prompt_template=answer_prompt_template,
             answer_output_schema=answer_output_schema,
             key_selector=key_selector,
-            summarize_async_fn=summarize_async_fn,
             retrieve_async_fn=retrieve_async_fn,
             workflow_version=workflow_version,
             config_version=config_version,
@@ -234,7 +228,7 @@ def build_memory_subflow(
 ) -> DataStream:
     """Subflow A: memory build pipeline.
 
-    ``memory_events → key_by → sem_window → sem_groupby → sem_agg (+ async bridge)``
+    ``memory_events → key_by → sem_window → sem_groupby → sem_agg``
 
     Parameters
     ----------
@@ -279,23 +273,11 @@ def build_memory_subflow(
             config.agg_config,
             query_spec=config.agg_query_spec,
             input_kind="event_stream",
+            llm_config=config.agg_llm_config,
         ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
-
-    # Wire async bridge for sem_agg summarize side outputs
-    if _components._agg_needs_summarize_bridge(config):
-        aggregated = _components._wire_async_bridge_if_configured(
-            aggregated_raw,
-            config.summarize_async_fn,
-            _components._SummarizeAsyncMergeFunction(),
-            "summarize",
-            config,
-        )
-    else:
-        aggregated = aggregated_raw
-
-    return aggregated
+    return aggregated_raw
 
 
 def build_retrieval_subflow(

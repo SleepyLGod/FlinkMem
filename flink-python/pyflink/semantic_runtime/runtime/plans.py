@@ -447,9 +447,9 @@ def lower_sem_agg_request(
     query_spec = runtime_config.get_agg_query_spec()
     query_spec.semantic.instruction = request.intent
     query_spec.agg_method = request.mode
-    if request.context.kind != "window":
-        query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
-    elif _is_default_on_event_trigger(query_spec.trigger_policy):
+    if request.context.kind in {"window", "session", "semantic_segment"} and _is_default_on_event_trigger(
+        query_spec.trigger_policy
+    ):
         query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
     query_spec.scope_policy = _preserve_agg_scope_policy(
         query_spec,
@@ -570,23 +570,25 @@ def resolve_agg_lowering_plan(
     query_spec: AggQuerySpec,
     *,
     input_kind: str = "event_stream",
+    persistence_policy: Optional[str] = None,
 ) -> SemLoweringPlan:
     """Resolve the logical form for ``sem_agg``."""
-    if input_kind == "window_snapshot" and query_spec.agg_method == "algebraic":
+    if input_kind == "window_snapshot" and query_spec.agg_method == "algebraic" and persistence_policy == "reset_per_scope":
         return SemLoweringPlan(
             operator_name="sem_agg",
             lowering_kind="derived_attribute_then_classical",
             classical_operator="aggregate",
             notes=(
-                "Window-owned algebraic aggregation can run as bounded native "
-                "aggregation without operator-owned semantic state.",
+                "Bounded external-window algebraic aggregation with reset-per-scope "
+                "semantics can run as classical per-scope aggregation.",
             ),
         )
     return SemLoweringPlan(
         operator_name="sem_agg",
         lowering_kind="native_runtime",
         notes=(
-            "Semantic summarize/compressive reduction remains native runtime.",
+            "Continuous aggregation keeps one canonical aggregate state; "
+            "window scopes act as contribution updates, not bounded operator identity.",
         ),
     )
 
