@@ -211,6 +211,10 @@ def apply_sem_groupby_from_request(
     async_capacity: int = 20,
 ) -> DataStream:
     """Apply a stateful semantic groupby request to one input stream."""
+    from pyflink.semantic_runtime.operators.stateful.sem_groupby_window import (
+        WindowOwnedSemGroupbyFunction,
+    )
+
     plan = lower_sem_groupby_request(request, runtime_config)
     groupby_input = input_ds
     if plan.context_kind == "window":
@@ -221,6 +225,8 @@ def apply_sem_groupby_from_request(
             runtime_config=runtime_config,
             operator_name="sem_groupby",
         )
+    op = build_sem_groupby_from_request(request, runtime_config)
+    if isinstance(op, WindowOwnedSemGroupbyFunction):
         return apply_sem_groupby_pushdown(
             groupby_input,
             request=request,
@@ -228,7 +234,6 @@ def apply_sem_groupby_from_request(
             timeout_ms=timeout_ms,
             async_capacity=async_capacity,
         )
-    op = build_sem_groupby_from_request(request, runtime_config)
     return groupby_input.key_by(lambda value: value.get("key", "")).process(op)
 
 
@@ -246,6 +251,7 @@ def build_sem_groupby_from_request(
         config=plan.kernel_config,
         query_spec=plan.query_spec,
         input_kind=plan.input_kind,
+        llm_config=runtime_config.to_llm_client_config(),
     )
 
 

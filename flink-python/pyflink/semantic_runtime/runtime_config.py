@@ -737,12 +737,24 @@ class RuntimeConfig:
         from pyflink.semantic_runtime.runtime.plans import (
             resolve_groupby_lowering_plan,
         )
+        from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+            resolve_groupby_persistence_policy,
+        )
 
         query_spec = self.get_groupby_query_spec()
+        kernel_config = self.get_groupby_kernel_config()
+        scope_source = "external_window" if input_kind == "window_snapshot" else "internal_scope"
         return GroupbyRuntimeBundle(
             query_spec=query_spec,
-            kernel_config=self.get_groupby_kernel_config(),
-            lowering_plan=resolve_groupby_lowering_plan(query_spec, input_kind=input_kind),
+            kernel_config=kernel_config,
+            lowering_plan=resolve_groupby_lowering_plan(
+                query_spec,
+                input_kind=input_kind,
+                persistence_policy=resolve_groupby_persistence_policy(
+                    kernel_config,
+                    scope_source=scope_source,
+                ),
+            ),
         )
 
     def resolve_agg_runtime_bundle(self, *, input_kind: str = "event_stream") -> AggRuntimeBundle:

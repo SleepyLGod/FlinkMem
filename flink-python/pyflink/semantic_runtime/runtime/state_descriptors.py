@@ -166,6 +166,23 @@ def sem_groupby_pending_events_descriptor(
     return desc
 
 
+def sem_groupby_scope_progress_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for external-window scope ingestion progress.
+
+    Key: window_id (str), Value: pickled scope-progress dict with processed
+    event sequence ids for cumulative window snapshots.
+    """
+    desc = MapStateDescriptor(
+        "sem_groupby_scope_progress",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 # ---------------------------------------------------------------------------
 # sem_search descriptors
 # ---------------------------------------------------------------------------

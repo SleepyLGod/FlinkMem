@@ -519,9 +519,10 @@ def resolve_groupby_lowering_plan(
     query_spec: GroupbyQuerySpec,
     *,
     input_kind: str = "event_stream",
+    persistence_policy: Optional[str] = None,
 ) -> SemLoweringPlan:
     """Resolve the logical form for ``sem_groupby``."""
-    if input_kind == "window_snapshot":
+    if input_kind == "window_snapshot" and persistence_policy == "reset_per_scope":
         return SemLoweringPlan(
             operator_name="sem_groupby",
             lowering_kind="derived_attribute_then_classical",
@@ -534,8 +535,9 @@ def resolve_groupby_lowering_plan(
                 bounded_context=False,
             ),
             notes=(
-                "Bounded/window-owned grouping is modeled as semantic label "
-                "generation followed by classical group-by.",
+                "Bounded external-window grouping with reset-per-scope "
+                "semantics is modeled as semantic label generation followed "
+                "by classical group-by.",
             ),
         )
 
@@ -543,8 +545,8 @@ def resolve_groupby_lowering_plan(
         operator_name="sem_groupby",
         lowering_kind="native_runtime",
         notes=(
-            "Operator-owned grouping keeps evolving group state; group identity "
-            "is not a static per-record label.",
+            "Continuous grouping keeps evolving group state; group identity is "
+            "not a static per-record label.",
         ),
     )
 

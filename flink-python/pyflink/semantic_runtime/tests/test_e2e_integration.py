@@ -524,7 +524,7 @@ def test_window_groupby_pushdown_pipeline() -> None:
             "operators": {
                 "sem_groupby": {
                     "query_spec": {},
-                    "kernel": {"assignment_method": "rule", "confidence_threshold": 0.5},
+                    "kernel": {"variant": "rule", "confidence_threshold": 0.5},
                 }
             }
         }

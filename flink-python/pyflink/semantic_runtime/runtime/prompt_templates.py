@@ -94,15 +94,38 @@ def build_sem_lookup_join_prompt(intent: str) -> str:
     )
 
 
-def build_sem_groupby_scope_prompt(intent: str) -> str:
-    """Build the internal semantic assignment prompt for one bounded grouping scope."""
+def build_sem_group_assign_prompt(intent: str) -> str:
+    """Build the internal semantic assignment prompt for semantic grouping."""
     return (
         f"{intent}\n\n"
         "Existing groups:\n{existing_groups}\n\n"
         "Events to assign:\n{events}\n\n"
-        "For each event, assign it to one existing group_id or create one new group_id.\n"
+        "For each event, either assign it to one existing group_id or create one new group.\n"
         'Return one JSON object with exactly this shape: '
-        '{{"assignments": [{{"event_seq_id": int, "group_id": str, "confidence": float, "label": str}}]}}.'
+        '{{"assignments": [{{"event_seq_id": int, "decision": "existing"|"new", "group_id": str, "label": str, "confidence": float, "reason": str}}]}}.\n'
+        "Rules:\n"
+        '- If decision is "existing", group_id must equal one existing group_id and label may be empty.\n'
+        '- If decision is "new", group_id must be an empty string and label must be non-empty.\n'
+    )
+
+
+def build_sem_group_refine_prompt(intent: str) -> str:
+    """Build the internal semantic refinement prompt for semantic grouping."""
+    return (
+        f"{intent}\n\n"
+        "Current groups:\n{groups}\n\n"
+        "Refine the current grouping state. You may rename groups, merge groups, and split groups.\n"
+        'Return one JSON object with exactly this shape: '
+        '{{'
+        '"renames": [{{"group_id": str, "label": str}}], '
+        '"merges": [{{"target_group_id": str, "source_group_ids": [str, ...], "label": str}}], '
+        '"splits": [{{"group_id": str, "children": [{{"label": str, "examples": [str, ...]}}]}}]'
+        '}}.\n'
+        "Rules:\n"
+        "- source_group_ids in a merge must contain at least two existing group ids, and target_group_id must be one of them.\n"
+        "- children in a split must contain at least two partitions.\n"
+        "- split examples must come from the listed group's retained examples.\n"
+        "- Return empty arrays for operations you do not need.\n"
     )
 
 

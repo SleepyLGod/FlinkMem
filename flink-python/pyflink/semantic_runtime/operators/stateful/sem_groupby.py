@@ -24,9 +24,9 @@ For each incoming event, the operator decides one of two outcomes:
 2. create one new group
 
 The decision backend is an internal execution concern. Local methods such as
-keyword overlap or embedding similarity can assign synchronously. Expensive
-semantic methods such as LLM-based assignment can emit async work and only
-produce the final assignment after merge-back.
+keyword overlap or embedding similarity assign synchronously. LLM-backed
+variants also run synchronously in the canonical state owner so that group
+assignment and refinement mutate one coherent group-state machine.
 """
 
 from __future__ import annotations
@@ -39,10 +39,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import ListState, MapState, ValueState
 
+from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_groupby_pending_events_descriptor,
     sem_groupby_profiles_descriptor,
+    sem_groupby_scope_progress_descriptor,
     sem_window_meta_descriptor,
     build_ttl_config,
 )
@@ -51,10 +53,10 @@ from pyflink.semantic_runtime.runtime.event_model import (
     is_window_snapshot,
     window_snapshot_to_sem_events,
 )
-from pyflink.semantic_runtime.runtime.async_bridge import (
-    ASYNC_WORK_TAG,
-    AsyncWorkItem,
-    AsyncResult,
+from pyflink.semantic_runtime.runtime.steps import (
+    evaluate_sem_group_assignment_chunks_sync,
+    evaluate_sem_group_assignments_sync,
+    evaluate_sem_group_refine_sync,
 )
 from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
@@ -68,9 +70,14 @@ from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEnco
 
 logger = logging.getLogger(__name__)
 
-_LOCAL_ASSIGNMENT_METHODS = {"rule", "embedding"}
-_ASYNC_ASSIGNMENT_METHODS = {"llm"}
-_VALID_INTERNAL_ASSIGNMENT_METHODS = _LOCAL_ASSIGNMENT_METHODS | _ASYNC_ASSIGNMENT_METHODS
+_LOCAL_GROUPBY_VARIANTS = {"rule", "embedding"}
+_LLM_GROUPBY_VARIANTS = {"llm_basic", "llm_refine"}
+_VALID_GROUPBY_VARIANTS = _LOCAL_GROUPBY_VARIANTS | _LLM_GROUPBY_VARIANTS
+_VALID_GROUPBY_PERSISTENCE_POLICIES = {
+    "reset_per_scope",
+    "persistent_across_scopes",
+    "hybrid",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -159,23 +166,37 @@ class SemGroupbyConfig:
     """Internal configuration for the semantic groupby operator."""
 
     max_groups_per_key: int = 50
-    assignment_method: str = "rule"
-    scope_chunk_size: int = 1
+    variant: str = "rule"
+    persistence_policy: Optional[str] = None
+    assignment_batch_size: int = 1
     confidence_threshold: float = 0.7
     ttl_seconds: int = 3600
     evict_interval_ms: int = 60_000
     new_group_creation_threshold: float = 0.3
     refresh_labels_during_maintenance: bool = False
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
+    max_group_examples: int = 8
+    local_rule_split_seed_similarity_threshold: float = 0.2
+    local_embedding_split_seed_similarity_threshold: float = 0.5
 
     def __post_init__(self) -> None:
-        if self.assignment_method not in _VALID_INTERNAL_ASSIGNMENT_METHODS:
+        if self.variant not in _VALID_GROUPBY_VARIANTS:
             raise ValueError(
-                f"Invalid internal groupby assignment_method={self.assignment_method!r}. "
-                f"Must be one of {_VALID_INTERNAL_ASSIGNMENT_METHODS}."
+                f"Invalid internal groupby variant={self.variant!r}. "
+                f"Must be one of {_VALID_GROUPBY_VARIANTS}."
             )
-        if self.scope_chunk_size <= 0:
-            raise ValueError("scope_chunk_size must be a positive integer.")
+        if (
+            self.persistence_policy is not None
+            and self.persistence_policy not in _VALID_GROUPBY_PERSISTENCE_POLICIES
+        ):
+            raise ValueError(
+                f"Invalid sem_groupby persistence_policy={self.persistence_policy!r}. "
+                f"Must be one of {_VALID_GROUPBY_PERSISTENCE_POLICIES}."
+            )
+        if self.assignment_batch_size <= 0:
+            raise ValueError("assignment_batch_size must be a positive integer.")
+        if self.max_group_examples <= 0:
+            raise ValueError("max_group_examples must be a positive integer.")
 
 
 # ---------------------------------------------------------------------------
@@ -190,16 +211,28 @@ def _new_group_profile(group_id: str, label: str, now_ms: int) -> Dict[str, Any]
         "created_ms": now_ms,
         "last_update_ms": now_ms,
         "summary": "",
+        "examples": [],
     }
 
 
-def resolve_groupby_assignment_method(
+def resolve_groupby_variant(
     config: SemGroupbyConfig,
     query_spec: Optional[GroupbyQuerySpec] = None,
 ) -> str:
-    """Resolve the internal assignment strategy."""
+    """Resolve the internal grouping variant."""
     _ = query_spec
-    return str(config.assignment_method or "rule")
+    return str(config.variant or "rule")
+
+
+def resolve_groupby_persistence_policy(
+    config: SemGroupbyConfig,
+    *,
+    scope_source: str,
+) -> str:
+    """Resolve group-state persistence independently from scope source."""
+    if config.persistence_policy is not None:
+        return str(config.persistence_policy)
+    return "persistent_across_scopes"
 
 
 def _group_profile_text(profile: Dict[str, Any]) -> str:
@@ -208,12 +241,41 @@ def _group_profile_text(profile: Dict[str, Any]) -> str:
     return f"{label}\n{summary}".strip()
 
 
+def _profile_summary_from_examples(
+    examples: Iterable[str],
+    *,
+    max_examples: int,
+) -> str:
+    """Build a compact local summary from retained examples."""
+    normalized = [str(item).strip() for item in examples if str(item).strip()]
+    return "\n".join(normalized[-max_examples:])
+
+
+def _append_profile_example(
+    profile: Dict[str, Any],
+    payload: str,
+    *,
+    max_examples: int,
+) -> None:
+    """Append one payload example and refresh the local summary."""
+    cleaned = str(payload).strip()
+    if not cleaned:
+        return
+    examples = [str(item) for item in profile.get("examples", []) if str(item).strip()]
+    if cleaned not in examples:
+        examples.append(cleaned)
+    profile["examples"] = examples[-max_examples:]
+    profile["summary"] = _profile_summary_from_examples(
+        profile["examples"],
+        max_examples=max_examples,
+    )
+
+
 def derive_group_label(profile: Dict[str, Any]) -> str:
     """Derive a compact local label from a group profile.
 
     This is a local relabel helper used by maintenance when label refresh is
-    enabled. No separate LLM-driven relabel worker exists in the current
-    runtime.
+    enabled.
     """
     text = _group_profile_text(profile).strip()
     if not text:
@@ -244,14 +306,14 @@ def score_group_profile(
     event_text: str,
     profile: Dict[str, Any],
     *,
-    assignment_method: str,
+    variant: str,
     encoder: Optional[HashingTextEncoder] = None,
 ) -> float:
     """Score an event against one group profile using the chosen local method."""
     profile_text = _group_profile_text(profile)
     if not profile_text:
         return 0.0
-    if assignment_method == "embedding":
+    if variant == "embedding":
         local_encoder = encoder or HashingTextEncoder()
         return float(local_encoder.similarity(event_text, profile_text))
     return float(_keyword_overlap_score(event_text, profile_text))
@@ -261,7 +323,7 @@ def group_profile_similarity(
     left_profile: Dict[str, Any],
     right_profile: Dict[str, Any],
     *,
-    assignment_method: str,
+    variant: str,
     encoder: Optional[HashingTextEncoder] = None,
 ) -> float:
     """Return a symmetric similarity score between two group profiles."""
@@ -269,7 +331,7 @@ def group_profile_similarity(
     right_text = _group_profile_text(right_profile)
     if not left_text or not right_text:
         return 0.0
-    if assignment_method == "embedding":
+    if variant == "embedding":
         local_encoder = encoder or HashingTextEncoder()
         return float(local_encoder.similarity(left_text, right_text))
     left_to_right = _keyword_overlap_score(left_text, right_text)
@@ -279,12 +341,12 @@ def group_profile_similarity(
 
 def resolve_groupby_maintenance_merge_threshold(
     *,
-    assignment_method: str,
+    variant: str,
     assign_threshold: float,
     new_group_threshold: float,
 ) -> float:
     """Return the local similarity threshold used by maintenance/refinement."""
-    if assignment_method == "embedding":
+    if variant == "embedding":
         return max(0.8, float(assign_threshold))
     return max(0.65, float(new_group_threshold))
 
@@ -292,11 +354,12 @@ def resolve_groupby_maintenance_merge_threshold(
 def merge_similar_group_profiles(
     groups: Dict[str, Dict[str, Any]],
     *,
-    assignment_method: str,
+    variant: str,
     encoder: Optional[HashingTextEncoder],
     assign_threshold: float,
     new_group_threshold: float,
     now_ms: int,
+    max_examples: int,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str], int]:
     """Greedily merge highly similar groups in a plain in-memory mapping.
 
@@ -313,7 +376,7 @@ def merge_similar_group_profiles(
         return dict(groups), {}, 0
 
     threshold = resolve_groupby_maintenance_merge_threshold(
-        assignment_method=assignment_method,
+        variant=variant,
         assign_threshold=assign_threshold,
         new_group_threshold=new_group_threshold,
     )
@@ -327,7 +390,7 @@ def merge_similar_group_profiles(
             score = group_profile_similarity(
                 left_profile,
                 right_profile,
-                assignment_method=assignment_method,
+                variant=variant,
                 encoder=encoder,
             )
             if score >= threshold:
@@ -351,7 +414,13 @@ def merge_similar_group_profiles(
         survivor_id, merged_id = choose_group_merge_survivor(
             left_id, left_profile, right_id, right_profile
         )
-        apply_group_merge(working, survivor_id, merged_id, now_ms)
+        apply_group_merge(
+            working,
+            survivor_id,
+            merged_id,
+            now_ms,
+            max_examples=max_examples,
+        )
         merged_ids.add(merged_id)
         merged_into[merged_id] = survivor_id
         merge_count += 1
@@ -394,6 +463,8 @@ def apply_group_merge(
     survivor_id: str,
     merged_id: str,
     now_ms: int,
+    *,
+    max_examples: int,
 ) -> None:
     """Apply one in-memory group merge."""
     survivor = groups.get(survivor_id)
@@ -423,6 +494,132 @@ def apply_group_merge(
 
     groups[survivor_id] = survivor
     groups.pop(merged_id, None)
+
+    merged_examples = list(survivor.get("examples", []))
+    for example in list(merged.get("examples", [])):
+        if example not in merged_examples:
+            merged_examples.append(example)
+    survivor["examples"] = merged_examples[-max_examples:]
+    survivor["summary"] = _profile_summary_from_examples(
+        survivor["examples"],
+        max_examples=max_examples,
+    )
+
+
+def _split_profile_examples(
+    profile: Dict[str, Any],
+    *,
+    variant: str,
+    encoder: Optional[HashingTextEncoder],
+    rule_threshold: float,
+    embedding_threshold: float,
+) -> Optional[Tuple[list[str], list[str]]]:
+    """Split one profile's examples into two semantic clusters when possible."""
+    examples = [str(item) for item in profile.get("examples", []) if str(item).strip()]
+    if len(examples) < 4:
+        return None
+
+    seed_left_text = examples[0]
+    seed_right_text = None
+    lowest_seed_similarity = 1.0
+    for candidate in examples[1:]:
+        score = score_group_profile(
+            candidate,
+            {"label": seed_left_text, "summary": seed_left_text},
+            variant=variant,
+            encoder=encoder,
+        )
+        if score < lowest_seed_similarity:
+            seed_right_text = candidate
+            lowest_seed_similarity = score
+    if seed_right_text is None:
+        return None
+
+    split_similarity_threshold = (
+        embedding_threshold if variant == "embedding" else rule_threshold
+    )
+    if lowest_seed_similarity > split_similarity_threshold:
+        return None
+
+    left_cluster = [seed_left_text]
+    right_cluster = [seed_right_text]
+    for sample in examples[1:]:
+        if sample == seed_right_text:
+            continue
+        left_similarity = score_group_profile(
+            sample,
+            {"label": seed_left_text, "summary": seed_left_text},
+            variant=variant,
+            encoder=encoder,
+        )
+        right_similarity = score_group_profile(
+            sample,
+            {"label": seed_right_text, "summary": seed_right_text},
+            variant=variant,
+            encoder=encoder,
+        )
+        if right_similarity > left_similarity:
+            right_cluster.append(sample)
+        else:
+            left_cluster.append(sample)
+    if not left_cluster or not right_cluster:
+        return None
+    return left_cluster, right_cluster
+
+
+def split_group_profiles(
+    groups: Dict[str, Dict[str, Any]],
+    *,
+    variant: str,
+    encoder: Optional[HashingTextEncoder],
+    now_ms: int,
+    max_examples: int,
+    rule_threshold: float,
+    embedding_threshold: float,
+) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    """Split semantically mixed groups using retained example payloads."""
+    working = {gid: dict(profile) for gid, profile in groups.items()}
+    split_count = 0
+    next_suffix = 0
+
+    for group_id in list(working.keys()):
+        profile = working.get(group_id)
+        if profile is None:
+            continue
+        split = _split_profile_examples(
+            profile,
+            variant=variant,
+            encoder=encoder,
+            rule_threshold=rule_threshold,
+            embedding_threshold=embedding_threshold,
+        )
+        if split is None:
+            continue
+        cluster_a, cluster_b = split
+        next_suffix += 1
+        new_group_id = f"{group_id}_split{next_suffix}"
+
+        left = dict(profile)
+        right = dict(profile)
+        left["examples"] = cluster_a[-max_examples:]
+        right["examples"] = cluster_b[-max_examples:]
+        left["summary"] = _profile_summary_from_examples(left["examples"], max_examples=max_examples)
+        right["summary"] = _profile_summary_from_examples(right["examples"], max_examples=max_examples)
+        left["label"] = derive_group_label(left)
+        right["label"] = derive_group_label(right)
+        total = max(int(profile.get("event_count", len(cluster_a) + len(cluster_b))), 2)
+        left_count = max(1, int(round(total * (len(cluster_a) / (len(cluster_a) + len(cluster_b))))))
+        right_count = max(1, total - left_count)
+        left["event_count"] = left_count
+        right["event_count"] = right_count
+        left["last_update_ms"] = now_ms
+        right["last_update_ms"] = now_ms
+        right["group_id"] = new_group_id
+        working[group_id] = left
+        working[new_group_id] = right
+        split_count += 1
+
+    return working, split_count
 
 
 def resolve_groupby_runtime_params(
@@ -459,34 +656,46 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
         keyed = ds.key_by(simple_key_selector)
         grouped = keyed.process(SemGroupbyFunction(SemGroupbyConfig(...)))
-        # Wire async bridge for ambiguous assignments:
-        merged = build_async_bridge(grouped, classifier_fn, merge_fn, ...)
     """
 
     def __init__(
         self,
         config: Optional[SemGroupbyConfig] = None,
         query_spec: Optional[GroupbyQuerySpec] = None,
+        *,
+        llm_config: Optional[LLMClientConfig] = None,
+        scope_source: str = "internal_scope",
     ) -> None:
         self._config = config or SemGroupbyConfig()
         self._query_spec = query_spec
+        self._llm_config = llm_config
+        self._scope_source = scope_source
         self._group_profiles: Optional[MapState] = None
         self._pending_events: Optional[ListState] = None
+        self._scope_progress: Optional[MapState] = None
         self._pending_events_buffer: List[Dict[str, Any]] = []
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
-        self._resolved_assignment_method = resolve_groupby_assignment_method(
+        self._client: Optional[LLMClient] = None
+        self._resolved_variant = resolve_groupby_variant(
             self._config,
             query_spec,
+        )
+        self._resolved_persistence_policy = resolve_groupby_persistence_policy(
+            self._config,
+            scope_source=self._scope_source,
         )
         self._maintenance_trigger_policy = (
             query_spec.maintenance_trigger_policy if query_spec is not None else None
         )
         self._scope_runtime = (
             _GroupbyScopeRuntime(query_spec)
-            if query_spec is not None
-            and self._maintenance_trigger_policy is not None
-            and self._maintenance_trigger_policy.mode == "on_scope_close"
+            if (
+                self._scope_source == "internal_scope"
+                and query_spec is not None
+                and self._maintenance_trigger_policy is not None
+                and self._maintenance_trigger_policy.mode == "on_scope_close"
+            )
             else None
         )
         self._encoder = HashingTextEncoder(dim=128)
@@ -496,7 +705,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._resolved_assign_threshold,
             self._resolved_new_group_threshold,
         ) = resolve_groupby_runtime_params(self._config, self._query_spec)
-        self._resolved_scope_chunk_size = int(self._config.scope_chunk_size)
+        self._resolved_assignment_batch_size = int(self._config.assignment_batch_size)
+        self._resolved_max_group_examples = int(self._config.max_group_examples)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -508,6 +718,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._pending_events = runtime_context.get_list_state(
             sem_groupby_pending_events_descriptor(ttl)
         )
+        self._scope_progress = runtime_context.get_map_state(
+            sem_groupby_scope_progress_descriptor(ttl)
+        )
         # Reuse a generic ValueState for counters/eviction bookkeeping
         from pyflink.common.typeinfo import Types
         from pyflink.datastream.state import ValueStateDescriptor
@@ -517,13 +730,25 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._metrics = StatefulOperatorMetrics.from_runtime_context(
             runtime_context, "sem_groupby",
         )
+        if self._resolved_variant in _LLM_GROUPBY_VARIANTS:
+            if self._llm_config is None:
+                raise ValueError(
+                    f"sem_groupby variant={self._resolved_variant!r} requires llm_config"
+                )
+            self._client = create_llm_client(self._llm_config)
         logger.info(
-            "SemGroupbyFunction opened (max_groups=%d, reuse_threshold=%.2f, maintenance_merge_threshold=%.2f, assignment_method=%s)",
+            "SemGroupbyFunction opened (max_groups=%d, reuse_threshold=%.2f, maintenance_merge_threshold=%.2f, variant=%s, persistence=%s)",
             self._resolved_max_groups_per_key,
             self._resolved_assign_threshold,
             self._resolved_new_group_threshold,
-            self._resolved_assignment_method,
+            self._resolved_variant,
+            self._resolved_persistence_policy,
         )
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     # -- core ----------------------------------------------------------------
 
@@ -532,28 +757,83 @@ class SemGroupbyFunction(KeyedProcessFunction):
         value: Any,
         ctx: "KeyedProcessFunction.Context",
     ) -> Iterable[Any]:
-        """Process one incoming event or async merge-back result.
-
-        Yields assignment dicts on main output.  Yields side-output
-        ``AsyncWorkItem`` dicts for ambiguous assignments.
-        """
+        """Process one incoming event."""
         now_ms = int(time.time() * 1000)
         if self._metrics:
             self._metrics.record_event_processed()
 
-        # Detect async merge-back result
-        if isinstance(value, dict) and value.get("task_type") == "classify":
-            yield from self._handle_async_result(value, now_ms)
-            return
-
         # Detect WindowSnapshot input → expand into individual events
         if isinstance(value, dict) and is_window_snapshot(value):
-            for sub_event_dict in window_snapshot_to_sem_events(value):
-                yield from self._process_single_event(sub_event_dict, ctx, now_ms)
+            yield from self._process_window_snapshot(value, ctx, now_ms)
             return
 
         # Single event path
         yield from self._process_single_event(value, ctx, now_ms)
+
+    def _process_window_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> Iterable[Any]:
+        """Process one external cumulative window snapshot."""
+        meta = self._meta.value() or {
+            "total_assigned": 0,
+            "key": str(ctx.get_current_key()),
+            "scope_epoch": 0,
+            "scope_last_time_ms": now_ms,
+            "scope_bucket_id": None,
+        }
+        scope_events = list(window_snapshot_to_sem_events(snapshot))
+        if self._resolved_persistence_policy == "reset_per_scope":
+            if self._resolved_variant in _LOCAL_GROUPBY_VARIANTS:
+                for sub_event_dict in scope_events:
+                    yield from self._process_single_event(sub_event_dict, ctx, now_ms)
+            else:
+                yield from self._assign_with_llm_events(scope_events, now_ms, meta=meta)
+            return
+
+        window_id = str(snapshot.get("window_id", "") or "")
+        if not window_id:
+            raise ValueError("sem_groupby external_window path requires non-empty window_id")
+
+        progress = self._scope_progress.get(window_id) if self._scope_progress is not None else None
+        seen_seq_ids = {
+            int(seq_id)
+            for seq_id in (progress or {}).get("seen_event_seq_ids", [])
+        }
+        unseen_scope_events: List[Dict[str, Any]] = []
+        newly_seen_seq_ids: List[int] = []
+        for sub_event_dict in scope_events:
+            seq_id = int(sub_event_dict.get("seq_id", 0))
+            if seq_id in seen_seq_ids:
+                continue
+            unseen_scope_events.append(sub_event_dict)
+            seen_seq_ids.add(seq_id)
+            newly_seen_seq_ids.append(seq_id)
+
+        if self._resolved_variant in _LOCAL_GROUPBY_VARIANTS:
+            for sub_event_dict in unseen_scope_events:
+                yield from self._process_single_event(sub_event_dict, ctx, now_ms)
+        else:
+            yield from self._assign_with_llm_events(unseen_scope_events, now_ms, meta=meta)
+
+        if self._scope_progress is not None:
+            self._scope_progress.put(
+                window_id,
+                {
+                    "seen_event_seq_ids": sorted(seen_seq_ids),
+                    "last_update_ms": now_ms,
+                    "newly_seen_event_seq_ids": newly_seen_seq_ids,
+                },
+            )
+        if (
+            self._maintenance_trigger_policy is not None
+            and self._maintenance_trigger_policy.mode == "on_scope_close"
+        ):
+            meta["scope_bucket_id"] = window_id
+            self._run_maintenance(meta, now_ms)
+            self._meta.update(meta)
 
     def _process_single_event(
         self,
@@ -617,24 +897,26 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if decision.scope_bucket_id is not None:
             meta["scope_bucket_id"] = decision.scope_bucket_id
 
-        if self._resolved_assignment_method in _LOCAL_ASSIGNMENT_METHODS:
+        if self._resolved_variant in _LOCAL_GROUPBY_VARIANTS:
             assignment_row = self._assign_locally(event, now_ms)
             meta["total_assigned"] = int(meta.get("total_assigned", 0)) + 1
             self._meta.update(meta)
             yield assignment_row
-        elif self._resolved_assignment_method in _ASYNC_ASSIGNMENT_METHODS:
-            yield from self._enqueue_async_assignment(
+        elif self._resolved_variant in _LLM_GROUPBY_VARIANTS:
+            yield from self._enqueue_llm_assignment(
                 event_dict=event_dict,
                 event=event,
                 meta=meta,
+                now_ms=now_ms,
             )
         else:
             raise ValueError(
-                f"Unsupported internal groupby assignment_method={self._resolved_assignment_method!r}."
+                f"Unsupported internal groupby variant={self._resolved_variant!r}."
             )
 
         if (
-            self._maintenance_trigger_policy is not None
+            self._scope_source == "internal_scope"
+            and self._maintenance_trigger_policy is not None
             and self._maintenance_trigger_policy.mode == "on_scope_close"
         ):
             if decision.post_reset_reason:
@@ -722,7 +1004,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             score = score_group_profile(
                 event.payload,
                 profile,
-                assignment_method=self._resolved_assignment_method,
+                variant=self._resolved_variant,
                 encoder=self._encoder,
             )
             if score > best_score:
@@ -751,105 +1033,148 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._pending_events.clear()
 
     def _append_pending_event(self, event_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Append one event to the pending async chunk and return the chunk."""
+        """Append one event to the pending assignment batch and return the batch."""
         pending = self._pending_event_values()
         pending.append(dict(event_dict))
         self._replace_pending_events(pending)
         return pending
 
-    def _build_async_assignment_payload(
-        self,
-        events: List[Dict[str, Any]],
-        *,
-        scope_epoch: int,
-        scope_close_pending: bool,
-        scope_close_reason: str = "",
-    ) -> Dict[str, Any]:
-        """Build one async assignment payload for one event chunk."""
-        existing_groups = self._existing_groups_payload()
-        if len(events) == 1:
-            event = dict(events[0])
-            semantic_event = SemEvent.from_dict(event)
-            suggested_group_id, suggested_score = self._local_assign(semantic_event)
-            return {
-                "event": event,
-                "existing_groups": existing_groups,
-                "scope_chunk_size": self._resolved_scope_chunk_size,
-                "scope_epoch": scope_epoch,
-                "scope_close_pending": scope_close_pending,
-                "scope_close_reason": scope_close_reason,
-                "planner_hints": {
-                    "suggested_group_id": suggested_group_id,
-                    "suggested_score": suggested_score,
-                },
-            }
-        return {
-            "events": [dict(item) for item in events],
-            "existing_groups": existing_groups,
-            "scope_chunk_size": self._resolved_scope_chunk_size,
-            "scope_epoch": scope_epoch,
-            "scope_close_pending": scope_close_pending,
-            "scope_close_reason": scope_close_reason,
-        }
-
-    def _emit_async_assignment_work(
-        self,
-        *,
-        key: str,
-        events: List[Dict[str, Any]],
-        meta: Dict[str, Any],
-        scope_close_pending: bool,
-        scope_close_reason: str = "",
-    ) -> Tuple[Any, Dict[str, Any]]:
-        """Build one async assignment work item for the current chunk."""
-        work = AsyncWorkItem(
-            key=key,
-            task_type="classify",
-            payload=self._build_async_assignment_payload(
-                events,
-                scope_epoch=int(meta.get("scope_epoch", 0) or 0),
-                scope_close_pending=scope_close_pending,
-                scope_close_reason=scope_close_reason,
-            ),
-        )
-        if self._metrics:
-            self._metrics.record_async_emit()
-        return ASYNC_WORK_TAG, work.to_dict()
-
-    def _enqueue_async_assignment(
+    def _enqueue_llm_assignment(
         self,
         *,
         event_dict: Dict[str, Any],
         event: SemEvent,
         meta: Dict[str, Any],
+        now_ms: int,
     ) -> Iterable[Any]:
-        """Append one event to the async chunk and emit work when full."""
+        """Append one event to the LLM assignment batch and flush when full."""
         pending = self._append_pending_event(event_dict)
         self._meta.update(meta)
-        if len(pending) < self._resolved_scope_chunk_size:
+        if len(pending) < self._resolved_assignment_batch_size:
             return
         chunk = list(pending)
         self._clear_pending_events()
-        yield self._emit_async_assignment_work(
-            key=event.key,
-            events=chunk,
-            meta=meta,
-            scope_close_pending=False,
-        )
+        yield from self._assign_with_llm_events(chunk, now_ms, meta=meta)
 
     def _existing_groups_payload(self) -> List[Dict[str, Any]]:
-        """Return a serializable view of current groups for async assignment."""
+        """Return a serializable view of current groups for semantic assignment."""
         return [
             {
                 "group_id": group_id,
                 "label": profile.get("label", ""),
                 "summary": profile.get("summary", ""),
                 "event_count": int(profile.get("event_count", 0)),
+                "examples": list(profile.get("examples", [])),
             }
             for group_id in self._group_profiles.keys()
             for profile in [self._group_profiles.get(group_id)]
             if profile is not None
         ]
+
+    def _default_group_label(self, payload: str) -> str:
+        """Derive a simple local fallback label for one new group."""
+        return " ".join(str(payload).split()[:5]).strip()
+
+    def _split_assignment_chunks(
+        self,
+        event_dicts: List[Dict[str, Any]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Split one event list into canonical assignment chunks."""
+        chunk_size = self._resolved_assignment_batch_size
+        return [
+            list(event_dicts[index:index + chunk_size])
+            for index in range(0, len(event_dicts), chunk_size)
+        ]
+
+    def _apply_assignment_rows(
+        self,
+        *,
+        event_dicts: List[Dict[str, Any]],
+        assignments: List[Dict[str, Any]],
+        now_ms: int,
+    ) -> Iterable[Dict[str, Any]]:
+        """Apply one semantic assignment result list to canonical state."""
+        events_by_seq_id = {
+            int(item["seq_id"]): SemEvent.from_dict(item)
+            for item in event_dicts
+        }
+        seen_seq_ids = set()
+        for assignment in assignments:
+            event_seq_id = int(assignment["event_seq_id"])
+            event = events_by_seq_id.get(event_seq_id)
+            if event is None:
+                raise ValueError(
+                    f"sem_group_assign returned unknown event_seq_id={event_seq_id}"
+                )
+            if event_seq_id in seen_seq_ids:
+                raise ValueError(
+                    f"sem_group_assign returned duplicate event_seq_id={event_seq_id}"
+                )
+            seen_seq_ids.add(event_seq_id)
+            decision = str(assignment["decision"])
+            confidence = float(assignment["confidence"])
+            if decision == "existing":
+                group_id = str(assignment["group_id"])
+                self._update_group(group_id, event, now_ms)
+                yield self._assignment_row(event, group_id, confidence, self._resolved_variant)
+                continue
+            label = str(assignment.get("label", "") or self._default_group_label(event.payload))
+            group_id = self._create_group_or_raise(event, now_ms, label=label)
+            yield self._assignment_row(event, group_id, confidence, self._resolved_variant)
+        if seen_seq_ids != set(events_by_seq_id.keys()):
+            missing = sorted(set(events_by_seq_id.keys()) - seen_seq_ids)
+            raise ValueError(
+                f"sem_group_assign did not return assignments for event_seq_ids={missing!r}"
+            )
+
+    def _assign_with_llm_events(
+        self,
+        event_dicts: List[Dict[str, Any]],
+        now_ms: int,
+        *,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Iterable[Dict[str, Any]]:
+        """Assign one event list through canonical semantic grouping."""
+        if self._client is None:
+            raise RuntimeError("sem_groupby LLM runtime is not initialized")
+        if not event_dicts:
+            return
+        existing_groups = self._existing_groups_payload()
+        event_chunks = self._split_assignment_chunks(event_dicts)
+        intent = (
+            self._query_spec.semantic.instruction
+            if self._query_spec is not None
+            else "Assign tuples to semantic groups."
+        )
+        if len(event_chunks) == 1:
+            assignments = evaluate_sem_group_assignments_sync(
+                client=self._client,
+                intent=intent,
+                existing_groups=existing_groups,
+                events=event_chunks[0],
+            )
+            yield from self._apply_assignment_rows(
+                event_dicts=event_chunks[0],
+                assignments=assignments,
+                now_ms=now_ms,
+            )
+            return
+
+        assignment_chunks = evaluate_sem_group_assignment_chunks_sync(
+            client=self._client,
+            intent=intent,
+            existing_groups=existing_groups,
+            event_chunks=event_chunks,
+        )
+        for event_chunk, assignment_chunk in zip(event_chunks, assignment_chunks):
+            yield from self._apply_assignment_rows(
+                event_dicts=event_chunk,
+                assignments=assignment_chunk,
+                now_ms=now_ms,
+            )
+        if meta is not None:
+            meta["total_assigned"] = int(meta.get("total_assigned", 0)) + len(event_dicts)
+            self._meta.update(meta)
 
     def _assign_locally(self, event: SemEvent, now_ms: int) -> Dict[str, Any]:
         """Assign one event using the configured local method."""
@@ -890,10 +1215,19 @@ class SemGroupbyFunction(KeyedProcessFunction):
             return
         profile["event_count"] = profile.get("event_count", 0) + 1
         profile["last_update_ms"] = now_ms
+        _append_profile_example(
+            profile,
+            event.payload,
+            max_examples=self._resolved_max_group_examples,
+        )
         self._group_profiles.put(group_id, profile)
 
     def _maybe_create_group(
-        self, event: SemEvent, now_ms: int
+        self,
+        event: SemEvent,
+        now_ms: int,
+        *,
+        label: Optional[str] = None,
     ) -> Optional[str]:
         """Create a new group if under the limit. Returns group_id or None.
 
@@ -912,104 +1246,34 @@ class SemGroupbyFunction(KeyedProcessFunction):
 
         import uuid
         group_id = uuid.uuid4().hex[:8]
-        label = " ".join(event.payload.split()[:5])
-        profile = _new_group_profile(group_id, label, now_ms)
+        profile = _new_group_profile(
+            group_id,
+            label or self._default_group_label(event.payload),
+            now_ms,
+        )
         profile["event_count"] = 1
+        _append_profile_example(
+            profile,
+            event.payload,
+            max_examples=self._resolved_max_group_examples,
+        )
         self._group_profiles.put(group_id, profile)
         return group_id
 
-    def _create_group_or_raise(self, event: SemEvent, now_ms: int) -> str:
+    def _create_group_or_raise(
+        self,
+        event: SemEvent,
+        now_ms: int,
+        *,
+        label: Optional[str] = None,
+    ) -> str:
         """Create a new group or fail when policy forbids it."""
-        group_id = self._maybe_create_group(event, now_ms)
+        group_id = self._maybe_create_group(event, now_ms, label=label)
         if group_id is None:
             raise RuntimeError(
                 "sem_groupby could not create a new group under the current overflow policy."
             )
         return group_id
-
-    def _merge_one_async_assignment(
-        self,
-        payload: Dict[str, Any],
-        *,
-        now_ms: int,
-        scope_close_pending: bool,
-        stale_scope_result: bool,
-    ) -> Dict[str, Any]:
-        """Merge one async assignment or emit it without state mutation."""
-        group_id = str(payload.get("group_id", "") or "")
-        if not group_id:
-            raise RuntimeError("sem_groupby async classify returned no group_id")
-
-        event = SemEvent(
-            key=str(payload.get("key", "") or ""),
-            payload=str(payload.get("payload", "") or ""),
-            seq_id=int(payload.get("event_seq_id", 0)),
-            event_time_ms=payload.get("event_time_ms"),
-            metadata=dict(payload.get("metadata", {}) or {}),
-            boundary_flags=dict(payload.get("boundary_flags", {}) or {}),
-        )
-        confidence = float(payload.get("confidence", 0.0))
-        label = str(payload.get("label", "") or "")
-
-        meta = self._meta.value() or {}
-        meta["total_assigned"] = int(meta.get("total_assigned", 0)) + 1
-        self._meta.update(meta)
-
-        if not scope_close_pending and not stale_scope_result:
-            if self._group_profiles.contains(group_id):
-                self._update_group(group_id, event, now_ms)
-                if label:
-                    profile = self._group_profiles.get(group_id)
-                    if profile is not None:
-                        profile["label"] = label
-                        self._group_profiles.put(group_id, profile)
-            else:
-                profile = _new_group_profile(
-                    group_id,
-                    label or " ".join(event.payload.split()[:5]),
-                    now_ms,
-                )
-                profile["event_count"] = 1
-                self._group_profiles.put(group_id, profile)
-
-        return self._assignment_row(event, group_id, confidence, "async_assign")
-
-    def _handle_async_result(
-        self, result_dict: Dict[str, Any], now_ms: int
-    ) -> Iterable[Dict[str, Any]]:
-        """Merge one async assignment result back into state."""
-        result = AsyncResult.from_dict(result_dict) if "success" in result_dict else None
-        if result is None or not result.success:
-            error = result_dict.get("error", "async_classify_failed")
-            raise RuntimeError(f"sem_groupby async classify failed: {error}")
-
-        payload = result.result or {}
-        scope_close_pending = bool(payload.get("scope_close_pending", False))
-        result_scope_epoch = int(payload.get("scope_epoch", 0) or 0)
-        current_scope_epoch = int((self._meta.value() or {}).get("scope_epoch", 0) or 0)
-        stale_scope_result = result_scope_epoch != current_scope_epoch
-
-        assignments = payload.get("assignments")
-        if isinstance(assignments, list):
-            for assignment in assignments:
-                assignment_payload = dict(assignment)
-                assignment_payload.setdefault("key", str(result_dict.get("key", "")))
-                yield self._merge_one_async_assignment(
-                    assignment_payload,
-                    now_ms=now_ms,
-                    scope_close_pending=scope_close_pending,
-                    stale_scope_result=stale_scope_result,
-                )
-            return
-
-        single_payload = dict(payload)
-        single_payload.setdefault("key", str(result_dict.get("key", "")))
-        yield self._merge_one_async_assignment(
-            single_payload,
-            now_ms=now_ms,
-            scope_close_pending=scope_close_pending,
-            stale_scope_result=stale_scope_result,
-        )
 
     def _evict_n_oldest(self, n: int) -> int:
         """Evict the *n* least-recently-updated groups. Returns count evicted."""
@@ -1035,17 +1299,22 @@ class SemGroupbyFunction(KeyedProcessFunction):
     def _run_maintenance(self, meta: Dict[str, Any], now_ms: int) -> None:
         """Run local maintenance for operator-owned grouping.
 
-        Current behaviour is intentionally narrow:
-        - perform a local greedy merge of highly similar groups
-        - record maintenance heartbeat metadata
-        - do not reassign historical events
+        Rule/embedding variants use local maintenance.
+        llm_refine uses a real semantic refinement pass.
         """
-        merge_count = self._merge_similar_groups(now_ms)
-        if self._config.refresh_labels_during_maintenance:
-            self._refresh_group_labels()
+        rename_count = 0
+        if self._resolved_variant == "llm_refine":
+            split_count, merge_count, rename_count = self._refine_groups_with_llm(now_ms)
+        else:
+            split_count = self._split_mixed_groups(now_ms)
+            merge_count = self._merge_similar_groups(now_ms)
+            if self._config.refresh_labels_during_maintenance:
+                rename_count = self._refresh_group_labels()
         meta["last_refine_ms"] = now_ms
         meta["refine_count"] = int(meta.get("refine_count", 0)) + 1
+        meta["last_split_count"] = split_count
         meta["last_merge_count"] = merge_count
+        meta["last_rename_count"] = rename_count
         if self._metrics:
             self._metrics.record_recompute()
 
@@ -1058,30 +1327,42 @@ class SemGroupbyFunction(KeyedProcessFunction):
         key: str,
     ) -> Iterable[Any]:
         """Finalize one scope and optionally flush pending async assignments."""
-        self._run_maintenance(meta, now_ms)
         pending = self._pending_event_values()
         if pending:
-            output = self._emit_async_assignment_work(
-                key=key,
-                events=pending,
-                meta=meta,
-                scope_close_pending=True,
-                scope_close_reason=reason,
-            )
             self._clear_pending_events()
-            self._reset_scope_state(meta, reason=reason)
-            self._meta.update(meta)
-            yield output
-            return
+            yield from self._assign_with_llm_events(pending, now_ms, meta=meta)
+        self._run_maintenance(meta, now_ms)
         self._reset_scope_state(meta, reason=reason)
         self._meta.update(meta)
 
     def _maintenance_merge_threshold(self) -> float:
         return resolve_groupby_maintenance_merge_threshold(
-            assignment_method=self._resolved_assignment_method,
+            variant=self._resolved_variant,
             assign_threshold=self._resolved_assign_threshold,
             new_group_threshold=self._resolved_new_group_threshold,
         )
+
+    def _split_mixed_groups(self, now_ms: int) -> int:
+        groups: Dict[str, Dict[str, Any]] = {}
+        for group_id in self._group_profiles.keys():
+            profile = self._group_profiles.get(group_id)
+            if profile is not None:
+                groups[group_id] = dict(profile)
+        split_groups, split_count = split_group_profiles(
+            groups,
+            variant=self._resolved_variant,
+            encoder=self._encoder,
+            now_ms=now_ms,
+            max_examples=self._resolved_max_group_examples,
+            rule_threshold=self._config.local_rule_split_seed_similarity_threshold,
+            embedding_threshold=self._config.local_embedding_split_seed_similarity_threshold,
+        )
+        for group_id in list(self._group_profiles.keys()):
+            if group_id not in split_groups:
+                self._group_profiles.remove(group_id)
+        for group_id, profile in split_groups.items():
+            self._group_profiles.put(group_id, profile)
+        return split_count
 
     def _merge_similar_groups(self, now_ms: int) -> int:
         groups: Dict[str, Dict[str, Any]] = {}
@@ -1091,11 +1372,12 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 groups[group_id] = dict(profile)
         merged_groups, _merged_into, merge_count = merge_similar_group_profiles(
             groups,
-            assignment_method=self._resolved_assignment_method,
+            variant=self._resolved_variant,
             encoder=self._encoder,
             assign_threshold=self._resolved_assign_threshold,
             new_group_threshold=self._resolved_new_group_threshold,
             now_ms=now_ms,
+            max_examples=self._resolved_max_group_examples,
         )
         for group_id in list(self._group_profiles.keys()):
             if group_id not in merged_groups:
@@ -1104,15 +1386,151 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._group_profiles.put(group_id, profile)
         return merge_count
 
-    def _refresh_group_labels(self) -> None:
+    def _refresh_group_labels(self) -> int:
         groups: Dict[str, Dict[str, Any]] = {}
         for group_id in self._group_profiles.keys():
             profile = self._group_profiles.get(group_id)
             if profile is not None:
                 groups[group_id] = dict(profile)
         relabeled = relabel_group_profiles(groups)
+        rename_count = 0
         for group_id, profile in relabeled.items():
+            previous = self._group_profiles.get(group_id)
+            if previous is not None and str(previous.get("label", "")) != str(profile.get("label", "")):
+                rename_count += 1
             self._group_profiles.put(group_id, profile)
+        return rename_count
+
+    def _refine_groups_with_llm(self, now_ms: int) -> Tuple[int, int, int]:
+        """Run one true semantic refinement pass over current groups."""
+        if self._client is None:
+            raise RuntimeError("sem_groupby llm_refine runtime is not initialized")
+        groups: List[Dict[str, Any]] = []
+        for group_id in self._group_profiles.keys():
+            profile = self._group_profiles.get(group_id)
+            if profile is None:
+                continue
+            groups.append(
+                {
+                    "group_id": group_id,
+                    "label": str(profile.get("label", "") or ""),
+                    "summary": str(profile.get("summary", "") or ""),
+                    "event_count": int(profile.get("event_count", 0)),
+                    "examples": list(profile.get("examples", [])),
+                }
+            )
+        if not groups:
+            return 0, 0, 0
+        refine_plan = evaluate_sem_group_refine_sync(
+            client=self._client,
+            intent=self._query_spec.semantic.instruction if self._query_spec is not None else "Refine semantic groups.",
+            groups=groups,
+        )
+        split_count = self._apply_llm_splits(refine_plan["splits"], now_ms)
+        merge_count = self._apply_llm_merges(refine_plan["merges"], now_ms)
+        rename_count = self._apply_llm_renames(refine_plan["renames"])
+        return split_count, merge_count, rename_count
+
+    def _apply_llm_splits(self, splits: List[Dict[str, Any]], now_ms: int) -> int:
+        """Apply semantic split operations using retained examples."""
+        split_count = 0
+        for split in splits:
+            group_id = str(split["group_id"])
+            profile = self._group_profiles.get(group_id)
+            if profile is None:
+                raise RuntimeError(f"sem_groupby llm_refine split referenced missing group_id={group_id!r}")
+            children = list(split["children"])
+            total_count = max(int(profile.get("event_count", 0)), len(children))
+            source_created_ms = int(profile.get("created_ms", now_ms))
+            source_examples = [str(item) for item in profile.get("examples", []) if str(item).strip()]
+            self._group_profiles.remove(group_id)
+            allocated = 0
+            for index, child in enumerate(children):
+                child_label = str(child["label"])
+                child_examples = [str(item) for item in child["examples"] if str(item).strip()]
+                child_group_id = group_id if index == 0 else self._new_group_id()
+                child_profile = _new_group_profile(child_group_id, child_label, now_ms)
+                child_profile["created_ms"] = source_created_ms
+                child_profile["last_update_ms"] = now_ms
+                child_profile["examples"] = child_examples[-self._resolved_max_group_examples :]
+                child_profile["summary"] = _profile_summary_from_examples(
+                    child_profile["examples"],
+                    max_examples=self._resolved_max_group_examples,
+                )
+                if index == len(children) - 1:
+                    child_count = max(1, total_count - allocated)
+                else:
+                    proportion = len(child_examples) / max(len(source_examples), 1)
+                    child_count = max(1, int(round(total_count * proportion)))
+                    allocated += child_count
+                child_profile["event_count"] = child_count
+                self._group_profiles.put(child_group_id, child_profile)
+            split_count += 1
+        return split_count
+
+    def _apply_llm_merges(self, merges: List[Dict[str, Any]], now_ms: int) -> int:
+        """Apply semantic merge operations."""
+        merge_count = 0
+        for merge in merges:
+            target_group_id = str(merge["target_group_id"])
+            source_group_ids = [str(group_id) for group_id in merge["source_group_ids"]]
+            if not self._group_profiles.contains(target_group_id):
+                raise RuntimeError(
+                    f"sem_groupby llm_refine merge referenced missing target_group_id={target_group_id!r}"
+                )
+            for source_group_id in source_group_ids:
+                if source_group_id == target_group_id:
+                    continue
+                if not self._group_profiles.contains(source_group_id):
+                    raise RuntimeError(
+                        f"sem_groupby llm_refine merge referenced missing source_group_id={source_group_id!r}"
+                    )
+                groups = {
+                    group_id: dict(self._group_profiles.get(group_id))
+                    for group_id in list(self._group_profiles.keys())
+                    if self._group_profiles.get(group_id) is not None
+                }
+                apply_group_merge(
+                    groups,
+                    target_group_id,
+                    source_group_id,
+                    now_ms,
+                    max_examples=self._resolved_max_group_examples,
+                )
+                for group_id in list(self._group_profiles.keys()):
+                    if group_id not in groups:
+                        self._group_profiles.remove(group_id)
+                for group_id, profile in groups.items():
+                    self._group_profiles.put(group_id, profile)
+                merge_count += 1
+            label = str(merge.get("label", "") or "")
+            if label:
+                target_profile = self._group_profiles.get(target_group_id)
+                if target_profile is not None:
+                    target_profile["label"] = label
+                    self._group_profiles.put(target_group_id, target_profile)
+        return merge_count
+
+    def _apply_llm_renames(self, renames: List[Dict[str, Any]]) -> int:
+        """Apply semantic rename operations."""
+        rename_count = 0
+        for rename in renames:
+            group_id = str(rename["group_id"])
+            profile = self._group_profiles.get(group_id)
+            if profile is None:
+                raise RuntimeError(f"sem_groupby llm_refine rename referenced missing group_id={group_id!r}")
+            label = str(rename["label"])
+            if str(profile.get("label", "")) != label:
+                rename_count += 1
+            profile["label"] = label
+            self._group_profiles.put(group_id, profile)
+        return rename_count
+
+    def _new_group_id(self) -> str:
+        """Allocate one compact group identifier."""
+        import uuid
+
+        return uuid.uuid4().hex[:8]
 
     def _register_scope_close_timer(
         self,
@@ -1150,8 +1568,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
         )
 
     def _reset_scope_state(self, meta: Dict[str, Any], *, reason: str) -> None:
-        for group_id in list(self._group_profiles.keys()):
-            self._group_profiles.remove(group_id)
+        if self._resolved_persistence_policy == "reset_per_scope":
+            for group_id in list(self._group_profiles.keys()):
+                self._group_profiles.remove(group_id)
         clear_timer_registration(meta, TimerCategory.FLUSH)
         meta.pop("pending_scope_close_reason", None)
         meta["scope_epoch"] = int(meta.get("scope_epoch", 0) or 0) + 1

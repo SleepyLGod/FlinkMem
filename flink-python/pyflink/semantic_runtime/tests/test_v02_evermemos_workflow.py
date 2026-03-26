@@ -33,7 +33,6 @@ from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_clie
 from pyflink.semantic_runtime.runtime.async_bridge import AsyncResult, AsyncWorkItem
 from pyflink.semantic_runtime.runtime.continuous_rag_components import (
     _AnswerSynthesiser,
-    _ClassifyAsyncMergeFunction,
     _GroupbyToAggEnvelope,
     _RetrievalEnvelopeExpander,
     _RetrievalToAnswerEnvelope,
@@ -220,6 +219,77 @@ class _DeterministicClassifyAsyncFn(AsyncFunction):
                 },
             ).to_dict()
         ]
+
+
+class _DeterministicGroupbyLLMClient:
+    @staticmethod
+    def _parse_json_block(prompt: str, start_marker: str, end_marker: str) -> Any:
+        start = prompt.index(start_marker) + len(start_marker)
+        end = prompt.index(end_marker, start)
+        return json.loads(prompt[start:end].strip())
+
+    async def call(self, prompt: str):
+        if "Events to assign:\n" in prompt:
+            existing_groups = self._parse_json_block(
+                prompt,
+                "Existing groups:\n",
+                "\n\nEvents to assign:\n",
+            )
+            events = self._parse_json_block(
+                prompt,
+                "Events to assign:\n",
+                "\n\nFor each event, either assign it to one existing group_id or create one new group.\n",
+            )
+            group_ids = {str(item.get("group_id", "")): item for item in existing_groups}
+            assignments: List[Dict[str, Any]] = []
+            for event in events:
+                text = str(event.get("payload", "")).lower()
+                chosen_group_id = ""
+                chosen_label = ""
+                if "travel" in text or "flight" in text or "hotel" in text:
+                    chosen_group_id = next((gid for gid in group_ids if "travel" in gid or "travel" in str(group_ids[gid].get("label", "")).lower()), "")
+                    chosen_label = "travel topic"
+                elif "budget" in text or "project" in text or "risk" in text:
+                    chosen_group_id = next((gid for gid in group_ids if "project" in gid or "project" in str(group_ids[gid].get("label", "")).lower()), "")
+                    chosen_label = "project topic"
+                else:
+                    chosen_label = "general topic"
+                assignments.append(
+                    {
+                        "event_seq_id": int(event.get("seq_id", 0)),
+                        "decision": "existing" if chosen_group_id else "new",
+                        "group_id": chosen_group_id,
+                        "label": "" if chosen_group_id else chosen_label,
+                        "confidence": 0.88,
+                        "reason": "deterministic test client",
+                    }
+                )
+            return json.dumps({"assignments": assignments}), {}
+
+        if "Current groups:\n" in prompt:
+            groups = self._parse_json_block(
+                prompt,
+                "Current groups:\n",
+                "\n\nRefine the current grouping state. You may rename groups, merge groups, and split groups.\n",
+            )
+            renames: List[Dict[str, str]] = []
+            for group in groups:
+                label = str(group.get("label", ""))
+                if not label.strip():
+                    summary = str(group.get("summary", "")).lower()
+                    if "travel" in summary:
+                        label = "travel topic"
+                    elif "project" in summary or "budget" in summary:
+                        label = "project topic"
+                    else:
+                        label = "general topic"
+                    renames.append({"group_id": str(group.get("group_id", "")), "label": label})
+            return json.dumps({"renames": renames, "merges": [], "splits": []}), {}
+
+        raise RuntimeError("Unexpected sem_groupby prompt in deterministic test client")
+
+    def close(self):
+        return None
 
     def timeout(self, value):
         work = AsyncWorkItem.from_dict(value)
@@ -697,7 +767,7 @@ def _build_use_case_events() -> List[Dict[str, Any]]:
 def _build_configs():
     window_cfg = SemWindowConfig(max_window_events=4, window_timeout_ms=60_000)
     groupby_cfg = SemGroupbyConfig(
-        assignment_method="llm",
+        variant="llm_basic",
         max_groups_per_key=16,
         confidence_threshold=0.95,
         new_group_creation_threshold=0.1,
@@ -768,12 +838,12 @@ def _merge_with_async(
 def _run_memory_path(
     events: List[Dict[str, Any]],
     agg_mode: str,
-    classify_async_fn: Optional[AsyncFunction],
     summarize_async_fn: Optional[AsyncFunction],
     *,
     groupby_config: Optional[SemGroupbyConfig] = None,
     groupby_query_spec: Optional[GroupbyQuerySpec] = None,
     agg_query_spec: Optional[AggQuerySpec] = None,
+    groupby_llm_config: Optional[LLMClientConfig] = None,
 ) -> List[Dict[str, Any]]:
     key = "user_001"
     window_cfg, groupby_cfg, _, _, _ = _build_configs()
@@ -789,10 +859,13 @@ def _run_memory_path(
         groupby_cfg,
         query_spec=groupby_query_spec,
         input_kind="window_snapshot",
+        llm_config=groupby_llm_config,
     )
     if isinstance(sem_groupby, SemGroupbyFunction):
         sem_groupby._group_profiles = _FakeMapState()
         sem_groupby._meta = _FakeValueState(None)
+    if getattr(groupby_cfg, "variant", "") in {"llm_basic", "llm_refine"}:
+        sem_groupby._client = _DeterministicGroupbyLLMClient()
 
     sem_agg = build_sem_agg_operator(
         agg_cfg,
@@ -804,7 +877,6 @@ def _run_memory_path(
     sem_agg._agg_value = _FakeValueState(None)
     sem_agg._meta = _FakeValueState(None)
 
-    classify_merge = _ClassifyAsyncMergeFunction()
     to_agg = _GroupbyToAggEnvelope()
     summarize_merge = _SummarizeAsyncMergeFunction()
 
@@ -828,17 +900,8 @@ def _run_memory_path(
         grouped_main.extend(main)
         grouped_side.extend(side)
 
-    grouped_merged = _merge_with_async(
-        grouped_main,
-        grouped_side,
-        classify_merge,
-        classify_async_fn,
-        "classify",
-        key,
-    )
-
     agg_inputs: List[Dict[str, Any]] = []
-    for row in grouped_merged:
+    for row in grouped_main:
         agg_inputs.extend(list(to_agg.process_element(row, to_agg_ctx)))
 
     agg_main: List[Dict[str, Any]] = []
@@ -1132,11 +1195,10 @@ def test_v02_workflow_lotus_inspired_contract_and_counts():
     events = _build_use_case_events()
     query_count = sum(1 for e in events if e.get("stream_type") == "query_request")
 
-    classify_fn = _DeterministicClassifyAsyncFn()
     summarize_fn = _DeterministicSummarizeAsyncFn()
     retrieve_fn = _DeterministicRetrieveAsyncFn()
 
-    memory_rows = _run_memory_path(events, agg_mode="algebraic", classify_async_fn=classify_fn, summarize_async_fn=summarize_fn)
+    memory_rows = _run_memory_path(events, agg_mode="algebraic", summarize_async_fn=summarize_fn)
     retrieval_rows = _run_retrieval_path(events, retrieve_async_fn=retrieve_fn)
     answer_rows = _run_answer_path(retrieval_rows)
     answer_rows_again = _run_answer_path(retrieval_rows)
@@ -1194,7 +1256,7 @@ def test_v02_workflow_lotus_inspired_contract_and_counts():
                 src = metadata.get("group_source")
                 if src:
                     group_sources.add(src)
-    assert "async_assign" in group_sources
+    assert "llm_basic" in group_sources or "local" in group_sources
     assert any(str(r.get("source", "")).startswith("async_retrieve") for r in retrieval_rows)
 
 
@@ -1273,7 +1335,6 @@ def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
     memory_rows = _run_memory_path(
         events,
         agg_mode="summarize",
-        classify_async_fn=_DeterministicClassifyAsyncFn(),
         summarize_async_fn=_DeterministicSummarizeAsyncFn(),
     )
     assert any(r.get("mode") == "summarize_async" for r in memory_rows)
@@ -1289,7 +1350,6 @@ def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
         _run_memory_path(
             events,
             agg_mode="summarize",
-            classify_async_fn=_DeterministicClassifyAsyncFn(),
             summarize_async_fn=None,
         )
     except ValueError as exc:
@@ -1298,23 +1358,21 @@ def test_v02_workflow_summarize_and_missing_async_worker_fails_fast():
         raise AssertionError("Expected missing summarize async worker to fail fast")
 
 
-def test_v02_workflow_groupby_async_assignment_window_owned_scope_close():
+def test_v02_workflow_groupby_sync_assignment_window_scope_close():
     events = _build_use_case_events()
-    classify_fn = _DeterministicClassifyAsyncFn()
     groupby_qs = GroupbyQuerySpec.simple(
         "Group memory events by topic",
     )
     groupby_qs.maintenance_trigger_policy = TriggerPolicy(mode="on_scope_close")
     groupby_cfg = SemGroupbyConfig(
-        assignment_method="llm",
-        scope_chunk_size=2,
+        variant="llm_basic",
+        assignment_batch_size=2,
         refresh_labels_during_maintenance=True,
     )
 
     memory_rows = _run_memory_path(
         events,
         agg_mode="algebraic",
-        classify_async_fn=classify_fn,
         summarize_async_fn=None,
         groupby_config=groupby_cfg,
         groupby_query_spec=groupby_qs,
@@ -1335,7 +1393,6 @@ def test_v02_workflow_agg_query_spec_count_threshold():
     memory_rows = _run_memory_path(
         events,
         agg_mode="summarize",
-        classify_async_fn=_DeterministicClassifyAsyncFn(),
         summarize_async_fn=_DeterministicSummarizeAsyncFn(),
         agg_query_spec=agg_qs,
     )
@@ -1356,7 +1413,6 @@ def test_v02_workflow_agg_operator_owned_semantic_scope_close():
     memory_rows = _run_memory_path(
         events,
         agg_mode="algebraic",
-        classify_async_fn=_DeterministicClassifyAsyncFn(),
         summarize_async_fn=None,
         agg_query_spec=agg_qs,
     )
@@ -1393,14 +1449,12 @@ def main() -> None:
     events = _build_use_case_events()
 
     if args.mode == "mock":
-        classify_fn = _DeterministicClassifyAsyncFn()
         summarize_fn = _DeterministicSummarizeAsyncFn()
         retrieve_fn = _DeterministicRetrieveAsyncFn()
         try:
             memory_rows = _run_memory_path(
                 events,
                 agg_mode="summarize",
-                classify_async_fn=classify_fn,
                 summarize_async_fn=summarize_fn,
             )
             retrieval_rows = _run_retrieval_path(events, retrieve_async_fn=retrieve_fn)
@@ -1425,13 +1479,12 @@ def main() -> None:
             print(f"artifact_json: {json_path}")
             print(f"artifact_md:   {md_path}")
         finally:
-            _close_workers(classify_fn, summarize_fn, retrieve_fn)
+            _close_workers(summarize_fn, retrieve_fn)
         return
 
     env_info = _try_load_env_file(args.env_file)
     llm_cfg = _build_real_llm_config(args)
     retrieval_corpus = _build_retrieval_corpus(events)
-    classify_fn = _RealClassifyAsyncFn(llm_cfg)
     summarize_fn = _RealSummarizeAsyncFn(llm_cfg)
     retrieve_fn = _RealRetrieveAsyncFn(llm_cfg, retrieval_corpus)
 
@@ -1439,7 +1492,6 @@ def main() -> None:
         memory_rows = _run_memory_path(
             events,
             agg_mode="summarize",
-            classify_async_fn=classify_fn,
             summarize_async_fn=summarize_fn,
         )
         retrieval_rows = _run_retrieval_path(events, retrieve_async_fn=retrieve_fn)
@@ -1471,7 +1523,7 @@ def main() -> None:
             f"{sum(1 for row in answer_rows if row.get('answer_failed'))}"
         )
     finally:
-        _close_workers(classify_fn, summarize_fn, retrieve_fn)
+        _close_workers(summarize_fn, retrieve_fn)
 
 
 if __name__ == "__main__":

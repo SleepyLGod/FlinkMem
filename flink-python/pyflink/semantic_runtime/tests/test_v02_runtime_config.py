@@ -93,9 +93,30 @@ class TestRuntimeConfig:
             }
         )
         bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
+        assert bundle.lowering_plan.lowering_kind == "native_runtime"
+        assert bundle.query_spec.semantic.backend == "hybrid"
+
+    def test_groupby_runtime_bundle_reset_per_scope_lowers_to_classical_groupby(self):
+        cfg = RuntimeConfig.from_dict(
+            {
+                "operators": {
+                    "sem_groupby": {
+                        "query_spec": {
+                            "semantic": {
+                                "instruction": "label records",
+                                "output_mode": "label",
+                            },
+                        },
+                        "kernel": {
+                            "persistence_policy": "reset_per_scope",
+                        },
+                    }
+                }
+            }
+        )
+        bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
         assert bundle.lowering_plan.lowering_kind == "derived_attribute_then_classical"
         assert bundle.lowering_plan.classical_operator == "groupby"
-        assert bundle.query_spec.semantic.backend == "hybrid"
 
     def test_agg_runtime_bundle_preserves_native_reduce_view(self):
         cfg = RuntimeConfig.from_dict(

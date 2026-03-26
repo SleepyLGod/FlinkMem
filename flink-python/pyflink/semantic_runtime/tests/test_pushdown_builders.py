@@ -214,7 +214,7 @@ def test_apply_sem_groupby_pushdown_builds_native_label_then_flat_map() -> None:
             "operators": {
                 "sem_groupby": {
                     "query_spec": {},
-                    "kernel": {"assignment_method": "rule", "confidence_threshold": 0.5},
+                    "kernel": {"variant": "rule", "confidence_threshold": 0.5},
                 }
             }
         }

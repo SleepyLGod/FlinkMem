@@ -244,18 +244,30 @@ def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
     assert kwargs["runtime_config"].__class__.__name__ == "RuntimeConfig"
 
 
-def test_apply_sem_groupby_from_request_uses_pushdown_for_window(monkeypatch) -> None:
+def test_apply_sem_groupby_from_request_uses_native_runtime_for_window_by_default(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_apply_sem_groupby_pushdown(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
+    sentinel.window_snapshots = _FakeDataStream()
+    sentinel.grouped_stream = _FakeDataStream()
+
+    def fake_materialize_window_stream(*args, **kwargs):
+        captured["materialize_args"] = args
+        return sentinel.window_snapshots
+
+    def fake_key_by(self, selector):
+        captured["key_by_input"] = self
+        return self
+
+    def fake_process(self, op):
+        captured["process_op"] = op
         return sentinel.grouped_stream
 
     monkeypatch.setattr(
-        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_groupby_pushdown",
-        fake_apply_sem_groupby_pushdown,
+        "pyflink.semantic_runtime.runtime.facade_builders.materialize_window_stream",
+        fake_materialize_window_stream,
     )
+    monkeypatch.setattr(_FakeDataStream, "key_by", fake_key_by, raising=False)
+    monkeypatch.setattr(_FakeDataStream, "process", fake_process, raising=False)
 
     result = facade_builders.apply_sem_groupby_from_request(
         sentinel.input_ds,
@@ -264,10 +276,11 @@ def test_apply_sem_groupby_from_request_uses_pushdown_for_window(monkeypatch) ->
     )
 
     assert result is sentinel.grouped_stream
-    assert captured["args"] == (sentinel.input_ds,)
+    assert captured["materialize_args"] == (sentinel.input_ds,)
+    assert captured["key_by_input"] is sentinel.window_snapshots
+    assert captured["process_op"].__class__.__name__ == "SemGroupbyFunction"
 
-
-def test_apply_sem_groupby_from_request_materializes_native_window(monkeypatch) -> None:
+def test_apply_sem_groupby_from_request_window_reset_per_scope_uses_pushdown(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_materialize_window_stream(*args, **kwargs):
@@ -296,9 +309,11 @@ def test_apply_sem_groupby_from_request_materializes_native_window(monkeypatch) 
                         "scope_policy": {
                             "window_kind": "tumbling",
                             "window_size_ms": 1000,
-                        }
+                        },
                     },
-                    "kernel": {},
+                    "kernel": {
+                        "persistence_policy": "reset_per_scope",
+                    },
                 }
             }
         }

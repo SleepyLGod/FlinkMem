@@ -15,6 +15,7 @@ if not _sem_runtime_dst.exists():
 
 import json
 import time
+import asyncio
 
 import pytest
 
@@ -138,6 +139,46 @@ class _FakeContext:
 
     def timer_service(self):
         return self._timer
+
+
+class _FakeGroupbyLLMClient:
+    def __init__(self, payload: dict | list[dict]):
+        if isinstance(payload, list):
+            self._payloads = list(payload)
+        else:
+            self._payloads = [payload]
+
+    async def call(self, prompt: str):
+        if not self._payloads:
+            raise RuntimeError("fake groupby LLM client exhausted payloads")
+        payload = self._payloads.pop(0)
+        return json.dumps(payload), {}
+
+    def close(self):
+        return None
+
+
+class _ConcurrentFakeGroupbyLLMClient:
+    def __init__(self, payloads: list[dict], delay_s: float = 0.02):
+        self._payloads = list(payloads)
+        self._delay_s = delay_s
+        self.max_in_flight = 0
+        self._in_flight = 0
+
+    async def call(self, prompt: str):
+        if not self._payloads:
+            raise RuntimeError("fake groupby LLM client exhausted payloads")
+        payload = self._payloads.pop(0)
+        self._in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            await asyncio.sleep(self._delay_s)
+            return json.dumps(payload), {}
+        finally:
+            self._in_flight -= 1
+
+    def close(self):
+        return None
 
 
 def _split_outputs(items):
@@ -357,9 +398,9 @@ class TestGroupbyQuerySpec:
         assert func._resolved_assign_threshold == 0.95
         assert func._resolved_new_group_threshold == 0.1
 
-    def test_invalid_internal_scope_chunk_size(self):
-        with pytest.raises(ValueError, match="scope_chunk_size"):
-            SemGroupbyConfig(scope_chunk_size=0)
+    def test_invalid_internal_assignment_batch_size(self):
+        with pytest.raises(ValueError, match="assignment_batch_size"):
+            SemGroupbyConfig(assignment_batch_size=0)
 
     def test_runtime_assign_threshold_used_by_process_path(self):
         cfg = SemGroupbyConfig(
@@ -388,7 +429,7 @@ class TestGroupbyQuerySpec:
                 return 0.9 if "beta" in right else 0.1
 
         func = SemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, assignment_method="embedding"),
+            SemGroupbyConfig(max_groups_per_key=10, variant="embedding"),
             GroupbyQuerySpec(),
         )
         func._encoder = _StubEncoder()
@@ -402,19 +443,30 @@ class TestGroupbyQuerySpec:
 
     def test_execution_plan_auto_resolves_operator_owned(self):
         plan = resolve_groupby_execution_plan(GroupbyQuerySpec())
-        assert plan.execution_path == "operator_owned"
+        assert plan.scope_source == "internal_scope"
+        assert plan.persistence_policy == "persistent_across_scopes"
 
     def test_execution_plan_auto_window_snapshot_resolves_window_owned(self):
         plan = resolve_groupby_execution_plan(
             GroupbyQuerySpec(),
             input_kind="window_snapshot",
         )
-        assert plan.execution_path == "window_owned"
+        assert plan.scope_source == "external_window"
+        assert plan.persistence_policy == "persistent_across_scopes"
 
     def test_builder_window_owned_returns_bounded_runtime(self):
         spec = GroupbyQuerySpec()
         op = build_sem_groupby_operator(
             SemGroupbyConfig(),
+            spec,
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, SemGroupbyFunction)
+
+    def test_builder_window_snapshot_reset_per_scope_returns_bounded_runtime(self):
+        spec = GroupbyQuerySpec()
+        op = build_sem_groupby_operator(
+            SemGroupbyConfig(persistence_policy="reset_per_scope"),
             spec,
             input_kind="window_snapshot",
         )
@@ -474,24 +526,23 @@ class TestGroupbyQuerySpec:
         )
         assert isinstance(op, SemGroupbyFunction)
 
-    def test_builder_window_owned_rejects_maintenance_trigger(self):
-        import pytest
-        with pytest.raises(NotImplementedError, match="maintenance_trigger_policy.mode='on_scope_close'"):
-            spec = GroupbyQuerySpec(
-                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
-            )
-            build_sem_groupby_operator(
-                SemGroupbyConfig(),
-                spec,
-                input_kind="window_snapshot",
-            )
+    def test_builder_window_snapshot_default_returns_continuous_runtime(self):
+        spec = GroupbyQuerySpec(
+            maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=1000),
+        )
+        op = build_sem_groupby_operator(
+            SemGroupbyConfig(),
+            spec,
+            input_kind="window_snapshot",
+        )
+        assert isinstance(op, SemGroupbyFunction)
 
-    def test_builder_window_owned_accepts_on_scope_close_maintenance(self):
+    def test_builder_window_snapshot_reset_per_scope_accepts_on_scope_close_maintenance(self):
         spec = GroupbyQuerySpec(
             maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
         )
         op = build_sem_groupby_operator(
-            SemGroupbyConfig(),
+            SemGroupbyConfig(persistence_policy="reset_per_scope"),
             spec,
             input_kind="window_snapshot",
         )
@@ -501,7 +552,7 @@ class TestGroupbyQuerySpec:
         func = WindowOwnedSemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="rule",
+                variant="rule",
                 confidence_threshold=0.5,
             ),
             GroupbyQuerySpec(),
@@ -532,7 +583,7 @@ class TestGroupbyQuerySpec:
                 return 0.9 if "beta" in right else 0.1
 
         func = WindowOwnedSemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, assignment_method="embedding"),
+            SemGroupbyConfig(max_groups_per_key=10, variant="embedding"),
             GroupbyQuerySpec(),
         )
         func._encoder = _StubEncoder()
@@ -580,7 +631,7 @@ class TestGroupbyQuerySpec:
         func = WindowOwnedSemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="rule",
+                variant="rule",
                 confidence_threshold=0.85,
             ),
             GroupbyQuerySpec(
@@ -605,14 +656,28 @@ class TestGroupbyQuerySpec:
         assert group_ids[0] == group_ids[1]
         assert group_ids[2] != group_ids[0]
 
-    def test_operator_owned_llm_new_group_emits_async_verify(self):
+    def test_operator_owned_llm_new_group_assigns_sync(self):
         func = SemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, assignment_method="llm"),
+            SemGroupbyConfig(max_groups_per_key=10, variant="llm_basic"),
             GroupbyQuerySpec(),
         )
         func._group_profiles = _FakeMapState({})
         func._meta = _FakeValueState({"total_assigned": 0, "key": "k"})
         func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "assignments": [
+                    {
+                        "event_seq_id": 1,
+                        "decision": "new",
+                        "group_id": "",
+                        "label": "brand new topic",
+                        "confidence": 0.9,
+                        "reason": "new group",
+                    }
+                ]
+            }
+        )
         outs = list(
             func.process_element(
                 SemEvent(key="k", payload="brand new topic", seq_id=1).to_dict(),
@@ -620,16 +685,30 @@ class TestGroupbyQuerySpec:
             )
         )
         main, side = _split_outputs(outs)
-        assert len(main) == 0
-        assert len(side) == 1
-        payload = side[0]["payload"]
-        assert "event" in payload
-        assert "existing_groups" in payload
+        assert len(side) == 0
+        assert len(main) == 1
+        assert main[0]["source"] == "llm_basic"
+        assert len(list(func._group_profiles.keys())) == 1
 
-    def test_window_owned_llm_new_group_emits_async_verify(self):
+    def test_window_owned_llm_new_group_assigns_sync(self):
         func = WindowOwnedSemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, assignment_method="llm", scope_chunk_size=3),
+            SemGroupbyConfig(max_groups_per_key=10, variant="llm_basic", assignment_batch_size=3),
             GroupbyQuerySpec(),
+            llm_config=object(),
+        )
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "assignments": [
+                    {
+                        "event_seq_id": 1,
+                        "decision": "new",
+                        "group_id": "",
+                        "label": "brand new topic",
+                        "confidence": 0.8,
+                        "reason": "new group",
+                    }
+                ]
+            }
         )
         snapshot = {
             "key": "k",
@@ -642,26 +721,44 @@ class TestGroupbyQuerySpec:
         }
         outs = list(func.process_element(snapshot, _FakeContext("k")))
         main, side = _split_outputs(outs)
-        assert len(main) == 0
-        assert len(side) == 1
-        payload = side[0]["payload"]
-        assert "events" in payload
-        assert payload["existing_groups"] == []
-        assert payload["scope_chunk_size"] == 3
-        assert payload["scope_close_pending"] is True
+        assert len(side) == 0
+        assert len(main) == 1
+        assert main[0]["source"] == "llm_basic"
 
-    def test_operator_owned_llm_chunk_size_batches_events(self):
+    def test_operator_owned_llm_assignment_batch_size_batches_events(self):
         func = SemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="llm",
-                scope_chunk_size=2,
+                variant="llm_basic",
+                assignment_batch_size=2,
             ),
             GroupbyQuerySpec(),
         )
         func._group_profiles = _FakeMapState({})
         func._meta = _FakeValueState({"total_assigned": 0, "key": "k", "scope_epoch": 0})
         func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "assignments": [
+                    {
+                        "event_seq_id": 1,
+                        "decision": "new",
+                        "group_id": "",
+                        "label": "project kickoff",
+                        "confidence": 0.9,
+                        "reason": "new group",
+                    },
+                    {
+                        "event_seq_id": 2,
+                        "decision": "new",
+                        "group_id": "",
+                        "label": "travel hotel",
+                        "confidence": 0.9,
+                        "reason": "new group",
+                    },
+                ]
+            }
+        )
 
         first = list(
             func.process_element(
@@ -680,19 +777,97 @@ class TestGroupbyQuerySpec:
             )
         )
         second_main, second_side = _split_outputs(second)
-        assert second_main == []
-        assert len(second_side) == 1
-        payload = second_side[0]["payload"]
-        assert "events" in payload
-        assert len(payload["events"]) == 2
-        assert payload["scope_chunk_size"] == 2
+        assert second_side == []
+        assert len(second_main) == 2
+        assert {row["event_seq_id"] for row in second_main} == {1, 2}
 
-    def test_operator_owned_llm_scope_close_flushes_pending_chunk_without_state_rebuild(self):
+    def test_external_window_llm_assignment_dispatches_chunks_concurrently(self):
         func = SemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="llm",
-                scope_chunk_size=5,
+                variant="llm_basic",
+                assignment_batch_size=2,
+            ),
+            GroupbyQuerySpec(
+                scope_policy=GroupbyScopePolicy(window_kind="tumbling", window_size_ms=1000),
+            ),
+            scope_source="external_window",
+        )
+        func._group_profiles = _FakeMapState({})
+        func._scope_progress = _FakeMapState({})
+        func._meta = _FakeValueState({"total_assigned": 0, "key": "k", "scope_epoch": 0})
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        func._client = _ConcurrentFakeGroupbyLLMClient(
+            payloads=[
+                {
+                    "assignments": [
+                        {
+                            "event_seq_id": 1,
+                            "decision": "new",
+                            "group_id": "",
+                            "label": "alpha one",
+                            "confidence": 0.9,
+                            "reason": "new group",
+                        },
+                        {
+                            "event_seq_id": 2,
+                            "decision": "new",
+                            "group_id": "",
+                            "label": "alpha two",
+                            "confidence": 0.9,
+                            "reason": "new group",
+                        },
+                    ]
+                },
+                {
+                    "assignments": [
+                        {
+                            "event_seq_id": 3,
+                            "decision": "new",
+                            "group_id": "",
+                            "label": "beta one",
+                            "confidence": 0.9,
+                            "reason": "new group",
+                        },
+                        {
+                            "event_seq_id": 4,
+                            "decision": "new",
+                            "group_id": "",
+                            "label": "beta two",
+                            "confidence": 0.9,
+                            "reason": "new group",
+                        },
+                    ]
+                },
+            ],
+            delay_s=0.02,
+        )
+        snapshot = {
+            "key": "k",
+            "window_id": "w1",
+            "trigger_reason": "fire",
+            "close_time_ms": 1000,
+            "events": [
+                {"key": "k", "payload": "alpha one", "seq_id": 1, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "alpha two", "seq_id": 2, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "beta one", "seq_id": 3, "metadata": {}, "boundary_flags": {}},
+                {"key": "k", "payload": "beta two", "seq_id": 4, "metadata": {}, "boundary_flags": {}},
+            ],
+        }
+
+        outs = list(func.process_element(snapshot, _FakeContext("k")))
+        main, side = _split_outputs(outs)
+        assert side == []
+        assert len(main) == 4
+        assert func._client.max_in_flight >= 2
+
+    def test_operator_owned_llm_scope_close_flushes_pending_chunk(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="llm_basic",
+                assignment_batch_size=5,
+                persistence_policy="reset_per_scope",
             ),
             GroupbyQuerySpec(
                 trigger_policy=TriggerPolicy(mode="on_event"),
@@ -705,6 +880,20 @@ class TestGroupbyQuerySpec:
         })
         func._meta = _FakeValueState({"total_assigned": 0, "key": "k", "scope_epoch": 0})
         func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "assignments": [
+                    {
+                        "event_seq_id": 1,
+                        "decision": "existing",
+                        "group_id": "g_existing",
+                        "label": "",
+                        "confidence": 0.9,
+                        "reason": "same group",
+                    }
+                ]
+            }
+        )
 
         outs = list(
             func.process_element(
@@ -718,37 +907,11 @@ class TestGroupbyQuerySpec:
             )
         )
         main, side = _split_outputs(outs)
-        assert main == []
-        assert len(side) == 1
-        assert side[0]["payload"]["scope_close_pending"] is True
+        assert side == []
+        assert len(main) == 1
+        assert main[0]["group_id"] == "g_existing"
         assert len(list(func._group_profiles.keys())) == 0
         assert func._meta.value()["scope_epoch"] == 1
-
-        merged = list(
-            func._handle_async_result(
-                {
-                    "task_type": "classify",
-                    "key": "k",
-                    "success": True,
-                    "result": {
-                        "assignments": [
-                            {
-                                "group_id": "g_existing",
-                                "confidence": 0.9,
-                                "event_seq_id": 1,
-                                "payload": "project budget",
-                            }
-                        ],
-                        "scope_epoch": 0,
-                        "scope_close_pending": True,
-                    },
-                },
-                2000,
-            )
-        )
-        assert len(merged) == 1
-        assert merged[0]["group_id"] == "g_existing"
-        assert len(list(func._group_profiles.keys())) == 0
 
     def test_operator_owned_periodic_maintenance_updates_meta(self):
         class _TimerService:
@@ -820,7 +983,7 @@ class TestGroupbyQuerySpec:
         func = SemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="rule",
+                variant="rule",
                 confidence_threshold=0.85,
             ),
             GroupbyQuerySpec(
@@ -885,7 +1048,7 @@ class TestGroupbyQuerySpec:
         func = SemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="rule",
+                variant="rule",
                 confidence_threshold=0.85,
             ),
             GroupbyQuerySpec(
@@ -934,7 +1097,7 @@ class TestGroupbyQuerySpec:
         func = SemGroupbyFunction(
             SemGroupbyConfig(
                 max_groups_per_key=10,
-                assignment_method="llm",
+                variant="llm_basic",
                 refresh_labels_during_maintenance=True,
             ),
             GroupbyQuerySpec(
@@ -950,6 +1113,20 @@ class TestGroupbyQuerySpec:
         })
         func._meta = _FakeValueState(None)
         func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "assignments": [
+                    {
+                        "event_seq_id": 1,
+                        "decision": "existing",
+                        "group_id": "g1",
+                        "label": "",
+                        "confidence": 0.95,
+                        "reason": "same group",
+                    }
+                ]
+            }
+        )
 
         ctx = _Ctx()
         list(func.process_element(
@@ -963,9 +1140,160 @@ class TestGroupbyQuerySpec:
         assert profile["label"] != "stale label"
         assert "alpha" in profile["label"].lower()
 
+    def test_operator_owned_llm_refine_periodic_applies_merge_and_rename(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="llm_refine",
+            ),
+            GroupbyQuerySpec(
+                maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
+            ),
+        )
+        func._group_profiles = _FakeMapState({
+            "g_existing": {
+                **_new_group_profile("g_existing", "old alpha", 100),
+                "summary": "alpha budget planning",
+                "examples": ["alpha budget planning", "alpha roadmap"],
+                "event_count": 2,
+            },
+            "g_merge": {
+                **_new_group_profile("g_merge", "travel old", 200),
+                "summary": "travel hotel booking",
+                "examples": ["travel hotel booking", "travel itinerary"],
+                "event_count": 2,
+            },
+            "g_new_1": {
+                **_new_group_profile("g_new_1", "fresh travel", 300),
+                "summary": "travel reimbursement",
+                "examples": ["travel reimbursement"],
+                "event_count": 1,
+            },
+        })
+        func._meta = _FakeValueState({"key": "k", "scope_epoch": 0})
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "renames": [{"group_id": "g_existing", "label": "alpha refined"}],
+                "merges": [
+                    {
+                        "target_group_id": "g_merge",
+                        "source_group_ids": ["g_merge", "g_new_1"],
+                        "label": "travel merged",
+                    }
+                ],
+                "splits": [],
+            }
+        )
+        meta = func._meta.value()
+        func._run_maintenance(meta, now_ms=1000)
+        func._meta.update(meta)
+
+        assert set(func._group_profiles.keys()) == {"g_existing", "g_merge"}
+        assert func._group_profiles.get("g_existing")["label"] == "alpha refined"
+        merged = func._group_profiles.get("g_merge")
+        assert merged["label"] == "travel merged"
+        assert merged["event_count"] == 3
+        assert func._meta.value()["last_merge_count"] == 1
+        assert func._meta.value()["last_rename_count"] == 1
+
+    def test_window_owned_llm_refine_scope_close_applies_split(self):
+        func = WindowOwnedSemGroupbyFunction(
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="llm_refine",
+            ),
+            GroupbyQuerySpec(
+                maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
+            ),
+        )
+        func._client = _FakeGroupbyLLMClient(
+            {
+                "renames": [],
+                "merges": [],
+                "splits": [
+                    {
+                        "group_id": "g_new_1",
+                        "children": [
+                            {
+                                "label": "alpha budget",
+                                "examples": ["alpha budget planning"],
+                            },
+                            {
+                                "label": "alpha roadmap",
+                                "examples": ["alpha roadmap next quarter"],
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        func._new_group_id = lambda: "g_new_2"
+        groups = {
+            "g_new_1": {
+                **_new_group_profile("g_new_1", "mixed alpha", 100),
+                "summary": "alpha budget planning\nalpha roadmap next quarter",
+                "examples": ["alpha budget planning", "alpha roadmap next quarter"],
+                "event_count": 2,
+            },
+        }
+        func._apply_llm_refine(groups)
+        assert set(groups.keys()) == {"g_new_1", "g_new_2"}
+        assert groups["g_new_1"]["label"] == "alpha budget"
+        assert groups["g_new_2"]["label"] == "alpha roadmap"
+
+    def test_external_window_persistent_across_scopes_processes_only_new_scope_events(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="rule",
+            ),
+            GroupbyQuerySpec(),
+        )
+        func._group_profiles = _FakeMapState({})
+        func._pending_events = _FakeListState()
+        func._scope_progress = _FakeMapState({})
+        func._meta = _FakeValueState(None)
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+
+        ctx = _FakeContext("k")
+        first_snapshot = {
+            "window_id": "w1",
+            "key": "k",
+            "trigger_reason": "on_event",
+            "events": [
+                SemEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
+                SemEvent(key="k", payload="alpha roadmap", seq_id=2).to_dict(),
+            ],
+        }
+        second_snapshot = {
+            "window_id": "w1",
+            "key": "k",
+            "trigger_reason": "on_event",
+            "events": [
+                SemEvent(key="k", payload="alpha planning", seq_id=1).to_dict(),
+                SemEvent(key="k", payload="alpha roadmap", seq_id=2).to_dict(),
+                SemEvent(key="k", payload="alpha budget", seq_id=3).to_dict(),
+            ],
+        }
+
+        first_rows = list(func.process_element(first_snapshot, ctx))
+        second_rows = list(func.process_element(second_snapshot, ctx))
+
+        assert len(first_rows) == 2
+        assert len(second_rows) == 1
+        assert second_rows[0]["event_seq_id"] == 3
+        progress = func._scope_progress.get("w1")
+        assert progress["seen_event_seq_ids"] == [1, 2, 3]
+        assert func._meta.value()["total_assigned"] == 3
+
     def test_operator_owned_semantic_on_scope_close_resets_group_state(self):
         func = SemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, assignment_method="rule"),
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="rule",
+                persistence_policy="reset_per_scope",
+            ),
             GroupbyQuerySpec(
                 trigger_policy=TriggerPolicy(mode="on_event"),
                 maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
@@ -1019,7 +1347,11 @@ class TestGroupbyQuerySpec:
                 return self._ts
 
         func = SemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, assignment_method="rule"),
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="rule",
+                persistence_policy="reset_per_scope",
+            ),
             GroupbyQuerySpec(
                 trigger_policy=TriggerPolicy(mode="on_event"),
                 maintenance_trigger_policy=TriggerPolicy(mode="on_scope_close"),
@@ -1060,10 +1392,19 @@ class TestSemLoweringPlans:
         assert plan.lowering_kind == "native_runtime"
         assert plan.derived_attribute is None
 
-    def test_groupby_window_owned_lowers_to_label_plus_groupby(self):
+    def test_groupby_window_snapshot_default_stays_native(self):
         plan = resolve_groupby_lowering_plan(
             GroupbyQuerySpec(),
             input_kind="window_snapshot",
+        )
+        assert plan.lowering_kind == "native_runtime"
+        assert plan.derived_attribute is None
+
+    def test_groupby_window_reset_per_scope_lowers_to_label_plus_groupby(self):
+        plan = resolve_groupby_lowering_plan(
+            GroupbyQuerySpec(),
+            input_kind="window_snapshot",
+            persistence_policy="reset_per_scope",
         )
         assert plan.lowering_kind == "derived_attribute_then_classical"
         assert plan.classical_operator == "groupby"

@@ -18,7 +18,7 @@ from pyflink.semantic_runtime.runtime.plans import (
     lower_sem_topk_request,
 )
 from pyflink.semantic_runtime.runtime.prompt_templates import (
-    build_sem_groupby_scope_prompt,
+    build_sem_group_assign_prompt,
 )
 from pyflink.semantic_runtime.runtime.pushdown.common import (
     parse_candidate_pool,
@@ -26,12 +26,13 @@ from pyflink.semantic_runtime.runtime.pushdown.common import (
     parse_window_snapshot,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
-    _ASYNC_ASSIGNMENT_METHODS,
-    _LOCAL_ASSIGNMENT_METHODS,
+    _LLM_GROUPBY_VARIANTS,
+    _LOCAL_GROUPBY_VARIANTS,
+    _append_profile_example,
     _new_group_profile,
     merge_similar_group_profiles,
     relabel_group_profiles,
-    resolve_groupby_assignment_method,
+    resolve_groupby_variant,
     resolve_groupby_runtime_params,
     score_group_profile,
 )
@@ -82,21 +83,23 @@ def apply_groupby_maintenance(
     *,
     groups: Dict[str, Dict[str, Any]],
     assignment_rows: List[Dict[str, Any]],
-    assignment_method: str,
+    variant: str,
     encoder: HashingTextEncoder,
     assign_threshold: float,
     new_group_threshold: float,
     refresh_labels_during_maintenance: bool,
+    max_examples: int,
 ) -> List[Dict[str, Any]]:
     """Apply bounded-scope group maintenance and rewrite merged group ids."""
     now_ms = int(time.time() * 1000)
     groups, merged_into, _merge_count = merge_similar_group_profiles(
         groups,
-        assignment_method=assignment_method,
+        variant=variant,
         encoder=encoder,
         assign_threshold=assign_threshold,
         new_group_threshold=new_group_threshold,
         now_ms=now_ms,
+        max_examples=max_examples,
     )
     if refresh_labels_during_maintenance:
         groups = relabel_group_profiles(groups)
@@ -131,11 +134,11 @@ class WindowOwnedLocalGroupbyLabeler(MapFunction):
             self._assign_threshold,
             self._new_group_threshold,
         ) = resolve_groupby_runtime_params(config, query_spec)
-        self._assignment_method = resolve_groupby_assignment_method(config, query_spec)
+        self._variant = resolve_groupby_variant(config, query_spec)
         self._encoder = HashingTextEncoder(dim=128)
-        if self._assignment_method not in _LOCAL_ASSIGNMENT_METHODS:
+        if self._variant not in _LOCAL_GROUPBY_VARIANTS:
             raise ValueError(
-                f"window-owned sem_groupby pushdown local path requires local assignment method, got {self._assignment_method!r}"
+                f"window-owned sem_groupby pushdown local path requires local variant, got {self._variant!r}"
             )
 
     def map(self, value: Any) -> Dict[str, Any]:
@@ -153,7 +156,7 @@ class WindowOwnedLocalGroupbyLabeler(MapFunction):
                 score = score_group_profile(
                     event.payload,
                     profile,
-                    assignment_method=self._assignment_method,
+                    variant=self._variant,
                     encoder=self._encoder,
                 )
                 if score > best_score:
@@ -164,6 +167,7 @@ class WindowOwnedLocalGroupbyLabeler(MapFunction):
                 profile = groups[best_group_id]
                 profile["event_count"] = int(profile.get("event_count", 0)) + 1
                 profile["last_update_ms"] = now_ms
+                _append_profile_example(profile, event.payload, max_examples=int(self._config.max_group_examples))
                 rows.append(
                     groupby_assignment_row(
                         event,
@@ -189,6 +193,7 @@ class WindowOwnedLocalGroupbyLabeler(MapFunction):
             group_id = uuid4_hex()
             profile = _new_group_profile(group_id, " ".join(event.payload.split()[:5]), now_ms)
             profile["event_count"] = 1
+            _append_profile_example(profile, event.payload, max_examples=int(self._config.max_group_examples))
             groups[group_id] = profile
             rows.append(
                 groupby_assignment_row(
@@ -206,11 +211,12 @@ class WindowOwnedLocalGroupbyLabeler(MapFunction):
             rows = apply_groupby_maintenance(
                 groups=groups,
                 assignment_rows=rows,
-                assignment_method=self._assignment_method,
+                variant=self._variant,
                 encoder=self._encoder,
                 assign_threshold=self._assign_threshold,
                 new_group_threshold=self._new_group_threshold,
                 refresh_labels_during_maintenance=self._config.refresh_labels_during_maintenance,
+                max_examples=int(self._config.max_group_examples),
             )
         return {"assignments": rows}
 
@@ -257,8 +263,8 @@ class WindowOwnedAsyncGroupbyLabeler(AsyncFunction):
 
         groups: Dict[str, Dict[str, Any]] = {}
         rows: List[Dict[str, Any]] = []
-        chunk_size = max(1, int(self._config.scope_chunk_size))
-        prompt_template = build_sem_groupby_scope_prompt(self._intent)
+        chunk_size = max(1, int(self._config.assignment_batch_size))
+        prompt_template = build_sem_group_assign_prompt(self._intent)
 
         for chunk in chunk_items(events, chunk_size):
             prompt = prompt_template.format(
@@ -272,19 +278,34 @@ class WindowOwnedAsyncGroupbyLabeler(AsyncFunction):
                 events=json.dumps([event.to_dict() for event in chunk], ensure_ascii=False),
             )
             text, _metrics = await self._client.call(prompt)
-            chunk_result = self._parse_groupby_chunk_result(text, chunk)
+            chunk_result = self._parse_groupby_chunk_result(
+                text,
+                chunk,
+                existing_group_ids=list(groups.keys()),
+            )
             now_ms = int(time.time() * 1000)
             for item in chunk_result:
                 event = item["event"]
                 group_id = item["group_id"]
-                if group_id not in groups:
+                if item["decision"] == "new":
+                    group_id = uuid4_hex()
                     profile = _new_group_profile(group_id, item["label"], now_ms)
                     profile["event_count"] = 1
+                    _append_profile_example(
+                        profile,
+                        event.payload,
+                        max_examples=int(self._config.max_group_examples),
+                    )
                     groups[group_id] = profile
                 else:
                     profile = groups[group_id]
                     profile["event_count"] = int(profile.get("event_count", 0)) + 1
                     profile["last_update_ms"] = now_ms
+                    _append_profile_example(
+                        profile,
+                        event.payload,
+                        max_examples=int(self._config.max_group_examples),
+                    )
                 rows.append(
                     groupby_assignment_row(
                         event,
@@ -301,38 +322,42 @@ class WindowOwnedAsyncGroupbyLabeler(AsyncFunction):
         raise TimeoutError("sem_groupby pushdown timed out")
 
     @staticmethod
-    def _parse_groupby_chunk_result(text: str, chunk: List[SemEvent]) -> List[Dict[str, Any]]:
+    def _parse_groupby_chunk_result(
+        text: str,
+        chunk: List[SemEvent],
+        *,
+        existing_group_ids: List[str],
+    ) -> List[Dict[str, Any]]:
         """Parse and validate one chunk assignment result."""
+        from pyflink.semantic_runtime.runtime.steps.sem_group_assign import (
+            parse_sem_group_assignments,
+        )
+
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError("sem_groupby pushdown expected valid JSON output") from exc
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("assignments"), list):
-            raise ValueError("sem_groupby pushdown expected assignments list")
-
         by_seq = {event.seq_id: event for event in chunk}
+        normalized_assignments = parse_sem_group_assignments(
+            parsed,
+            existing_group_ids=existing_group_ids,
+        )
         seen: set[int] = set()
         normalized: List[Dict[str, Any]] = []
-        for raw in parsed["assignments"]:
-            if not isinstance(raw, dict):
-                raise ValueError("sem_groupby pushdown expected assignment objects")
-            if "event_seq_id" not in raw or "group_id" not in raw or "confidence" not in raw:
-                raise ValueError("sem_groupby pushdown assignment is missing required fields")
+        for raw in normalized_assignments:
             seq_id = int(raw["event_seq_id"])
             if seq_id not in by_seq:
                 raise ValueError("sem_groupby pushdown returned assignment for unknown event_seq_id")
             if seq_id in seen:
                 raise ValueError("sem_groupby pushdown returned duplicate event assignment")
             seen.add(seq_id)
-            group_id = str(raw["group_id"]).strip()
-            if not group_id:
-                raise ValueError("sem_groupby pushdown returned empty group_id")
             normalized.append(
                 {
                     "event": by_seq[seq_id],
-                    "group_id": group_id,
+                    "decision": str(raw["decision"]),
+                    "group_id": str(raw["group_id"]).strip(),
                     "confidence": float(raw["confidence"]),
-                    "label": str(raw.get("label", group_id)),
+                    "label": str(raw.get("label", "")).strip(),
                 }
             )
         if seen != set(by_seq.keys()):
@@ -484,13 +509,13 @@ def apply_sem_groupby_pushdown(
     if plan.input_kind != "window_snapshot":
         raise ValueError("sem_groupby pushdown requires window context")
 
-    assignment_method = resolve_groupby_assignment_method(plan.kernel_config, plan.query_spec)
-    if assignment_method in _LOCAL_ASSIGNMENT_METHODS:
+    variant = resolve_groupby_variant(plan.kernel_config, plan.query_spec)
+    if variant in _LOCAL_GROUPBY_VARIANTS:
         envelopes = input_stream.map(
             WindowOwnedLocalGroupbyLabeler(config=plan.kernel_config, query_spec=plan.query_spec),
             output_type=Types.PICKLED_BYTE_ARRAY(),
         )
-    elif assignment_method in _ASYNC_ASSIGNMENT_METHODS:
+    elif variant in _LLM_GROUPBY_VARIANTS:
         envelopes = AsyncDataStream.unordered_wait(
             input_stream,
             WindowOwnedAsyncGroupbyLabeler(
@@ -507,7 +532,7 @@ def apply_sem_groupby_pushdown(
             Types.PICKLED_BYTE_ARRAY(),
         )
     else:
-        raise ValueError(f"Unsupported sem_groupby pushdown assignment_method {assignment_method!r}")
+        raise ValueError(f"Unsupported sem_groupby pushdown variant {variant!r}")
 
     return envelopes.flat_map(
         GroupbyAssignmentsEmitter(),

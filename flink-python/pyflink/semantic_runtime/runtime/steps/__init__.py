@@ -7,6 +7,15 @@ from pyflink.semantic_runtime.runtime.steps.sem_continuity import (
     evaluate_summary_sem_continuity_sync,
     parse_sem_continuity,
 )
+from pyflink.semantic_runtime.runtime.steps.sem_group_assign import (
+    evaluate_sem_group_assignment_chunks_sync,
+    evaluate_sem_group_assignments_sync,
+    parse_sem_group_assignments,
+)
+from pyflink.semantic_runtime.runtime.steps.sem_group_refine import (
+    evaluate_sem_group_refine_sync,
+    parse_sem_group_refine_plan,
+)
 from pyflink.semantic_runtime.runtime.steps.sem_label import SemLabelFunction
 from pyflink.semantic_runtime.runtime.steps.sem_match import (
     SemMatchFunction,
@@ -47,6 +56,9 @@ __all__ = [
     "evaluate_all_history_sem_continuity_sync",
     "evaluate_pairwise_sem_continuity_sync",
     "evaluate_summary_sem_continuity_sync",
+    "evaluate_sem_group_assignments_sync",
+    "evaluate_sem_group_assignment_chunks_sync",
+    "evaluate_sem_group_refine_sync",
     "evaluate_sem_rerank_block",
     "evaluate_sem_rerank_block_sync",
     "evaluate_sem_score",
@@ -54,6 +66,8 @@ __all__ = [
     "evaluate_sem_score_block_payload",
     "evaluate_sem_score_block_sync",
     "parse_sem_continuity",
+    "parse_sem_group_assignments",
+    "parse_sem_group_refine_plan",
     "parse_sem_window_summary",
     "parse_sem_score",
     "parse_sem_score_block",

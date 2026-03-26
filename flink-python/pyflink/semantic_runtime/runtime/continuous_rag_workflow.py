@@ -109,6 +109,7 @@ class ContinuousRAGConfig:
     window_config: SemWindowConfig = field(default_factory=SemWindowConfig)
     groupby_config: SemGroupbyConfig = field(default_factory=SemGroupbyConfig)
     groupby_query_spec: Optional[GroupbyQuerySpec] = None
+    groupby_llm_config: Optional[LLMClientConfig] = None
     agg_config: SemAggConfig = field(default_factory=SemAggConfig)
     agg_query_spec: Optional[AggQuerySpec] = None
 
@@ -136,7 +137,6 @@ class ContinuousRAGConfig:
     # Async bridge workers (None = side outputs are discarded with warning)
     # These should be AsyncFunction instances that process AsyncWorkItem dicts
     # and return AsyncResult dicts.
-    classify_async_fn: Optional[Any] = None    # For sem_groupby side output
     summarize_async_fn: Optional[Any] = None   # For sem_agg side output
     retrieve_async_fn: Optional[Any] = None    # For sem_search side output
 
@@ -153,7 +153,6 @@ class ContinuousRAGConfig:
         answer_prompt_template: Optional[str] = None,
         answer_output_schema: Optional[Dict[str, type]] = None,
         key_selector: Callable = simple_key_selector,
-        classify_async_fn: Optional[Any] = None,
         summarize_async_fn: Optional[Any] = None,
         retrieve_async_fn: Optional[Any] = None,
         workflow_version: str = "v0.2.0",
@@ -190,7 +189,7 @@ class ContinuousRAGConfig:
             key_selector=key_selector,
             async_timeout_ms=runtime_config.defaults.async_timeout_ms,
             async_capacity=runtime_config.defaults.async_capacity,
-            classify_async_fn=classify_async_fn,
+            groupby_llm_config=runtime_config.to_llm_client_config(),
             summarize_async_fn=summarize_async_fn,
             retrieve_async_fn=retrieve_async_fn,
             workflow_version=workflow_version,
@@ -206,7 +205,6 @@ def build_continuous_rag_workflow_from_runtime_config(
     answer_prompt_template: Optional[str] = None,
     answer_output_schema: Optional[Dict[str, type]] = None,
     key_selector: Callable = simple_key_selector,
-    classify_async_fn: Optional[Any] = None,
     summarize_async_fn: Optional[Any] = None,
     retrieve_async_fn: Optional[Any] = None,
     workflow_version: str = "v0.2.0",
@@ -222,7 +220,6 @@ def build_continuous_rag_workflow_from_runtime_config(
             answer_prompt_template=answer_prompt_template,
             answer_output_schema=answer_output_schema,
             key_selector=key_selector,
-            classify_async_fn=classify_async_fn,
             summarize_async_fn=summarize_async_fn,
             retrieve_async_fn=retrieve_async_fn,
             workflow_version=workflow_version,
@@ -237,7 +234,7 @@ def build_memory_subflow(
 ) -> DataStream:
     """Subflow A: memory build pipeline.
 
-    ``memory_events → key_by → sem_window → sem_groupby (+ async bridge) → sem_agg (+ async bridge)``
+    ``memory_events → key_by → sem_window → sem_groupby → sem_agg (+ async bridge)``
 
     Parameters
     ----------
@@ -265,21 +262,11 @@ def build_memory_subflow(
             config.groupby_config,
             query_spec=config.groupby_query_spec,
             input_kind="window_snapshot",
+            llm_config=config.groupby_llm_config,
         ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
-
-    # Wire async bridge for sem_groupby classify side outputs
-    if _components._groupby_needs_classify_bridge(config):
-        grouped = _components._wire_async_bridge_if_configured(
-            grouped_raw,
-            config.classify_async_fn,
-            _components._ClassifyAsyncMergeFunction(),
-            "classify",
-            config,
-        )
-    else:
-        grouped = grouped_raw
+    grouped = grouped_raw
 
     grouped_for_agg = grouped.key_by(config.key_selector).process(
         _components._GroupbyToAggEnvelope(),
