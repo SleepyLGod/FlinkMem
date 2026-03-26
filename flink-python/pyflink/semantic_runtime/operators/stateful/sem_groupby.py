@@ -78,6 +78,21 @@ _VALID_GROUPBY_PERSISTENCE_POLICIES = {
     "persistent_across_scopes",
     "hybrid",
 }
+DEFAULT_GROUPBY_MAX_GROUPS_PER_KEY = 50
+DEFAULT_GROUPBY_ASSIGNMENT_BATCH_SIZE = 1
+DEFAULT_GROUPBY_CONFIDENCE_THRESHOLD = 0.7
+DEFAULT_GROUPBY_TTL_SECONDS = 3600
+DEFAULT_GROUPBY_EVICT_INTERVAL_MS = 60_000
+DEFAULT_GROUPBY_NEW_GROUP_CREATION_THRESHOLD = 0.3
+DEFAULT_GROUPBY_MAX_GROUP_EXAMPLES = 8
+DEFAULT_GROUPBY_RULE_SPLIT_SEED_SIMILARITY_THRESHOLD = 0.2
+DEFAULT_GROUPBY_EMBEDDING_SPLIT_SEED_SIMILARITY_THRESHOLD = 0.5
+GROUPBY_MERGE_THRESHOLD_EMBEDDING_FLOOR = 0.8
+GROUPBY_MERGE_THRESHOLD_GENERIC_FLOOR = 0.65
+GROUPBY_MIN_EXAMPLES_FOR_SPLIT = 4
+GROUPBY_LOCAL_ENCODER_DIM = 128
+GROUPBY_DERIVED_LABEL_TOKEN_LIMIT = 5
+GROUPBY_ID_HEX_CHARS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -165,19 +180,23 @@ class _GroupbyScopeRuntime:
 class SemGroupbyConfig:
     """Internal configuration for the semantic groupby operator."""
 
-    max_groups_per_key: int = 50
+    max_groups_per_key: int = DEFAULT_GROUPBY_MAX_GROUPS_PER_KEY
     variant: str = "rule"
     persistence_policy: Optional[str] = None
-    assignment_batch_size: int = 1
-    confidence_threshold: float = 0.7
-    ttl_seconds: int = 3600
-    evict_interval_ms: int = 60_000
-    new_group_creation_threshold: float = 0.3
+    assignment_batch_size: int = DEFAULT_GROUPBY_ASSIGNMENT_BATCH_SIZE
+    confidence_threshold: float = DEFAULT_GROUPBY_CONFIDENCE_THRESHOLD
+    ttl_seconds: int = DEFAULT_GROUPBY_TTL_SECONDS
+    evict_interval_ms: int = DEFAULT_GROUPBY_EVICT_INTERVAL_MS
+    new_group_creation_threshold: float = DEFAULT_GROUPBY_NEW_GROUP_CREATION_THRESHOLD
     refresh_labels_during_maintenance: bool = False
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
-    max_group_examples: int = 8
-    local_rule_split_seed_similarity_threshold: float = 0.2
-    local_embedding_split_seed_similarity_threshold: float = 0.5
+    max_group_examples: int = DEFAULT_GROUPBY_MAX_GROUP_EXAMPLES
+    local_rule_split_seed_similarity_threshold: float = (
+        DEFAULT_GROUPBY_RULE_SPLIT_SEED_SIMILARITY_THRESHOLD
+    )
+    local_embedding_split_seed_similarity_threshold: float = (
+        DEFAULT_GROUPBY_EMBEDDING_SPLIT_SEED_SIMILARITY_THRESHOLD
+    )
 
     def __post_init__(self) -> None:
         if self.variant not in _VALID_GROUPBY_VARIANTS:
@@ -347,8 +366,8 @@ def resolve_groupby_maintenance_merge_threshold(
 ) -> float:
     """Return the local similarity threshold used by maintenance/refinement."""
     if variant == "embedding":
-        return max(0.8, float(assign_threshold))
-    return max(0.65, float(new_group_threshold))
+        return max(GROUPBY_MERGE_THRESHOLD_EMBEDDING_FLOOR, float(assign_threshold))
+    return max(GROUPBY_MERGE_THRESHOLD_GENERIC_FLOOR, float(new_group_threshold))
 
 
 def merge_similar_group_profiles(
@@ -516,7 +535,7 @@ def _split_profile_examples(
 ) -> Optional[Tuple[list[str], list[str]]]:
     """Split one profile's examples into two semantic clusters when possible."""
     examples = [str(item) for item in profile.get("examples", []) if str(item).strip()]
-    if len(examples) < 4:
+    if len(examples) < GROUPBY_MIN_EXAMPLES_FOR_SPLIT:
         return None
 
     seed_left_text = examples[0]
@@ -681,6 +700,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._config,
             query_spec,
         )
+        if self._resolved_variant in _LLM_GROUPBY_VARIANTS and query_spec is None:
+            raise ValueError(
+                f"sem_groupby variant={self._resolved_variant!r} requires query_spec"
+            )
         self._resolved_persistence_policy = resolve_groupby_persistence_policy(
             self._config,
             scope_source=self._scope_source,
@@ -698,7 +721,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             )
             else None
         )
-        self._encoder = HashingTextEncoder(dim=128)
+        self._encoder = HashingTextEncoder(dim=GROUPBY_LOCAL_ENCODER_DIM)
         (
             self._resolved_ttl_seconds,
             self._resolved_max_groups_per_key,
@@ -1071,9 +1094,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
             if profile is not None
         ]
 
-    def _default_group_label(self, payload: str) -> str:
-        """Derive a simple local fallback label for one new group."""
-        return " ".join(str(payload).split()[:5]).strip()
+    def _derive_local_group_label(self, payload: str) -> str:
+        """Derive a local label for one newly created group."""
+        return " ".join(str(payload).split()[:GROUPBY_DERIVED_LABEL_TOKEN_LIMIT]).strip()
 
     def _split_assignment_chunks(
         self,
@@ -1118,7 +1141,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 self._update_group(group_id, event, now_ms)
                 yield self._assignment_row(event, group_id, confidence, self._resolved_variant)
                 continue
-            label = str(assignment.get("label", "") or self._default_group_label(event.payload))
+            label = str(assignment["label"])
             group_id = self._create_group_or_raise(event, now_ms, label=label)
             yield self._assignment_row(event, group_id, confidence, self._resolved_variant)
         if seen_seq_ids != set(events_by_seq_id.keys()):
@@ -1141,11 +1164,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             return
         existing_groups = self._existing_groups_payload()
         event_chunks = self._split_assignment_chunks(event_dicts)
-        intent = (
-            self._query_spec.semantic.instruction
-            if self._query_spec is not None
-            else "Assign tuples to semantic groups."
-        )
+        intent = self._query_spec.semantic.instruction
         if len(event_chunks) == 1:
             assignments = evaluate_sem_group_assignments_sync(
                 client=self._client,
@@ -1158,6 +1177,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 assignments=assignments,
                 now_ms=now_ms,
             )
+            if meta is not None:
+                meta["total_assigned"] = int(meta.get("total_assigned", 0)) + len(event_chunks[0])
+                self._meta.update(meta)
             return
 
         assignment_chunks = evaluate_sem_group_assignment_chunks_sync(
@@ -1212,7 +1234,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
         """Increment group counters and update timestamp."""
         profile = self._group_profiles.get(group_id)
         if profile is None:
-            return
+            raise RuntimeError(
+                f"sem_groupby assignment referenced missing group_id={group_id!r}"
+            )
         profile["event_count"] = profile.get("event_count", 0) + 1
         profile["last_update_ms"] = now_ms
         _append_profile_example(
@@ -1245,10 +1269,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 return None
 
         import uuid
-        group_id = uuid.uuid4().hex[:8]
+        group_id = uuid.uuid4().hex[:GROUPBY_ID_HEX_CHARS]
         profile = _new_group_profile(
             group_id,
-            label or self._default_group_label(event.payload),
+            label or self._derive_local_group_label(event.payload),
             now_ms,
         )
         profile["event_count"] = 1
@@ -1423,7 +1447,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             return 0, 0, 0
         refine_plan = evaluate_sem_group_refine_sync(
             client=self._client,
-            intent=self._query_spec.semantic.instruction if self._query_spec is not None else "Refine semantic groups.",
+            intent=self._query_spec.semantic.instruction,
             groups=groups,
         )
         split_count = self._apply_llm_splits(refine_plan["splits"], now_ms)
@@ -1530,7 +1554,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
         """Allocate one compact group identifier."""
         import uuid
 
-        return uuid.uuid4().hex[:8]
+        return uuid.uuid4().hex[:GROUPBY_ID_HEX_CHARS]
 
     def _register_scope_close_timer(
         self,

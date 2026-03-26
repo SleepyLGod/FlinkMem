@@ -82,6 +82,9 @@ logger = logging.getLogger(__name__)
 
 _VALID_INTERNAL_TOPK_SCORERS = {"llm", "embedding", "external_score"}
 _VALID_TOPK_PERSISTENCE_POLICIES = {"persistent_across_scopes", "reset_per_scope", "hybrid"}
+DEFAULT_TOPK_MAX_CANDIDATES = 100
+DEFAULT_TOPK_RECOMPUTE_INTERVAL_MS = 10_000
+DEFAULT_TOPK_TTL_SECONDS = 3600
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +124,9 @@ class SemTopKConfig:
         Whether ranked state resets per bounded scope or persists across scope
         updates. ``None`` means planner/runtime resolves the default.
     """
-    max_candidates: int = 100
-    recompute_interval_ms: int = 10_000  # timer-driven recompute
-    ttl_seconds: int = 3600
+    max_candidates: int = DEFAULT_TOPK_MAX_CANDIDATES
+    recompute_interval_ms: int = DEFAULT_TOPK_RECOMPUTE_INTERVAL_MS
+    ttl_seconds: int = DEFAULT_TOPK_TTL_SECONDS
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     emission_policy: str = "delta"       # "delta" | "snapshot"
     score_field: str = "score"           # field name in candidate record

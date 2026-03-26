@@ -29,13 +29,16 @@ from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, crea
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     _LOCAL_GROUPBY_VARIANTS,
     _LLM_GROUPBY_VARIANTS,
+    GROUPBY_DERIVED_LABEL_TOKEN_LIMIT,
+    GROUPBY_ID_HEX_CHARS,
+    GROUPBY_LOCAL_ENCODER_DIM,
     SemGroupbyConfig,
     _append_profile_example,
+    _profile_summary_from_examples,
     _new_group_profile,
     apply_group_merge,
     derive_group_label,
     merge_similar_group_profiles,
-    resolve_groupby_persistence_policy,
     resolve_groupby_runtime_params,
     resolve_groupby_variant,
     score_group_profile,
@@ -48,6 +51,7 @@ from pyflink.semantic_runtime.runtime.event_model import (
 )
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 from pyflink.semantic_runtime.runtime.steps import (
+    evaluate_sem_group_assignment_chunks_sync,
     evaluate_sem_group_assignments_sync,
     evaluate_sem_group_refine_sync,
 )
@@ -74,16 +78,16 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             self._resolved_new_group_threshold,
         ) = resolve_groupby_runtime_params(self._config, self._query_spec)
         self._resolved_variant = resolve_groupby_variant(self._config, query_spec)
-        self._resolved_persistence_policy = resolve_groupby_persistence_policy(
-            self._config,
-            scope_source="external_window",
-        )
+        if self._resolved_variant in _LLM_GROUPBY_VARIANTS and query_spec is None:
+            raise ValueError(
+                f"sem_groupby variant={self._resolved_variant!r} requires query_spec"
+            )
         self._resolved_assignment_batch_size = int(self._config.assignment_batch_size)
         self._resolved_max_group_examples = int(self._config.max_group_examples)
         self._maintenance_trigger_policy = (
             query_spec.maintenance_trigger_policy if query_spec is not None else None
         )
-        self._encoder = HashingTextEncoder(dim=128)
+        self._encoder = HashingTextEncoder(dim=GROUPBY_LOCAL_ENCODER_DIM)
         self._client: Optional[LLMClient] = None
 
     def open(self, runtime_context) -> None:
@@ -156,24 +160,38 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
 
         now_ms = int(time.time() * 1000)
         assignment_rows: List[Dict[str, Any]] = []
-        for start_index in range(0, len(events), self._resolved_assignment_batch_size):
-            chunk = events[start_index : start_index + self._resolved_assignment_batch_size]
-            existing_groups = [
-                {
-                    "group_id": group_id,
-                    "label": profile.get("label", ""),
-                    "summary": profile.get("summary", ""),
-                    "event_count": int(profile.get("event_count", 0)),
-                    "examples": list(profile.get("examples", [])),
-                }
-                for group_id, profile in groups.items()
+        event_chunks: List[List[SemEvent]] = [
+            events[index : index + self._resolved_assignment_batch_size]
+            for index in range(0, len(events), self._resolved_assignment_batch_size)
+        ]
+        existing_groups = [
+            {
+                "group_id": group_id,
+                "label": profile.get("label", ""),
+                "summary": profile.get("summary", ""),
+                "event_count": int(profile.get("event_count", 0)),
+                "examples": list(profile.get("examples", [])),
+            }
+            for group_id, profile in groups.items()
+        ]
+        if len(event_chunks) == 1:
+            assignment_chunks = [
+                evaluate_sem_group_assignments_sync(
+                    client=self._client,
+                    intent=self._resolve_intent(),
+                    existing_groups=existing_groups,
+                    events=[event.to_dict() for event in event_chunks[0]],
+                )
             ]
-            assignments = evaluate_sem_group_assignments_sync(
+        else:
+            assignment_chunks = evaluate_sem_group_assignment_chunks_sync(
                 client=self._client,
                 intent=self._resolve_intent(),
                 existing_groups=existing_groups,
-                events=[event.to_dict() for event in chunk],
+                event_chunks=[[event.to_dict() for event in chunk] for chunk in event_chunks],
             )
+
+        for chunk, assignments in zip(event_chunks, assignment_chunks):
             events_by_seq_id = {event.seq_id: event for event in chunk}
             seen_seq_ids = set()
             for assignment in assignments:
@@ -197,7 +215,7 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
                         self._assignment_row(event, group_id, confidence, self._resolved_variant)
                     )
                     continue
-                label = str(assignment.get("label", "") or self._default_group_label(event.payload))
+                label = str(assignment["label"])
                 group_id = self._create_group_or_raise(groups, event, now_ms, label=label)
                 assignment_rows.append(
                     self._assignment_row(event, group_id, confidence, self._resolved_variant)
@@ -307,7 +325,10 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
                 child_profile["created_ms"] = source_created_ms
                 child_profile["last_update_ms"] = now_ms
                 child_profile["examples"] = child_examples[-self._resolved_max_group_examples :]
-                child_profile["summary"] = "\n".join(child_profile["examples"])
+                child_profile["summary"] = _profile_summary_from_examples(
+                    child_profile["examples"],
+                    max_examples=self._resolved_max_group_examples,
+                )
                 if index == len(children) - 1:
                     child_count = max(1, total_count - allocated)
                 else:
@@ -417,10 +438,10 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             elif policy.name == "DROP_NEWEST":
                 return None
 
-        group_id = uuid.uuid4().hex[:8]
+        group_id = uuid.uuid4().hex[:GROUPBY_ID_HEX_CHARS]
         profile = _new_group_profile(
             group_id,
-            label or self._default_group_label(event.payload),
+            label or self._derive_local_group_label(event.payload),
             now_ms,
         )
         profile["event_count"] = 1
@@ -447,12 +468,12 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
             )
         return group_id
 
-    def _default_group_label(self, payload: str) -> str:
-        return " ".join(str(payload).split()[:5]).strip()
+    def _derive_local_group_label(self, payload: str) -> str:
+        return " ".join(str(payload).split()[:GROUPBY_DERIVED_LABEL_TOKEN_LIMIT]).strip()
 
     def _resolve_intent(self) -> str:
         if self._query_spec is None:
-            return "Assign tuples to semantic groups."
+            raise RuntimeError("sem_groupby LLM runtime requires query_spec semantic intent")
         return str(self._query_spec.semantic.instruction)
 
     @staticmethod
@@ -485,4 +506,4 @@ class WindowOwnedSemGroupbyFunction(KeyedProcessFunction):
 
     @staticmethod
     def _new_group_id() -> str:
-        return uuid.uuid4().hex[:8]
+        return uuid.uuid4().hex[:GROUPBY_ID_HEX_CHARS]

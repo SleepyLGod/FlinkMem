@@ -37,6 +37,9 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg import (
     resolve_agg_runtime_params,
 )
 
+COMPRESSIVE_MIN_EVENTS_FOR_TRUNCATION = 2
+COMPRESSIVE_KEEP_DIVISOR = 2
+
 
 class WindowOwnedSemAggFunction(KeyedProcessFunction):
     """Bounded/window-owned runtime for ``sem_agg``.
@@ -102,7 +105,10 @@ class WindowOwnedSemAggFunction(KeyedProcessFunction):
         return _aggregate_event_records(events, reduce_fn=self._config.reduce_fn)
 
     def _compress_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if len(events) <= 2:
+        if len(events) <= COMPRESSIVE_MIN_EVENTS_FOR_TRUNCATION:
             return events
-        keep = max(1, min(len(events), self._resolved_max_buffer_events // 2))
+        keep = max(
+            1,
+            min(len(events), self._resolved_max_buffer_events // COMPRESSIVE_KEEP_DIVISOR),
+        )
         return events[-keep:]

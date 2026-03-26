@@ -75,6 +75,11 @@ _VALID_AGG_PERSISTENCE_POLICIES = {
     "reset_per_scope",
     "hybrid",
 }
+DEFAULT_SEM_AGG_MAX_BUFFER_EVENTS = 100
+DEFAULT_SEM_AGG_FLUSH_INTERVAL_MS = 30_000
+DEFAULT_SEM_AGG_TTL_SECONDS = 3600
+DEFAULT_SEM_AGG_ASYNC_MAX_WORKERS = 20
+DEFAULT_SEM_AGG_ASYNC_POLL_INTERVAL_MS = 200
 
 
 @dataclass
@@ -153,14 +158,14 @@ class _AggScopeRuntime:
 class SemAggConfig:
     """Configuration for the semantic aggregation operator."""
     mode: str = "algebraic"
-    max_buffer_events: int = 100
-    flush_interval_ms: int = 30_000
-    ttl_seconds: int = 3600
+    max_buffer_events: int = DEFAULT_SEM_AGG_MAX_BUFFER_EVENTS
+    flush_interval_ms: int = DEFAULT_SEM_AGG_FLUSH_INTERVAL_MS
+    ttl_seconds: int = DEFAULT_SEM_AGG_TTL_SECONDS
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     persistence_policy: Optional[str] = None
     reduce_fn: Optional[Callable[[Dict, Dict], Dict]] = None
-    async_max_workers: int = 20
-    async_poll_interval_ms: int = 200
+    async_max_workers: int = DEFAULT_SEM_AGG_ASYNC_MAX_WORKERS
+    async_poll_interval_ms: int = DEFAULT_SEM_AGG_ASYNC_POLL_INTERVAL_MS
 
     def __post_init__(self) -> None:
         if (
@@ -311,11 +316,13 @@ class SemAggFunction(KeyedProcessFunction):
         cfg = SemAggConfig(mode="algebraic", reduce_fn=my_reduce)
         keyed.process(SemAggFunction(cfg))
 
-    Usage (summarize)::
+    Usage (summarize/compressive)::
 
         cfg = SemAggConfig(mode="summarize", max_buffer_events=50)
-        main_ds = keyed.process(SemAggFunction(cfg))
-        merged = build_async_bridge(main_ds, summarizer_fn, merge_fn, ...)
+        keyed.process(SemAggFunction(cfg))
+
+    Summarize/compressive modes run LLM updates through an internal async
+    executor and timer-driven polling in this state owner.
     """
 
     def __init__(

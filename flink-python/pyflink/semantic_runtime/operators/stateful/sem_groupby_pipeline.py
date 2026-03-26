@@ -98,9 +98,7 @@ def build_sem_groupby_operator(
             )
         if spec.maintenance_trigger_policy is not None:
             mode = spec.maintenance_trigger_policy.mode
-            if mode == "periodic":
-                pass
-            elif mode == "on_scope_close":
+            if mode == "on_scope_close":
                 close_capable = {"session", "tumbling", "semantic"}
                 if spec.scope_policy.window_kind not in close_capable:
                     raise NotImplementedError(
@@ -108,7 +106,7 @@ def build_sem_groupby_operator(
                         "maintenance_trigger_policy.mode='on_scope_close' only "
                         "for close-capable scopes: session, tumbling, semantic."
                     )
-            else:
+            elif mode != "periodic":
                 raise NotImplementedError(
                     "sem_groupby internal_scope path currently supports only "
                     "maintenance_trigger_policy.mode='periodic' or 'on_scope_close'."

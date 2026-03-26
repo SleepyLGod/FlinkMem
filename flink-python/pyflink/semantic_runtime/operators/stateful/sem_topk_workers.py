@@ -68,6 +68,8 @@ VALID_CONTEXTUAL_CLOSE_SURROGATES = {
     "epoch_close",
 }
 
+DEFAULT_LOCAL_EMBEDDING_DIM = 128
+
 
 def _require_contextual_chunk_size(topk_config: SemTopKConfig) -> int:
     """Return the explicit chunk size required by contextual top-k paths."""
@@ -171,9 +173,11 @@ def build_contextual_snapshot_query_spec(
     if plan.close_surrogate in {"none", "natural_close"}:
         return query_spec
     if plan.close_surrogate == "epoch_close":
+        if plan.epoch_ms is None or int(plan.epoch_ms) <= 0:
+            raise ValueError("topk_contextual_epoch_close_requires_positive_epoch_ms")
         eff_trigger = TriggerPolicy(
             mode="periodic",
-            interval_ms=int(plan.epoch_ms or topk_config.recompute_interval_ms or 1),
+            interval_ms=int(plan.epoch_ms),
             emit_intermediate=trigger.emit_intermediate,
             emit_final_on_scope_close=trigger.emit_final_on_scope_close,
         )
@@ -181,28 +185,35 @@ def build_contextual_snapshot_query_spec(
     if plan.close_surrogate == "periodic_snapshot":
         interval_ms = topk_config.recompute_interval_ms
         if interval_ms <= 0:
-            interval_ms = int((query_spec.scope_policy.ttl_seconds or 1) * 1000)
+            raise ValueError("topk_contextual_periodic_snapshot_requires_positive_recompute_interval_ms")
         eff_trigger = TriggerPolicy(
             mode="periodic",
-            interval_ms=max(1, int(interval_ms)),
+            interval_ms=int(interval_ms),
             emit_intermediate=trigger.emit_intermediate,
             emit_final_on_scope_close=trigger.emit_final_on_scope_close,
         )
         return replace(query_spec, trigger_policy=eff_trigger)
     if plan.close_surrogate == "idle_flush":
-        idle_ms = trigger.idle_ms or topk_config.recompute_interval_ms or 1000
+        if trigger.idle_ms is not None and int(trigger.idle_ms) > 0:
+            idle_ms = int(trigger.idle_ms)
+        elif topk_config.recompute_interval_ms > 0:
+            idle_ms = int(topk_config.recompute_interval_ms)
+        else:
+            raise ValueError("topk_contextual_idle_flush_requires_idle_ms_or_positive_recompute_interval_ms")
         eff_trigger = TriggerPolicy(
             mode="idle_flush",
-            idle_ms=max(1, int(idle_ms)),
+            idle_ms=idle_ms,
             emit_intermediate=trigger.emit_intermediate,
             emit_final_on_scope_close=trigger.emit_final_on_scope_close,
         )
         return replace(query_spec, trigger_policy=eff_trigger)
     if plan.close_surrogate == "count_threshold_snapshot":
-        count_threshold = trigger.count_threshold or max(1, query_spec.k)
+        if trigger.count_threshold is None or int(trigger.count_threshold) <= 0:
+            raise ValueError("topk_contextual_count_threshold_snapshot_requires_positive_count_threshold")
+        count_threshold = int(trigger.count_threshold)
         eff_trigger = TriggerPolicy(
             mode="count_threshold",
-            count_threshold=max(1, int(count_threshold)),
+            count_threshold=count_threshold,
             emit_intermediate=trigger.emit_intermediate,
             emit_final_on_scope_close=trigger.emit_final_on_scope_close,
         )
@@ -415,7 +426,9 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
     def _resolved_context_chunk_size(self, candidate_count: int) -> int:
         if self._rerank_chunk_size is None:
             raise ValueError("topk_contextual_rerank_chunk_size_is_required")
-        chunk_size = max(1, int(self._rerank_chunk_size))
+        chunk_size = int(self._rerank_chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("topk_contextual_rerank_chunk_size_must_be_positive")
         if candidate_count <= chunk_size:
             return candidate_count
         if chunk_size <= self._query_spec.k:
@@ -640,7 +653,7 @@ class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
     ) -> None:
         super().__init__(query_spec, "embedding", score_field, candidate_text_fields)
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
-        dim = int(self._embedding_config.dimensions or 128)
+        dim = int(self._embedding_config.dimensions or DEFAULT_LOCAL_EMBEDDING_DIM)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
 
     async def async_invoke(self, value):
@@ -796,7 +809,7 @@ class _BoundedPoolEmbeddingRerankerWorker(_BaseBoundedPoolRerankerWorker):
             rerank_chunk_size=rerank_chunk_size,
         )
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
-        dim = int(self._embedding_config.dimensions or 128)
+        dim = int(self._embedding_config.dimensions or DEFAULT_LOCAL_EMBEDDING_DIM)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
 
     def _candidate_text(self, value: Dict[str, Any]) -> str:
@@ -1046,7 +1059,7 @@ class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
             rerank_chunk_size=rerank_chunk_size,
         )
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
-        dim = int(self._embedding_config.dimensions or 128)
+        dim = int(self._embedding_config.dimensions or DEFAULT_LOCAL_EMBEDDING_DIM)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
 
     def _candidate_text(self, value: Dict[str, Any]) -> str:
