@@ -312,6 +312,7 @@ def window_snapshot_to_topk_pool(
         "candidates": candidates,
         "source": "window_snapshot",
         "window_id": snap.get("window_id", ""),
+        "scope_id": snap.get("window_id", ""),
     }
 
 

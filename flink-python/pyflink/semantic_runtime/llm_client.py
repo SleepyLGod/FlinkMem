@@ -59,7 +59,7 @@ class LLMCallMetrics:
 @dataclass
 class LLMClientConfig:
     """Serialisable configuration carried through cloudpickle."""
-    backend: str = "mock"                   # "mock" | "openai"
+    backend: str = "openai"                 # "mock" | "openai"
     model: str = "gpt-4o-mini"
     api_base: Optional[str] = None          # None → default endpoint
     api_key_env: str = "OPENAI_API_KEY"     # env-var name (not the key itself)
@@ -156,6 +156,10 @@ class OpenAILLMClient(LLMClient):
         assert self._session is not None
 
         api_key = os.environ.get(self._config.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(
+                f"LLM API key environment variable {self._config.api_key_env!r} is empty"
+            )
         base = self._config.api_base or "https://api.openai.com/v1"
         url = f"{base}/chat/completions"
         headers = {
@@ -245,4 +249,3 @@ def create_llm_client(config: LLMClientConfig) -> LLMClient:
         return OpenAILLMClient(config)
     else:
         raise ValueError(f"Unknown LLM backend: {config.backend!r}")
-

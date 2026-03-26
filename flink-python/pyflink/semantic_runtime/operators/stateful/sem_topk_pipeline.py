@@ -24,6 +24,7 @@ and path selection remains easy to audit.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from pyflink.common import Types
@@ -33,8 +34,19 @@ from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 from pyflink.semantic_runtime.runtime.event_model import retrieve_to_topk_items
-from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.operators.stateful.sem_topk import (
+    SemTopKConfig,
+    SemTopKFunction,
+    resolve_topk_persistence_policy,
+)
+from pyflink.semantic_runtime.operators.stateful.sem_topk_window import (
+    ScopedPersistentSemTopKFunction,
+)
 from pyflink.semantic_runtime.operators.stateful.sem_topk_scope_runtime import SemTopKScopeSnapshotFunction
+from pyflink.semantic_runtime.runtime.plans import (
+    SemLoweringPlan,
+    resolve_topk_lowering_plan,
+)
 from pyflink.semantic_runtime.operators.stateful.sem_topk_workers import (
     TopKContextualPlan,
     _BoundedPoolEmbeddingTopKSnapshotWorker,
@@ -52,6 +64,77 @@ from pyflink.semantic_runtime.operators.stateful.sem_topk_workers import (
     topk_candidate_has_score,
     topk_candidate_needs_scoring,
 )
+
+
+@dataclass(frozen=True)
+class TopKExecutionPlan:
+    """Resolved internal execution plan for ``sem_topk``."""
+
+    scope_source: str = "internal_scope"
+    persistence_policy: str = "persistent_across_scopes"
+    input_kind: str = "event_stream"
+    lowering_plan: Optional[SemLoweringPlan] = None
+
+
+def resolve_topk_execution_plan(
+    query_spec: Optional[TopKQuerySpec] = None,
+    *,
+    config: Optional[SemTopKConfig] = None,
+    input_kind: str = "event_stream",
+) -> TopKExecutionPlan:
+    """Resolve scope source and persistence policy for ``sem_topk``."""
+    spec = query_spec or TopKQuerySpec()
+    kernel_config = config or SemTopKConfig()
+    scope_source = "external_window" if input_kind == "window_snapshot" else "internal_scope"
+    persistence_policy = resolve_topk_persistence_policy(
+        kernel_config,
+        scope_source=scope_source,
+    )
+    return TopKExecutionPlan(
+        scope_source=scope_source,
+        persistence_policy=persistence_policy,
+        input_kind=input_kind,
+        lowering_plan=resolve_topk_lowering_plan(
+            spec,
+            input_kind=input_kind,
+            persistence_policy=persistence_policy,
+        ),
+    )
+
+
+def _make_scoped_topk_snapshot_worker(
+    *,
+    query_spec: TopKQuerySpec,
+    topk_config: SemTopKConfig,
+    llm_config: Optional[LLMClientConfig],
+    embedding_config: Optional[EmbeddingBackendConfig],
+):
+    """Build one scoped top-k snapshot worker for the active backend."""
+    backend = topk_config.scorer_backend
+    score_field = topk_config.score_field
+    if backend == "llm":
+        if llm_config is None:
+            raise ValueError("llm_config is required for sem_topk backend='llm'")
+        return _BoundedPoolLLMTopKSnapshotWorker(
+            query_spec,
+            llm_config,
+            score_field,
+            rerank_chunk_size=topk_config.rerank_chunk_size,
+        )
+    if backend == "embedding":
+        return _BoundedPoolEmbeddingTopKSnapshotWorker(
+            query_spec,
+            embedding_config,
+            score_field,
+            rerank_chunk_size=topk_config.rerank_chunk_size,
+        )
+    if backend == "external_score":
+        return _BoundedPoolExternalTopKSnapshotWorker(
+            query_spec,
+            score_field,
+            rerank_chunk_size=topk_config.rerank_chunk_size,
+        )
+    raise ValueError(f"Unsupported sem_topk backend: {backend!r}")
 
 def build_sem_topk_pipeline(
     input_ds: DataStream,
@@ -80,7 +163,9 @@ def build_sem_topk_pipeline(
         Required when ``topk_config.scorer_backend == "llm"``.
     embedding_config : EmbeddingBackendConfig, optional
         Optional embedding scorer config. Current implementation supports
-        only ``backend="mock"`` / ``"local_lexical"``.
+        explicit local embedding-style backends such as
+        ``backend="local_hashing"`` / ``"local_lexical"``, plus
+        ``backend="mock"`` for tests.
     async_timeout_ms : int
         Async scoring timeout in milliseconds.
     async_capacity : int
@@ -119,31 +204,22 @@ def build_sem_topk_pipeline(
     )
 
     def _make_final_pool_worker():
-        if backend == "llm":
-            if llm_config is None:
-                raise ValueError("llm_config is required for sem_topk backend='llm'")
-            return _BoundedPoolLLMTopKSnapshotWorker(query_spec, llm_config, score_field)
-        if backend == "embedding":
-            return _BoundedPoolEmbeddingTopKSnapshotWorker(query_spec, embedding_config, score_field)
-        if backend == "external_score":
-            return _BoundedPoolExternalTopKSnapshotWorker(query_spec, score_field)
-        raise ValueError(f"Unsupported sem_topk backend: {backend!r}")
+        return _make_scoped_topk_snapshot_worker(
+            query_spec=query_spec,
+            topk_config=topk_config,
+            llm_config=llm_config,
+            embedding_config=embedding_config,
+        )
 
     if query_spec.ranking_method in {"pairwise", "listwise"}:
         contextual_plan = derive_topk_contextual_plan(query_spec, topk_config)
 
-        def _make_contextual_snapshot_worker():
-            if backend == "llm":
-                if llm_config is None:
-                    raise ValueError("llm_config is required for sem_topk backend='llm'")
-                return _BoundedPoolLLMTopKSnapshotWorker(query_spec, llm_config, score_field)
-            if backend == "embedding":
-                return _BoundedPoolEmbeddingTopKSnapshotWorker(query_spec, embedding_config, score_field)
-            if backend == "external_score":
-                return _BoundedPoolExternalTopKSnapshotWorker(query_spec, score_field)
-            raise ValueError(f"Unsupported sem_topk backend: {backend!r}")
-
-        snapshot_worker = _make_contextual_snapshot_worker()
+        snapshot_worker = _make_scoped_topk_snapshot_worker(
+            query_spec=query_spec,
+            topk_config=topk_config,
+            llm_config=llm_config,
+            embedding_config=embedding_config,
+        )
         snapshot_query_spec = build_contextual_snapshot_query_spec(
             query_spec, topk_config, contextual_plan
         )
@@ -257,3 +333,103 @@ def build_sem_topk_pipeline(
     if pool_results is not None:
         out = out.union(pool_results)
     return out
+
+
+def build_scoped_persistent_topk_pipeline(
+    input_ds: DataStream,
+    *,
+    key_selector: Callable,
+    topk_config: SemTopKConfig,
+    query_spec: TopKQuerySpec,
+    llm_config: Optional[LLMClientConfig] = None,
+    embedding_config: Optional[EmbeddingBackendConfig] = None,
+    async_timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Build one continuous top-k from scope-level top-k contributions."""
+    snapshot_worker = _make_scoped_topk_snapshot_worker(
+        query_spec=query_spec,
+        topk_config=topk_config,
+        llm_config=llm_config,
+        embedding_config=embedding_config,
+    )
+    scope_snapshots = AsyncDataStream.unordered_wait(
+        input_ds,
+        snapshot_worker,
+        async_timeout_ms,
+        async_capacity,
+    )
+    return scope_snapshots.key_by(key_selector).process(
+        ScopedPersistentSemTopKFunction(topk_config, query_spec),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+
+
+def build_external_window_persistent_topk_pipeline(
+    input_ds: DataStream,
+    *,
+    key_selector: Callable,
+    topk_config: SemTopKConfig,
+    query_spec: TopKQuerySpec,
+    llm_config: Optional[LLMClientConfig] = None,
+    embedding_config: Optional[EmbeddingBackendConfig] = None,
+    async_timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Build the external-window persistent top-k runtime.
+
+    Input must be a bounded candidate pool stream with stable ``scope_id``.
+    Each scope fire is reranked independently and then merged into one
+    continuous cross-scope frontier by replacing that scope's prior
+    contribution.
+    """
+    return build_scoped_persistent_topk_pipeline(
+        input_ds,
+        key_selector=key_selector,
+        topk_config=topk_config,
+        query_spec=query_spec,
+        llm_config=llm_config,
+        embedding_config=embedding_config,
+        async_timeout_ms=async_timeout_ms,
+        async_capacity=async_capacity,
+    )
+
+
+def build_internal_scope_persistent_contextual_topk_pipeline(
+    input_ds: DataStream,
+    *,
+    key_selector: Callable,
+    topk_config: SemTopKConfig,
+    query_spec: TopKQuerySpec,
+    llm_config: Optional[LLMClientConfig] = None,
+    embedding_config: Optional[EmbeddingBackendConfig] = None,
+    async_timeout_ms: int = 30_000,
+    async_capacity: int = 20,
+) -> DataStream:
+    """Build persistent contextual top-k over operator-owned scopes."""
+    if query_spec.ranking_method not in {"pairwise", "listwise"}:
+        raise ValueError(
+            "internal_scope persistent contextual top-k requires ranking_method in "
+            "{'pairwise', 'listwise'}"
+        )
+
+    contextual_plan = derive_topk_contextual_plan(query_spec, topk_config)
+    snapshot_query_spec = build_contextual_snapshot_query_spec(
+        query_spec,
+        topk_config,
+        contextual_plan,
+    )
+    scope_pools = input_ds.key_by(key_selector).process(
+        SemTopKScopeSnapshotFunction(topk_config, snapshot_query_spec),
+        output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    return build_scoped_persistent_topk_pipeline(
+        scope_pools,
+        key_selector=key_selector,
+        topk_config=topk_config,
+        query_spec=query_spec,
+        llm_config=llm_config,
+        embedding_config=embedding_config,
+        async_timeout_ms=async_timeout_ms,
+        async_capacity=async_capacity,
+    )

@@ -80,7 +80,7 @@ class DefaultsConfig:
 class LLMBackendConfig:
     """LLM backend connection configuration."""
 
-    backend: str = "mock"
+    backend: str = "openai"
     model: str = ""
     api_key: str = ""
     endpoint: str = ""
@@ -101,7 +101,7 @@ class LLMBackendConfig:
 class EmbeddingBackendConfig:
     """Embedding backend configuration."""
 
-    backend: str = "mock"
+    backend: str = "local_hashing"
     model: str = ""
     endpoint: str = ""
     dimensions: int = 0
@@ -431,7 +431,7 @@ def _build_llm_client_config(
     )
 
     return LLMClientConfig(
-        backend=str(overrides.get("backend", base.backend or "mock")),
+        backend=str(overrides.get("backend", base.backend or "openai")),
         model=str(overrides.get("model", base.model or "gpt-4o-mini")),
         api_base=api_base,
         api_key_env=api_key_env,
@@ -721,16 +721,28 @@ class RuntimeConfig:
 
     # -- resolved bundles ----------------------------------------------------
 
-    def resolve_topk_runtime_bundle(self) -> TopKRuntimeBundle:
+    def resolve_topk_runtime_bundle(self, *, input_kind: str = "event_stream") -> TopKRuntimeBundle:
         from pyflink.semantic_runtime.runtime.plans import (
             resolve_topk_lowering_plan,
         )
+        from pyflink.semantic_runtime.operators.stateful.sem_topk import (
+            resolve_topk_persistence_policy,
+        )
 
         query_spec = self.get_topk_query_spec()
+        kernel_config = self.get_topk_kernel_config()
+        scope_source = "external_window" if input_kind == "window_snapshot" else "internal_scope"
         return TopKRuntimeBundle(
             query_spec=query_spec,
-            kernel_config=self.get_topk_kernel_config(),
-            lowering_plan=resolve_topk_lowering_plan(query_spec),
+            kernel_config=kernel_config,
+            lowering_plan=resolve_topk_lowering_plan(
+                query_spec,
+                input_kind=input_kind,
+                persistence_policy=resolve_topk_persistence_policy(
+                    kernel_config,
+                    scope_source=scope_source,
+                ),
+            ),
         )
 
     def resolve_groupby_runtime_bundle(self, *, input_kind: str = "event_stream") -> GroupbyRuntimeBundle:

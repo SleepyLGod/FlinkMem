@@ -265,6 +265,22 @@ def sem_topk_snapshot_descriptor(
     return desc
 
 
+def sem_topk_scope_contributions_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for external-window top-k scope contributions.
+
+    Key: window_id (str), Value: pickled scoped top-k snapshot dict.
+    """
+    desc = MapStateDescriptor(
+        "sem_topk_scope_contributions",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 # ---------------------------------------------------------------------------
 # sem_join descriptors
 # ---------------------------------------------------------------------------

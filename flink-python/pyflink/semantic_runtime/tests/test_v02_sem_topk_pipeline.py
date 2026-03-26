@@ -39,6 +39,8 @@ from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (
 )
 from pyflink.semantic_runtime.operators.stateful.sem_topk_scope_runtime import SemTopKScopeSnapshotFunction
 
+TEST_CONTEXTUAL_RERANK_CHUNK_SIZE = 8
+
 
 class _FakeMapState:
     def __init__(self, initial=None):
@@ -96,6 +98,7 @@ class _FakeOnTimerContext(_FakeContext):
 
 
 def _resolve_test_topk_config(
+    query_spec: TopKQuerySpec,
     topk_config: SemTopKConfig | None,
     *,
     llm_config: LLMClientConfig | None,
@@ -114,6 +117,11 @@ def _resolve_test_topk_config(
         emission_policy="snapshot",
         recompute_interval_ms=0,
         scorer_backend=scorer_backend,
+        rerank_chunk_size=(
+            TEST_CONTEXTUAL_RERANK_CHUNK_SIZE
+            if query_spec.ranking_method in {"pairwise", "listwise"}
+            else None
+        ),
     )
 
 
@@ -150,6 +158,7 @@ def _run_pipeline_in_memory(
     embedding_config: EmbeddingBackendConfig | None = None,
 ) -> List[Dict[str, Any]]:
     config = _resolve_test_topk_config(
+        query_spec,
         topk_config,
         llm_config=llm_config,
         embedding_config=embedding_config,
@@ -195,17 +204,20 @@ def _run_pipeline_in_memory(
                 query_spec,
                 llm_config or LLMClientConfig(backend="mock"),
                 score_field,
+                rerank_chunk_size=config.rerank_chunk_size,
             )
         elif scorer_backend == "embedding":
             snapshot_pool_worker = _BoundedPoolEmbeddingTopKSnapshotWorker(
                 query_spec,
                 embedding_config or EmbeddingBackendConfig(backend="mock"),
                 score_field,
+                rerank_chunk_size=config.rerank_chunk_size,
             )
         elif scorer_backend == "external_score":
             snapshot_pool_worker = _BoundedPoolExternalTopKSnapshotWorker(
                 query_spec,
                 score_field,
+                rerank_chunk_size=config.rerank_chunk_size,
             )
         else:
             raise AssertionError(f"unexpected backend: {scorer_backend}")
@@ -215,17 +227,20 @@ def _run_pipeline_in_memory(
                 query_spec,
                 llm_config or LLMClientConfig(backend="mock"),
                 score_field,
+                rerank_chunk_size=config.rerank_chunk_size,
             )
         elif scorer_backend == "embedding":
             snapshot_pool_worker = _BoundedPoolEmbeddingTopKSnapshotWorker(
                 query_spec,
                 embedding_config or EmbeddingBackendConfig(backend="mock"),
                 score_field,
+                rerank_chunk_size=config.rerank_chunk_size,
             )
         elif scorer_backend == "external_score":
             snapshot_pool_worker = _BoundedPoolExternalTopKSnapshotWorker(
                 query_spec,
                 score_field,
+                rerank_chunk_size=config.rerank_chunk_size,
             )
         else:
             raise AssertionError(f"unexpected backend: {scorer_backend}")
@@ -446,9 +461,12 @@ class TestTopKPipelineHelpers:
     def test_contextual_plan_pairwise_uses_tournament_of_pairs(self):
         spec = TopKQuerySpec.simple("best weather days")
         spec.ranking_method = "pairwise"
-        plan = derive_topk_contextual_plan(spec, SemTopKConfig())
+        plan = derive_topk_contextual_plan(
+            spec,
+            SemTopKConfig(rerank_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE),
+        )
         assert plan == TopKContextualPlan(
-            context_chunk_size=2,
+            context_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE,
             merge_strategy="tournament",
             close_surrogate="none",
             epoch_ms=None,
@@ -457,8 +475,11 @@ class TestTopKPipelineHelpers:
     def test_contextual_plan_listwise_defaults_to_global_rank(self):
         spec = TopKQuerySpec.simple("best weather days")
         spec.ranking_method = "listwise"
-        plan = derive_topk_contextual_plan(spec, SemTopKConfig())
-        assert plan.context_chunk_size is None
+        plan = derive_topk_contextual_plan(
+            spec,
+            SemTopKConfig(rerank_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE),
+        )
+        assert plan.context_chunk_size == TEST_CONTEXTUAL_RERANK_CHUNK_SIZE
         assert plan.merge_strategy == "global_rank"
 
     def test_contextual_sliding_scope_close_uses_epoch_surrogate(self):
@@ -467,9 +488,22 @@ class TestTopKPipelineHelpers:
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.window_kind = "sliding"
         spec.scope_policy.window_size_ms = 60000
-        plan = derive_topk_contextual_plan(spec, SemTopKConfig(recompute_interval_ms=5000))
+        plan = derive_topk_contextual_plan(
+            spec,
+            SemTopKConfig(
+                recompute_interval_ms=5000,
+                rerank_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE,
+            ),
+        )
         assert plan.close_surrogate == "epoch_close"
-        eff = build_contextual_snapshot_query_spec(spec, SemTopKConfig(recompute_interval_ms=5000), plan)
+        eff = build_contextual_snapshot_query_spec(
+            spec,
+            SemTopKConfig(
+                recompute_interval_ms=5000,
+                rerank_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE,
+            ),
+            plan,
+        )
         assert eff.trigger_policy.mode == "periodic"
         assert eff.trigger_policy.interval_ms == 60000
 
@@ -478,9 +512,22 @@ class TestTopKPipelineHelpers:
         spec.ranking_method = "listwise"
         spec.trigger_policy.mode = "on_scope_close"
         spec.scope_policy.ttl_seconds = 30
-        plan = derive_topk_contextual_plan(spec, SemTopKConfig(recompute_interval_ms=4000))
+        plan = derive_topk_contextual_plan(
+            spec,
+            SemTopKConfig(
+                recompute_interval_ms=4000,
+                rerank_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE,
+            ),
+        )
         assert plan.close_surrogate == "periodic_snapshot"
-        eff = build_contextual_snapshot_query_spec(spec, SemTopKConfig(recompute_interval_ms=4000), plan)
+        eff = build_contextual_snapshot_query_spec(
+            spec,
+            SemTopKConfig(
+                recompute_interval_ms=4000,
+                rerank_chunk_size=TEST_CONTEXTUAL_RERANK_CHUNK_SIZE,
+            ),
+            plan,
+        )
         assert eff.trigger_policy.mode == "periodic"
         assert eff.trigger_policy.interval_ms == 4000
 

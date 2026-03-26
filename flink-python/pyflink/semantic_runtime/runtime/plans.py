@@ -486,9 +486,24 @@ def lower_sem_join_request(
     )
 
 
-def resolve_topk_lowering_plan(query_spec: TopKQuerySpec) -> SemLoweringPlan:
+def resolve_topk_lowering_plan(
+    query_spec: TopKQuerySpec,
+    *,
+    input_kind: str = "event_stream",
+    persistence_policy: Optional[str] = None,
+) -> SemLoweringPlan:
     """Resolve the logical form for ``sem_topk``."""
     if query_spec.ranking_method == "pointwise":
+        if input_kind == "window_snapshot" and persistence_policy != "reset_per_scope":
+            return SemLoweringPlan(
+                operator_name="sem_topk",
+                lowering_kind="native_runtime",
+                notes=(
+                    "Continuous top-k over external window scopes keeps one "
+                    "cross-scope frontier; repeated scope fires do not lower "
+                    "to a bounded per-scope Top-N projection.",
+                ),
+            )
         return SemLoweringPlan(
             operator_name="sem_topk",
             lowering_kind="derived_attribute_then_classical",

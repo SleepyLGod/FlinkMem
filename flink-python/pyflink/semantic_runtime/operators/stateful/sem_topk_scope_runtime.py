@@ -380,6 +380,7 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
             "error": str(meta.get("last_error", "")),
             "timestamp_ms": now_ms,
             "scope_epoch": meta.get("scope_epoch", 0),
+            "scope_id": str(meta.get("scope_epoch", 0)),
             "emission_policy": "scope_close_final" if scope_close_reason else "snapshot",
         }
         if scope_close_reason:

@@ -81,6 +81,7 @@ from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 logger = logging.getLogger(__name__)
 
 _VALID_INTERNAL_TOPK_SCORERS = {"llm", "embedding", "external_score"}
+_VALID_TOPK_PERSISTENCE_POLICIES = {"persistent_across_scopes", "reset_per_scope", "hybrid"}
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,13 @@ class SemTopKConfig:
         Name of the score field in candidate records.
     scorer_backend : str
         Internal scoring backend chosen by planner/runtime.
+    rerank_chunk_size : int | None
+        Internal contextual rerank chunk size for pairwise/listwise execution.
+        One chunk maps to one semantic rerank call. This must be set explicitly
+        for contextual top-k paths.
+    persistence_policy : str or None
+        Whether ranked state resets per bounded scope or persists across scope
+        updates. ``None`` means planner/runtime resolves the default.
     """
     max_candidates: int = 100
     recompute_interval_ms: int = 10_000  # timer-driven recompute
@@ -120,6 +128,8 @@ class SemTopKConfig:
     emission_policy: str = "delta"       # "delta" | "snapshot"
     score_field: str = "score"           # field name in candidate record
     scorer_backend: str = "external_score"
+    rerank_chunk_size: Optional[int] = None
+    persistence_policy: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.scorer_backend not in _VALID_INTERNAL_TOPK_SCORERS:
@@ -127,6 +137,28 @@ class SemTopKConfig:
                 f"Invalid scorer_backend={self.scorer_backend!r}. "
                 f"Must be one of {_VALID_INTERNAL_TOPK_SCORERS}."
             )
+        if (
+            self.persistence_policy is not None
+            and self.persistence_policy not in _VALID_TOPK_PERSISTENCE_POLICIES
+        ):
+            raise ValueError(
+                f"Invalid sem_topk persistence_policy={self.persistence_policy!r}. "
+                f"Must be one of {_VALID_TOPK_PERSISTENCE_POLICIES}."
+            )
+        if self.rerank_chunk_size is not None and int(self.rerank_chunk_size) <= 0:
+            raise ValueError("sem_topk rerank_chunk_size must be > 0")
+
+
+def resolve_topk_persistence_policy(
+    config: SemTopKConfig,
+    *,
+    scope_source: str,
+) -> str:
+    """Resolve top-k state persistence independently from scope source."""
+    _ = scope_source
+    if config.persistence_policy is not None:
+        return str(config.persistence_policy)
+    return "persistent_across_scopes"
 
 # ---------------------------------------------------------------------------
 # SemTopKFunction

@@ -147,10 +147,18 @@ def build_sem_topk_from_request(
 ) -> DataStream:
     """Build a stateful semantic top-k pipeline from a public request."""
     from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (
+        build_external_window_persistent_topk_pipeline,
+        build_internal_scope_persistent_contextual_topk_pipeline,
         build_sem_topk_pipeline,
+        resolve_topk_execution_plan,
     )
 
     plan = lower_sem_topk_request(request, runtime_config)
+    execution_plan = resolve_topk_execution_plan(
+        plan.query_spec,
+        config=plan.kernel_config,
+        input_kind=plan.input_kind,
+    )
     topk_input = input_ds
     if plan.context_kind == "window":
         snapshots = materialize_window_stream(
@@ -160,22 +168,48 @@ def build_sem_topk_from_request(
             runtime_config=runtime_config,
             operator_name="sem_topk",
         )
-        topk_input = snapshots.map(
-            lambda value: window_snapshot_to_topk_pool(
-                parse_window_snapshot(value, operator_name="sem_topk window materialization"),
-                ranking_text=plan.intent,
-            ),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
-
-    if plan.context_kind == "window" and plan.query_spec.ranking_method == "pointwise":
-        return apply_sem_topk_pushdown(
-            topk_input,
-            request=request,
-            runtime_config=runtime_config,
-            timeout_ms=async_timeout_ms,
-            async_capacity=async_capacity,
-        )
+        if execution_plan.persistence_policy == "reset_per_scope":
+            topk_input = snapshots.map(
+                lambda value: window_snapshot_to_topk_pool(
+                    parse_window_snapshot(value, operator_name="sem_topk window materialization"),
+                    ranking_text=plan.intent,
+                ),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            if plan.query_spec.ranking_method == "pointwise":
+                return apply_sem_topk_pushdown(
+                    topk_input,
+                    request=request,
+                    runtime_config=runtime_config,
+                    timeout_ms=async_timeout_ms,
+                    async_capacity=async_capacity,
+                )
+        else:
+            topk_input = snapshots.map(
+                lambda value: window_snapshot_to_topk_pool(
+                    parse_window_snapshot(value, operator_name="sem_topk window materialization"),
+                    ranking_text=plan.intent,
+                ),
+                output_type=Types.PICKLED_BYTE_ARRAY(),
+            )
+            llm_config = None
+            if plan.kernel_config.scorer_backend == "llm":
+                llm_config = runtime_config.get_operator_llm_client_config(
+                    "sem_topk",
+                    allow_query_spec=True,
+                )
+            return build_external_window_persistent_topk_pipeline(
+                topk_input,
+                key_selector=lambda value: str(
+                    parse_json_or_passthrough(value, operator_name="sem_topk external window pool").get("key", "")
+                ),
+                topk_config=plan.kernel_config,
+                query_spec=plan.query_spec,
+                llm_config=llm_config,
+                embedding_config=runtime_config.to_embedding_backend_config(),
+                async_timeout_ms=async_timeout_ms,
+                async_capacity=async_capacity,
+            )
 
     llm_config = None
     if plan.kernel_config.scorer_backend == "llm":
@@ -185,8 +219,23 @@ def build_sem_topk_from_request(
         )
 
     embedding_config = runtime_config.to_embedding_backend_config()
+    if (
+        execution_plan.scope_source == "internal_scope"
+        and execution_plan.persistence_policy == "persistent_across_scopes"
+        and plan.query_spec.ranking_method in {"pairwise", "listwise"}
+    ):
+        return build_internal_scope_persistent_contextual_topk_pipeline(
+            topk_input,
+            key_selector=key_selector,
+            topk_config=plan.kernel_config,
+            query_spec=plan.query_spec,
+            llm_config=llm_config,
+            embedding_config=embedding_config,
+            async_timeout_ms=async_timeout_ms,
+            async_capacity=async_capacity,
+        )
     effective_key_selector = key_selector
-    if plan.context_kind == "window":
+    if execution_plan.scope_source == "external_window":
         effective_key_selector = lambda value: str(
             parse_json_or_passthrough(value, operator_name="sem_topk window pool").get("key", "")
         )

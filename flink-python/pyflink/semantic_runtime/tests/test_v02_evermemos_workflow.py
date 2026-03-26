@@ -773,8 +773,13 @@ def _build_configs():
         new_group_creation_threshold=0.1,
     )
     retrieve_cfg = SemSearchConfig(max_candidates_per_request=4, max_cache_entries_per_key=32)
-    topk_cfg = SemTopKConfig(max_candidates=16, recompute_interval_ms=0, emission_policy="snapshot")
     topk_qs = TopKQuerySpec(k=2)
+    topk_cfg = SemTopKConfig(
+        max_candidates=16,
+        recompute_interval_ms=0,
+        emission_policy="snapshot",
+        rerank_chunk_size=8 if topk_qs.ranking_method in {"pairwise", "listwise"} else None,
+    )
     return window_cfg, groupby_cfg, retrieve_cfg, topk_cfg, topk_qs
 
 
@@ -935,6 +940,8 @@ def _run_retrieval_path(
     key = "user_001"
     _, _, retrieve_cfg, topk_cfg, topk_qs = _build_configs()
     topk_qs = topk_query_spec or topk_qs
+    if topk_qs.ranking_method in {"pairwise", "listwise"} and topk_cfg.rerank_chunk_size is None:
+        topk_cfg.rerank_chunk_size = 8
 
     retrieve = SemSearchFunction(retrieve_cfg)
     retrieve._cache = _FakeMapState()
@@ -983,7 +990,11 @@ def _run_retrieval_path(
     else:
         # Contextual pairwise/listwise rerank consumes bounded retrieval pools
         # directly, preserving the pool boundary until rerank is complete.
-        reranker = _BoundedPoolExternalScoreRerankerWorker(topk_qs, topk_cfg.score_field)
+        reranker = _BoundedPoolExternalScoreRerankerWorker(
+            topk_qs,
+            topk_cfg.score_field,
+            rerank_chunk_size=topk_cfg.rerank_chunk_size,
+        )
         scored_candidate_rows = []
         passthrough_rows = []
         for row in merged_retrieve:

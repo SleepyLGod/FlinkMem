@@ -23,7 +23,8 @@ class TestRuntimeConfig:
     def test_defaults(self):
         cfg = RuntimeConfig()
         assert cfg.defaults.ttl_seconds == 3600
-        assert cfg.llm.backend == "mock"
+        assert cfg.llm.backend == "openai"
+        assert cfg.embedding.backend == "local_hashing"
         assert cfg.operators == {}
 
     def test_from_dict(self):
@@ -117,6 +118,40 @@ class TestRuntimeConfig:
         bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
         assert bundle.lowering_plan.lowering_kind == "derived_attribute_then_classical"
         assert bundle.lowering_plan.classical_operator == "groupby"
+
+    def test_topk_runtime_bundle_window_default_stays_native(self):
+        cfg = RuntimeConfig.from_dict(
+            {
+                "operators": {
+                    "sem_topk": {
+                        "query_spec": {
+                            "ranking_method": "pointwise",
+                        }
+                    }
+                }
+            }
+        )
+        bundle = cfg.resolve_topk_runtime_bundle(input_kind="window_snapshot")
+        assert bundle.lowering_plan.lowering_kind == "native_runtime"
+
+    def test_topk_runtime_bundle_window_reset_per_scope_lowers_to_classical_topn(self):
+        cfg = RuntimeConfig.from_dict(
+            {
+                "operators": {
+                    "sem_topk": {
+                        "query_spec": {
+                            "ranking_method": "pointwise",
+                        },
+                        "kernel": {
+                            "persistence_policy": "reset_per_scope",
+                        },
+                    }
+                }
+            }
+        )
+        bundle = cfg.resolve_topk_runtime_bundle(input_kind="window_snapshot")
+        assert bundle.lowering_plan.lowering_kind == "derived_attribute_then_classical"
+        assert bundle.lowering_plan.classical_operator == "topn"
 
     def test_agg_runtime_bundle_preserves_native_reduce_view(self):
         cfg = RuntimeConfig.from_dict(

@@ -1387,6 +1387,24 @@ class TestSemLoweringPlans:
         assert plan.derived_attribute.attribute_kind == "score"
         assert plan.derived_attribute.output_field == "score"
 
+    def test_topk_window_snapshot_default_stays_native(self):
+        plan = resolve_topk_lowering_plan(
+            TopKQuerySpec(ranking_method="pointwise"),
+            input_kind="window_snapshot",
+        )
+        assert plan.lowering_kind == "native_runtime"
+        assert plan.derived_attribute is None
+
+    def test_topk_window_reset_per_scope_lowers_to_score_plus_topn(self):
+        plan = resolve_topk_lowering_plan(
+            TopKQuerySpec(ranking_method="pointwise"),
+            input_kind="window_snapshot",
+            persistence_policy="reset_per_scope",
+        )
+        assert plan.lowering_kind == "derived_attribute_then_classical"
+        assert plan.classical_operator == "topn"
+        assert plan.derived_attribute is not None
+
     def test_topk_contextual_stays_native(self):
         plan = resolve_topk_lowering_plan(TopKQuerySpec(ranking_method="pairwise"))
         assert plan.lowering_kind == "native_runtime"

@@ -69,6 +69,16 @@ VALID_CONTEXTUAL_CLOSE_SURROGATES = {
 }
 
 
+def _require_contextual_chunk_size(topk_config: SemTopKConfig) -> int:
+    """Return the explicit chunk size required by contextual top-k paths."""
+    if topk_config.rerank_chunk_size is None:
+        raise ValueError("topk_contextual_rerank_chunk_size_is_required")
+    chunk_size = int(topk_config.rerank_chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("topk_contextual_rerank_chunk_size_must_be_positive")
+    return chunk_size
+
+
 @dataclass(frozen=True)
 class TopKContextualPlan:
     """Internal execution plan for contextual top-k reranking.
@@ -113,10 +123,10 @@ def derive_topk_contextual_plan(
     """
     method = query_spec.ranking_method
     if method == "pairwise":
-        chunk_size = 2
+        chunk_size = _require_contextual_chunk_size(topk_config)
         merge_strategy = "tournament"
     elif method == "listwise":
-        chunk_size = None
+        chunk_size = _require_contextual_chunk_size(topk_config)
         merge_strategy = "global_rank"
     else:
         raise ValueError("TopKContextualPlan applies only to pairwise/listwise methods")
@@ -376,11 +386,13 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
         score_backend: str,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
         self._query_spec = query_spec
         self._score_backend = score_backend
         self._score_field = score_field
         self._candidate_text_fields = tuple(candidate_text_fields)
+        self._rerank_chunk_size = rerank_chunk_size
 
     def _query_text(self, value: Dict[str, Any]) -> str:
         return resolve_topk_ranking_text(value, self._query_spec)
@@ -394,10 +406,74 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
             out["key"] = value.get("key", "")
             out["query"] = value.get("query", "")
             out["query_seq_id"] = int(value.get("query_seq_id", 0))
+            out["scope_id"] = str(value.get("scope_id", value.get("window_id", "")) or "")
             out.setdefault("source", value.get("source", ""))
             out.setdefault("error", value.get("error", ""))
             items.append(out)
         return items
+
+    def _resolved_context_chunk_size(self, candidate_count: int) -> int:
+        if self._rerank_chunk_size is None:
+            raise ValueError("topk_contextual_rerank_chunk_size_is_required")
+        chunk_size = max(1, int(self._rerank_chunk_size))
+        if candidate_count <= chunk_size:
+            return candidate_count
+        if chunk_size <= self._query_spec.k:
+            raise ValueError(
+                "topk_contextual_rerank_chunk_size_must_exceed_k_for_multi_chunk_rerank"
+            )
+        return chunk_size
+
+    def _chunk_pool(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        chunk_size: int,
+    ) -> List[List[Dict[str, Any]]]:
+        if chunk_size <= 0:
+            raise ValueError("topk_contextual_rerank_chunk_size_must_be_positive")
+        return [
+            list(pool[start : start + chunk_size])
+            for start in range(0, len(pool), chunk_size)
+        ]
+
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Rank one contextual chunk."""
+        raise NotImplementedError
+
+    async def _rank_contextual_pool(
+        self,
+        value: Dict[str, Any],
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Hierarchically rerank a bounded pool into one reduced ranking."""
+        query_text = self._query_text(value)
+        current_pool = self._extract_pool(value)
+        chunk_size = self._resolved_context_chunk_size(len(current_pool))
+        if len(current_pool) <= chunk_size:
+            return await self._rank_contextual_chunk(current_pool, query_text)
+
+        while len(current_pool) > chunk_size:
+            pool_chunks = self._chunk_pool(current_pool, chunk_size)
+            ranked_chunks = await asyncio.gather(
+                *[
+                    self._rank_contextual_chunk(chunk, query_text)
+                    for chunk in pool_chunks
+                ]
+            )
+            promoted: List[Dict[str, Any]] = []
+            for ranked_chunk in ranked_chunks:
+                promoted.extend(
+                    candidate
+                    for candidate, _score in ranked_chunk[: self._query_spec.k]
+                )
+            if len(promoted) >= len(current_pool):
+                raise ValueError("topk_contextual_multi_chunk_rerank_did_not_reduce_candidate_pool")
+            current_pool = promoted
+
+        return await self._rank_contextual_chunk(current_pool, query_text)
 
     def _finalise_ranked(
         self,
@@ -451,6 +527,17 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
         return [
             {
                 "key": original_value.get("key", ""),
+                "scope_id": str(
+                    original_value.get(
+                        "scope_id",
+                        original_value.get(
+                            "window_id",
+                            original_value.get("scope_epoch", ""),
+                        ),
+                    )
+                    or ""
+                ),
+                "window_id": original_value.get("window_id", ""),
                 "topk": top_rows,
                 "top_items": top_rows,
                 "top_ids": [row.get("candidate_id", "") for row in top_rows],
@@ -560,7 +647,9 @@ class _EmbeddingScorerWorker(_BaseTopKScorerWorker):
         if not is_topk_candidate_record(value):
             raise ValueError("topk_embedding_pointwise_requires_flat_candidate_record")
 
-        backend = self._embedding_config.backend or "mock"
+        backend = str(self._embedding_config.backend or "")
+        if not backend:
+            raise ValueError("topk_embedding_backend_is_required")
         if backend not in {"mock", "local_lexical", "local_hashing"}:
             raise ValueError(f"topk_embedding_backend_not_implemented: {backend}")
 
@@ -599,8 +688,15 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
         llm_config: LLMClientConfig,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
-        super().__init__(query_spec, "llm", score_field, candidate_text_fields)
+        super().__init__(
+            query_spec,
+            "llm",
+            score_field,
+            candidate_text_fields,
+            rerank_chunk_size=rerank_chunk_size,
+        )
         self._llm_config = llm_config
         self._client = None
 
@@ -615,13 +711,48 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
     def _candidate_text(self, value: Dict[str, Any]) -> str:
         return extract_topk_candidate_text(value, self._candidate_text_fields)
 
-    def _mock_rank(self, value: Dict[str, Any]) -> List[Tuple[Dict[str, Any], float]]:
-        query_text = self._query_text(value)
-        pool = self._extract_pool(value)
+    def _mock_rank_chunk(
+        self,
+        query_text: str,
+        pool: Sequence[Dict[str, Any]],
+    ) -> List[Tuple[Dict[str, Any], float]]:
         scored = [(cand, lexical_similarity(query_text, self._candidate_text(cand))) for cand in pool]
         if self._query_spec.ranking_method == "pairwise":
             return _pairwise_rank(scored)
         return sorted(scored, key=lambda item: item[1], reverse=True)
+
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        if self._llm_config.backend == "mock":
+            return self._mock_rank_chunk(query_text, pool)
+
+        await self._ensure_client()
+        assert self._client is not None
+        ranked_ids = await evaluate_sem_rerank_block(
+            client=self._client,
+            llm_config=self._llm_config,
+            intent=self._query_spec.semantic.instruction or "Rerank bounded items.",
+            method=self._query_spec.ranking_method,
+            rerank_block=[
+                {
+                    "item_id": str(cand["candidate_id"]),
+                    "query": query_text,
+                    "item": self._candidate_text(cand),
+                }
+                for cand in pool
+            ],
+        )
+        scored = [
+            (cand, lexical_similarity(query_text, self._candidate_text(cand)))
+            for cand in pool
+        ]
+        scored_map = {cand["candidate_id"]: (cand, score) for cand, score in scored}
+        ranked = [scored_map.pop(cid) for cid in ranked_ids if cid in scored_map]
+        ranked.extend(scored_map.values())
+        return ranked
 
     async def _ensure_client(self):
         if self._client is None:
@@ -631,32 +762,7 @@ class _BoundedPoolLLMRerankerWorker(_BaseBoundedPoolRerankerWorker):
         if not is_topk_candidate_pool(value):
             raise ValueError("topk_contextual_reranker_requires_bounded_pool")
         try:
-            if self._llm_config.backend == "mock":
-                ranked = self._mock_rank(value)
-            else:
-                await self._ensure_client()
-                assert self._client is not None
-                ranked_ids = await evaluate_sem_rerank_block(
-                    client=self._client,
-                    llm_config=self._llm_config,
-                    intent=self._query_spec.semantic.instruction or "Rerank bounded items.",
-                    method=self._query_spec.ranking_method,
-                    rerank_block=[
-                        {
-                            "item_id": str(cand["candidate_id"]),
-                            "query": self._query_text(value),
-                            "item": self._candidate_text(cand),
-                        }
-                        for cand in self._extract_pool(value)
-                    ],
-                )
-                pool = {cand["candidate_id"]: cand for cand in self._extract_pool(value)}
-                ranked = []
-                for cid in ranked_ids:
-                    if cid in pool:
-                        ranked.append((pool.pop(cid), 0.0))
-                for cand in pool.values():
-                    ranked.append((cand, 0.0))
+            ranked = await self._rank_contextual_pool(value)
             return self._finalise_ranked(
                 value,
                 ranked,
@@ -680,8 +786,15 @@ class _BoundedPoolEmbeddingRerankerWorker(_BaseBoundedPoolRerankerWorker):
         embedding_config: Optional[EmbeddingBackendConfig] = None,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
-        super().__init__(query_spec, "embedding", score_field, candidate_text_fields)
+        super().__init__(
+            query_spec,
+            "embedding",
+            score_field,
+            candidate_text_fields,
+            rerank_chunk_size=rerank_chunk_size,
+        )
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
         dim = int(self._embedding_config.dimensions or 128)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
@@ -689,16 +802,17 @@ class _BoundedPoolEmbeddingRerankerWorker(_BaseBoundedPoolRerankerWorker):
     def _candidate_text(self, value: Dict[str, Any]) -> str:
         return extract_topk_candidate_text(value, self._candidate_text_fields)
 
-    async def async_invoke(self, value):
-        if not is_topk_candidate_pool(value):
-            raise ValueError("topk_contextual_reranker_requires_bounded_pool")
-
-        backend = self._embedding_config.backend or "mock"
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        backend = str(self._embedding_config.backend or "")
+        if not backend:
+            raise ValueError("topk_embedding_backend_is_required")
         if backend not in {"mock", "local_lexical", "local_hashing"}:
             raise ValueError(f"topk_embedding_backend_not_implemented: {backend}")
 
-        query_text = self._query_text(value)
-        pool = self._extract_pool(value)
         scored: List[Tuple[Dict[str, Any], float]] = []
         for cand in pool:
             candidate_text = self._candidate_text(cand)
@@ -712,6 +826,13 @@ class _BoundedPoolEmbeddingRerankerWorker(_BaseBoundedPoolRerankerWorker):
             ranked = _pairwise_rank(scored)
         else:
             ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        return ranked
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            raise ValueError("topk_contextual_reranker_requires_bounded_pool")
+
+        ranked = await self._rank_contextual_pool(value)
 
         await asyncio.sleep(0)
         return self._finalise_ranked(
@@ -732,13 +853,21 @@ class _BoundedPoolExternalScoreRerankerWorker(_BaseBoundedPoolRerankerWorker):
         query_spec: TopKQuerySpec,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
-        super().__init__(query_spec, "external_score", score_field, candidate_text_fields)
+        super().__init__(
+            query_spec,
+            "external_score",
+            score_field,
+            candidate_text_fields,
+            rerank_chunk_size=rerank_chunk_size,
+        )
 
-    async def async_invoke(self, value):
-        if not is_topk_candidate_pool(value):
-            raise ValueError("topk_contextual_reranker_requires_bounded_pool")
-        pool = self._extract_pool(value)
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
         scored = []
         for cand in pool:
             if self._score_field not in cand or cand[self._score_field] is None:
@@ -748,6 +877,12 @@ class _BoundedPoolExternalScoreRerankerWorker(_BaseBoundedPoolRerankerWorker):
             ranked = _pairwise_rank(scored)
         else:
             ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        return ranked
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            raise ValueError("topk_contextual_reranker_requires_bounded_pool")
+        ranked = await self._rank_contextual_pool(value)
         await asyncio.sleep(0)
         return self._finalise_ranked(
             value,
@@ -765,8 +900,15 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
         llm_config: LLMClientConfig,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
-        super().__init__(query_spec, "llm", score_field, candidate_text_fields)
+        super().__init__(
+            query_spec,
+            "llm",
+            score_field,
+            candidate_text_fields,
+            rerank_chunk_size=rerank_chunk_size,
+        )
         self._llm_config = llm_config
         self._client = None
 
@@ -823,9 +965,11 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
                 ranked.append((cand, max(0.0, min(1.0, score))))
         return sorted(ranked, key=lambda item: item[1], reverse=True)
 
-    async def _rank_contextual(self, value: Dict[str, Any]) -> List[Tuple[Dict[str, Any], float]]:
-        query_text = self._query_text(value)
-        pool = self._extract_pool(value)
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
         scored = [(cand, lexical_similarity(query_text, self._candidate_text(cand))) for cand in pool]
         if self._llm_config.backend != "mock":
             await self._ensure_client()
@@ -859,7 +1003,7 @@ class _BoundedPoolLLMTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
             if self._query_spec.ranking_method == "pointwise":
                 ranked = await self._rank_pointwise(value)
             else:
-                ranked = await self._rank_contextual(value)
+                ranked = await self._rank_contextual_pool(value)
                 if self._score_backend == "llm":
                     total = len(ranked)
                     ranked = [
@@ -892,8 +1036,15 @@ class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
         embedding_config: Optional[EmbeddingBackendConfig] = None,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
-        super().__init__(query_spec, "embedding", score_field, candidate_text_fields)
+        super().__init__(
+            query_spec,
+            "embedding",
+            score_field,
+            candidate_text_fields,
+            rerank_chunk_size=rerank_chunk_size,
+        )
         self._embedding_config = embedding_config or EmbeddingBackendConfig()
         dim = int(self._embedding_config.dimensions or 128)
         self._encoder = HashingTextEncoder(dim=max(dim, 1))
@@ -901,17 +1052,19 @@ class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
     def _candidate_text(self, value: Dict[str, Any]) -> str:
         return extract_topk_candidate_text(value, self._candidate_text_fields)
 
-    async def async_invoke(self, value):
-        if not is_topk_candidate_pool(value):
-            raise ValueError("topk_snapshot_worker_requires_bounded_pool")
-
-        backend = self._embedding_config.backend or "mock"
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        backend = str(self._embedding_config.backend or "")
+        if not backend:
+            raise ValueError("topk_embedding_backend_is_required")
         if backend not in {"mock", "local_lexical", "local_hashing"}:
             raise ValueError(f"topk_embedding_backend_not_implemented: {backend}")
 
-        query_text = self._query_text(value)
         scored: List[Tuple[Dict[str, Any], float]] = []
-        for cand in self._extract_pool(value):
+        for cand in pool:
             candidate_text = self._candidate_text(cand)
             if backend == "mock":
                 score = lexical_similarity(query_text, candidate_text)
@@ -923,6 +1076,31 @@ class _BoundedPoolEmbeddingTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
             ranked = _pairwise_rank(scored)
         else:
             ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        return ranked
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            raise ValueError("topk_snapshot_worker_requires_bounded_pool")
+
+        if self._query_spec.ranking_method == "pointwise":
+            query_text = self._query_text(value)
+            scored: List[Tuple[Dict[str, Any], float]] = []
+            backend = str(self._embedding_config.backend or "")
+            if not backend:
+                raise ValueError("topk_embedding_backend_is_required")
+            if backend not in {"mock", "local_lexical", "local_hashing"}:
+                raise ValueError(f"topk_embedding_backend_not_implemented: {backend}")
+            for cand in self._extract_pool(value):
+                candidate_text = self._candidate_text(cand)
+                if backend == "mock":
+                    score = lexical_similarity(query_text, candidate_text)
+                else:
+                    score = self._encoder.similarity(query_text, candidate_text)
+                scored.append((cand, score))
+            ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        else:
+            ranked = await self._rank_contextual_pool(value)
+
         await asyncio.sleep(0)
         if not ranked:
             raise ValueError("topk_empty_bounded_pool")
@@ -945,14 +1123,23 @@ class _BoundedPoolExternalTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
         query_spec: TopKQuerySpec,
         score_field: str = "score",
         candidate_text_fields: Sequence[str] = DEFAULT_CANDIDATE_TEXT_FIELDS,
+        rerank_chunk_size: Optional[int] = None,
     ) -> None:
-        super().__init__(query_spec, "external_score", score_field, candidate_text_fields)
+        super().__init__(
+            query_spec,
+            "external_score",
+            score_field,
+            candidate_text_fields,
+            rerank_chunk_size=rerank_chunk_size,
+        )
 
-    async def async_invoke(self, value):
-        if not is_topk_candidate_pool(value):
-            raise ValueError("topk_snapshot_worker_requires_bounded_pool")
+    async def _rank_contextual_chunk(
+        self,
+        pool: Sequence[Dict[str, Any]],
+        query_text: str,
+    ) -> List[Tuple[Dict[str, Any], float]]:
         scored = []
-        for cand in self._extract_pool(value):
+        for cand in pool:
             if self._score_field not in cand or cand[self._score_field] is None:
                 raise ValueError(f"topk_missing_external_score:{self._score_field}")
             scored.append((cand, float(cand[self._score_field])))
@@ -961,6 +1148,15 @@ class _BoundedPoolExternalTopKSnapshotWorker(_BaseBoundedPoolRerankerWorker):
             ranked = _pairwise_rank(scored)
         else:
             ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        return ranked
+
+    async def async_invoke(self, value):
+        if not is_topk_candidate_pool(value):
+            raise ValueError("topk_snapshot_worker_requires_bounded_pool")
+        if self._query_spec.ranking_method == "pointwise":
+            ranked = await self._rank_contextual_chunk(self._extract_pool(value), "")
+        else:
+            ranked = await self._rank_contextual_pool(value)
         await asyncio.sleep(0)
         if not ranked:
             raise ValueError("topk_empty_bounded_pool")

@@ -204,7 +204,46 @@ def test_build_sem_agg_from_request() -> None:
     assert op.__class__.__name__ == "WindowOwnedSemAggFunction"
 
 
-def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
+def test_build_sem_topk_from_request_window_default_uses_persistent_runtime(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    sentinel.window_snapshots = _FakeDataStream()
+    sentinel.window_pools = _FakeDataStream()
+
+    def fake_materialize_window_stream(*args, **kwargs):
+        return sentinel.window_snapshots
+
+    def fake_map(self, func, output_type=None):
+        return sentinel.window_pools
+
+    def fake_build_external_window_persistent_topk_pipeline(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.materialize_window_stream",
+        fake_materialize_window_stream,
+    )
+    monkeypatch.setattr(_FakeDataStream, "map", fake_map, raising=False)
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline.build_external_window_persistent_topk_pipeline",
+        fake_build_external_window_persistent_topk_pipeline,
+    )
+
+    result = facade_builders.build_sem_topk_from_request(
+        sentinel.input_ds,
+        key_selector=sentinel.key_selector,
+        request=sem_topk(intent="Rank by relevance", k=3, context=context("window")),
+        runtime_config=_stateful_runtime_config(),
+    )
+
+    assert result is sentinel.stream
+    assert captured["args"] == (sentinel.window_pools,)
+    assert captured["kwargs"]["query_spec"].ranking_method == "pointwise"
+    assert captured["kwargs"]["topk_config"].persistence_policy is None
+
+
+def test_build_sem_topk_from_request_window_reset_per_scope_uses_pushdown(monkeypatch) -> None:
     captured: dict[str, object] = {}
     sentinel.window_snapshots = _FakeDataStream()
     sentinel.window_pools = _FakeDataStream()
@@ -230,11 +269,29 @@ def test_build_sem_topk_from_request_uses_internal_plan(monkeypatch) -> None:
         fake_apply_sem_topk_pushdown,
     )
 
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "operators": {
+                "sem_topk": {
+                    "query_spec": {
+                        "scope_policy": {
+                            "window_kind": "tumbling",
+                            "window_size_ms": 1000,
+                        },
+                    },
+                    "kernel": {
+                        "persistence_policy": "reset_per_scope",
+                    },
+                }
+            }
+        }
+    )
+
     result = facade_builders.build_sem_topk_from_request(
         sentinel.input_ds,
         key_selector=sentinel.key_selector,
         request=sem_topk(intent="Rank by relevance", k=3, context=context("window")),
-        runtime_config=_stateful_runtime_config(),
+        runtime_config=runtime_config,
     )
 
     assert result is sentinel.stream

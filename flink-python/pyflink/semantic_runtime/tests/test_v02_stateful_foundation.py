@@ -1161,6 +1161,9 @@ from pyflink.semantic_runtime.operators.stateful.sem_topk import (
     SemTopKConfig,
     SemTopKFunction,
 )
+from pyflink.semantic_runtime.operators.stateful.sem_topk_window import (
+    ScopedPersistentSemTopKFunction,
+)
 from pyflink.semantic_runtime.sem_spec import TopKQuerySpec, TopKScopePolicy
 
 class TestSemTopKConfig:
@@ -1673,6 +1676,88 @@ class TestSemTopKPureStateMachine:
         assert len(results) == 1
         assert results[0]["top_ids"] == ["c3"]
         assert set(func._candidates.keys()) == {"c3"}
+
+
+class TestScopedPersistentSemTopK:
+    def _make_func(self, k=2):
+        cfg = SemTopKConfig(emission_policy="snapshot")
+        qs = TopKQuerySpec(k=k)
+        func = ScopedPersistentSemTopKFunction(cfg, query_spec=qs)
+        func._scope_contributions = _FakeMapState()
+        func._snapshot = _FakeValueState()
+        func._meta = _FakeValueState()
+        func._metrics = None
+        return func
+
+    def test_replaces_same_scope_contribution(self):
+        func = self._make_func(k=1)
+        ctx = _FakeContext("k")
+        first = list(
+            func.process_element(
+                {
+                    "key": "k",
+                    "scope_id": "w1",
+                    "top_items": [{"candidate_id": "c1", "score": 0.5}],
+                    "query": "best weather",
+                    "query_seq_id": 1,
+                    "source": "scope_1",
+                },
+                ctx,
+            )
+        )
+        second = list(
+            func.process_element(
+                {
+                    "key": "k",
+                    "scope_id": "w1",
+                    "top_items": [{"candidate_id": "c2", "score": 0.9}],
+                    "query": "best weather",
+                    "query_seq_id": 1,
+                    "source": "scope_1",
+                },
+                ctx,
+            )
+        )
+        assert first[0]["top_ids"] == ["c1"]
+        assert second[0]["top_ids"] == ["c2"]
+        assert func._scope_contributions.get("w1")["top_items"][0]["candidate_id"] == "c2"
+
+    def test_dedupes_candidate_across_scopes_by_best_score(self):
+        func = self._make_func(k=2)
+        ctx = _FakeContext("k")
+        list(
+            func.process_element(
+                {
+                    "key": "k",
+                    "scope_id": "w1",
+                    "top_items": [
+                        {"candidate_id": "c1", "score": 0.4},
+                        {"candidate_id": "c2", "score": 0.8},
+                    ],
+                    "query": "best weather",
+                    "query_seq_id": 1,
+                    "source": "scope_1",
+                },
+                ctx,
+            )
+        )
+        second = list(
+            func.process_element(
+                {
+                    "key": "k",
+                    "scope_id": "w2",
+                    "top_items": [
+                        {"candidate_id": "c1", "score": 0.9},
+                        {"candidate_id": "c3", "score": 0.7},
+                    ],
+                    "query": "best weather",
+                    "query_seq_id": 1,
+                    "source": "scope_2",
+                },
+                ctx,
+            )
+        )
+        assert second[0]["top_ids"] == ["c1", "c2"]
 
 
 # ============================================================================
