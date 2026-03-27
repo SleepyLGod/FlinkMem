@@ -23,7 +23,7 @@ list. The operator uses the internal ``sem_score`` step to score these
 items and returns the top-k.
 
 This is the **local** V0.1 variant (no keyed state).  The continuous,
-stateful ``sem_topk`` lives in ``operators/stateful/sem_topk.py``.
+stateful ``sem_topk`` lives in ``operators/stateful/sem_topk_kernel.py``.
 
 Public callers should use ``build_sem_local_topk_operator(...)`` so ranking
 intent stays separate from internal backend configuration.

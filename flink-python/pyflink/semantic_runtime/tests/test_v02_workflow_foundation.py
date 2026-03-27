@@ -29,10 +29,10 @@ from pyflink.semantic_runtime.runtime.continuous_rag_workflow import (
     validate_rag_config,
 )
 from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig
-from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
-from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
-from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import SemGroupbyConfig
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
+from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowConfig
 
 
 class _FakeContext:

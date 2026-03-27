@@ -18,7 +18,7 @@
 """Planner/builder for ``sem_topk``.
 
 This module keeps only orchestration logic. Worker classes, contextual plans,
-and scoring helpers live in ``sem_topk_workers.py`` so the builder stays small
+and scoring helpers live in ``sem_topk_worker.py`` so the builder stays small
 and path selection remains easy to audit.
 """
 
@@ -34,12 +34,12 @@ from pyflink.semantic_runtime.llm_client import LLMClientConfig
 from pyflink.semantic_runtime.runtime_config import EmbeddingBackendConfig
 from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 from pyflink.semantic_runtime.runtime.event_model import retrieve_to_topk_items
-from pyflink.semantic_runtime.operators.stateful.sem_topk import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import (
     SemTopKConfig,
     SemTopKFunction,
     resolve_topk_persistence_policy,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_topk_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_bounded import (
     ScopedPersistentSemTopKFunction,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_topk_scope_runtime import SemTopKScopeSnapshotFunction
@@ -47,7 +47,7 @@ from pyflink.semantic_runtime.runtime.plans import (
     SemLoweringPlan,
     resolve_topk_lowering_plan,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_topk_workers import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_worker import (
     TopKContextualPlan,
     _BoundedPoolEmbeddingTopKSnapshotWorker,
     _BoundedPoolExternalScoreRerankerWorker,

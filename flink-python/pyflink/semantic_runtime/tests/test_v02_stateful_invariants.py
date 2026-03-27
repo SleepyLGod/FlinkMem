@@ -18,7 +18,7 @@ from collections import deque
 import pytest
 
 from pyflink.semantic_runtime.runtime.event_model import SemEvent
-from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig, SemWindowFunction, _new_window_meta
+from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowConfig, SemWindowFunction, _new_window_meta
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_window_event_buffer_descriptor,
@@ -42,14 +42,14 @@ from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
 from pyflink.semantic_runtime.runtime.stateful_async_executor import (
     ensure_thread_pool_executor,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
     SemGroupbyConfig,
     SemGroupbyFunction,
     _new_group_profile,
 )
 from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig, SemSearchFunction
-from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
-from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec, GroupbyScopePolicy, TriggerPolicy, AggQuerySpec, AggScopePolicy, TopKQuerySpec
 from pyflink.semantic_runtime.runtime.external_search_backend import MockSearchBackend
 from pyflink.semantic_runtime.runtime.continuous_rag_workflow import ContinuousRAGConfig

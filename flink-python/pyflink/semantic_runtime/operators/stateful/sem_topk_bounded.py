@@ -15,7 +15,7 @@ from pyflink.common import Types
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import MapState, ValueState, ValueStateDescriptor
 
-from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     build_ttl_config,
     sem_topk_scope_contributions_descriptor,

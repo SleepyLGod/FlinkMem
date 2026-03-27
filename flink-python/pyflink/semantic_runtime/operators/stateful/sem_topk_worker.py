@@ -49,7 +49,7 @@ from pyflink.semantic_runtime.runtime.simple_text_encoder import (
     HashingTextEncoder,
     tokenize_text,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_topk import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import (
     SemTopKConfig,
 )
 

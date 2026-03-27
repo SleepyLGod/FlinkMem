@@ -23,13 +23,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.stateful.sem_agg import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import (
     SemAggConfig,
     SemAggFunction,
     ensure_agg_query_spec,
     resolve_agg_persistence_policy,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_agg_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_bounded import (
     WindowOwnedSemAggFunction,
 )
 from pyflink.semantic_runtime.runtime.plans import (

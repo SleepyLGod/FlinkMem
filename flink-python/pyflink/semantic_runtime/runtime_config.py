@@ -47,11 +47,11 @@ from pyflink.semantic_runtime.sem_spec import (
 )
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.runtime.plans import SemLoweringPlan
-    from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_join import SemJoinConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import SemGroupbyConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_join_kernel import SemJoinConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowConfig
     from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig
     from pyflink.semantic_runtime.runtime.state_descriptors import OverflowPolicy
 
@@ -626,7 +626,7 @@ class RuntimeConfig:
     # -- typed kernel configs ------------------------------------------------
 
     def get_topk_kernel_config(self) -> SemTopKConfig:
-        from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_topk",
@@ -643,7 +643,7 @@ class RuntimeConfig:
         return SemTopKConfig(**kwargs)
 
     def get_groupby_kernel_config(self) -> SemGroupbyConfig:
-        from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import SemGroupbyConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_groupby",
@@ -660,7 +660,7 @@ class RuntimeConfig:
         return SemGroupbyConfig(**kwargs)
 
     def get_agg_kernel_config(self) -> SemAggConfig:
-        from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_agg",
@@ -697,7 +697,7 @@ class RuntimeConfig:
         return SemSearchConfig(**kwargs)
 
     def get_join_kernel_config(self) -> "SemJoinConfig":
-        from pyflink.semantic_runtime.operators.stateful.sem_join import SemJoinConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_join_kernel import SemJoinConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_join",
@@ -710,7 +710,7 @@ class RuntimeConfig:
         return SemJoinConfig(**kwargs)
 
     def get_window_config(self) -> "SemWindowConfig":
-        from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
+        from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowConfig
 
         _query_raw, kernel_raw = self._get_operator_sections(
             "sem_window",
@@ -734,7 +734,7 @@ class RuntimeConfig:
         from pyflink.semantic_runtime.runtime.plans import (
             resolve_topk_lowering_plan,
         )
-        from pyflink.semantic_runtime.operators.stateful.sem_topk import (
+        from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import (
             resolve_topk_persistence_policy,
         )
 
@@ -758,7 +758,7 @@ class RuntimeConfig:
         from pyflink.semantic_runtime.runtime.plans import (
             resolve_groupby_lowering_plan,
         )
-        from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+        from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
             resolve_groupby_persistence_policy,
         )
 
@@ -782,7 +782,7 @@ class RuntimeConfig:
         from pyflink.semantic_runtime.runtime.plans import (
             resolve_agg_lowering_plan,
         )
-        from pyflink.semantic_runtime.operators.stateful.sem_agg import (
+        from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import (
             resolve_agg_persistence_policy,
         )
 

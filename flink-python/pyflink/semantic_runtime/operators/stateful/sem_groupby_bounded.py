@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pyflink.datastream.functions import KeyedProcessFunction
 
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
     _LOCAL_GROUPBY_VARIANTS,
     _LLM_GROUPBY_VARIANTS,
     GROUPBY_DERIVED_LABEL_TOKEN_LIMIT,

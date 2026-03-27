@@ -23,12 +23,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
     SemGroupbyConfig,
     SemGroupbyFunction,
     resolve_groupby_persistence_policy,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_groupby_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_bounded import (
     WindowOwnedSemGroupbyFunction,
 )
 from pyflink.semantic_runtime.runtime.plans import (

@@ -130,7 +130,7 @@ class SemTopKScopeSnapshotFunction(KeyedProcessFunction):
         query_spec: Optional[TopKQuerySpec] = None,
     ) -> None:
         if config is None:
-            from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
+            from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
 
             config = SemTopKConfig()
         self._config = config

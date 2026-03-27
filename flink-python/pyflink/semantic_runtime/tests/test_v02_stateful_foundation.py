@@ -47,7 +47,7 @@ from pyflink.semantic_runtime.runtime.timer_policy import (
     clear_timer_registration,
     schedule_policy_timers,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import (
     SemWindowConfig,
     SemWindowFunction,
     _new_window_meta,
@@ -788,7 +788,7 @@ class TestAsyncWorkTag:
 # SemGroupby Logic Tests (no Flink runtime — test pure internals)
 # ============================================================================
 
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
     SemGroupbyConfig,
     SemGroupbyFunction,
     _new_group_profile,
@@ -1088,7 +1088,7 @@ def _drain_sem_window_async(
 # SemAgg Logic Tests
 # ============================================================================
 
-from pyflink.semantic_runtime.operators.stateful.sem_agg import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import (
     SemAggConfig,
     SemAggFunction,
 )
@@ -1224,11 +1224,11 @@ class TestSemAggSummarize:
 # SemTopK Logic Tests
 # ============================================================================
 
-from pyflink.semantic_runtime.operators.stateful.sem_topk import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import (
     SemTopKConfig,
     SemTopKFunction,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_topk_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_bounded import (
     ScopedPersistentSemTopKFunction,
 )
 from pyflink.semantic_runtime.sem_spec import TopKQuerySpec, TopKScopePolicy

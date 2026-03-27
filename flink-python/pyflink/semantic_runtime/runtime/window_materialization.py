@@ -180,7 +180,7 @@ def materialize_window_stream(
     )
 
     if scope_policy.window_kind == "semantic":
-        from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowFunction
+        from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowFunction
 
         sem_window_config = replace(
             runtime_config.get_window_config(),

@@ -7,7 +7,7 @@ import time
 import pytest
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig
-from pyflink.semantic_runtime.operators.stateful.sem_join import (
+from pyflink.semantic_runtime.operators.stateful.sem_join_kernel import (
     SemJoinConfig,
     SemJoinFunction,
 )

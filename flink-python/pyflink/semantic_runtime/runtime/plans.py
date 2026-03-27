@@ -59,11 +59,11 @@ from pyflink.semantic_runtime.sem_spec import (
 
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.operators.row.sem_lookup_join import SemLookupJoinConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_join import SemJoinConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import SemGroupbyConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_join_kernel import SemJoinConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowConfig
     from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 

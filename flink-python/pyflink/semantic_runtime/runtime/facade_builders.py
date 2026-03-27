@@ -123,7 +123,7 @@ def build_sem_window_from_request(
     runtime_config: RuntimeConfig,
 ):
     """Build a semantic window runtime from a public request."""
-    from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowFunction
+    from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowFunction
 
     plan = lower_sem_window_request(request, runtime_config)
     return SemWindowFunction(
@@ -260,7 +260,7 @@ def apply_sem_groupby_from_request(
     async_capacity: int = 20,
 ) -> DataStream:
     """Apply a stateful semantic groupby request to one input stream."""
-    from pyflink.semantic_runtime.operators.stateful.sem_groupby_window import (
+    from pyflink.semantic_runtime.operators.stateful.sem_groupby_bounded import (
         WindowOwnedSemGroupbyFunction,
     )
 
@@ -374,7 +374,7 @@ def apply_sem_join_from_request(
     right_key_selector: Callable,
 ) -> DataStream:
     """Apply a public semantic join request to two keyed streams."""
-    from pyflink.semantic_runtime.operators.stateful.sem_join import (
+    from pyflink.semantic_runtime.operators.stateful.sem_join_kernel import (
         build_sem_join_operator,
     )
 

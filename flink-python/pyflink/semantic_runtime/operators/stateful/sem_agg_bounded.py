@@ -31,7 +31,7 @@ from pyflink.semantic_runtime.runtime.event_model import (
     is_window_snapshot,
     window_snapshot_to_sem_events,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_agg import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import (
     SemAggConfig,
     _aggregate_event_records,
     resolve_agg_runtime_params,

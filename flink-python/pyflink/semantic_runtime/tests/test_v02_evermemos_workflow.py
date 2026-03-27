@@ -40,11 +40,11 @@ from pyflink.semantic_runtime.runtime.continuous_rag_components import (
 )
 from pyflink.semantic_runtime.runtime.timer_policy import TimerCategory, encode_timer_key
 from pyflink.semantic_runtime.runtime.steps.sem_search import SemSearchConfig, SemSearchFunction
-from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import build_sem_agg_operator
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig, SemGroupbyFunction
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import SemGroupbyConfig, SemGroupbyFunction
 from pyflink.semantic_runtime.operators.stateful.sem_groupby_pipeline import build_sem_groupby_operator
-from pyflink.semantic_runtime.operators.stateful.sem_topk import SemTopKConfig, SemTopKFunction
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig, SemTopKFunction
 from pyflink.semantic_runtime.runtime.external_search_backend import (
     MockSearchBackend,
     SearchBackendAsyncFn,
@@ -59,7 +59,7 @@ from pyflink.semantic_runtime.sem_spec import (
 from pyflink.semantic_runtime.operators.stateful.sem_topk_pipeline import (
     _BoundedPoolExternalScoreRerankerWorker,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_window import SemWindowConfig, SemWindowFunction
+from pyflink.semantic_runtime.operators.stateful.sem_window_kernel import SemWindowConfig, SemWindowFunction
 
 
 # ---------------------------------------------------------------------------

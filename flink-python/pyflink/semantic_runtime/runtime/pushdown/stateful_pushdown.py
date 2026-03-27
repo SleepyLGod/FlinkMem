@@ -25,7 +25,7 @@ from pyflink.semantic_runtime.runtime.pushdown.common import (
     parse_json_or_passthrough,
     parse_window_snapshot,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
     _LLM_GROUPBY_VARIANTS,
     _LOCAL_GROUPBY_VARIANTS,
     _append_profile_example,
@@ -36,11 +36,11 @@ from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     resolve_groupby_runtime_params,
     score_group_profile,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_topk_workers import (
+from pyflink.semantic_runtime.operators.stateful.sem_topk_worker import (
     extract_topk_candidate_text,
     lexical_similarity,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_agg_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_bounded import (
     COMPRESSIVE_KEEP_DIVISOR,
     COMPRESSIVE_MIN_EVENTS_FOR_TRUNCATION,
 )
@@ -49,8 +49,8 @@ from pyflink.semantic_runtime.llm_client import LLMClient, create_llm_client
 
 if TYPE_CHECKING:
     from pyflink.semantic_runtime.llm_client import LLMClientConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig
-    from pyflink.semantic_runtime.operators.stateful.sem_groupby import SemGroupbyConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig
+    from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import SemGroupbyConfig
     from pyflink.semantic_runtime.runtime_config import RuntimeConfig
 
 

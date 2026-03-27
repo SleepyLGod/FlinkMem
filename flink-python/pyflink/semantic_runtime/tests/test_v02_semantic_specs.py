@@ -37,7 +37,7 @@ from pyflink.semantic_runtime.sem_spec import (
     TopKScopePolicy,
 )
 from pyflink.semantic_runtime.runtime_config import RuntimeConfig, DefaultsConfig
-from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_kernel import (
     SemGroupbyConfig,
     SemGroupbyFunction,
     _new_group_profile,
@@ -46,13 +46,13 @@ from pyflink.semantic_runtime.operators.stateful.sem_groupby_pipeline import (
     build_sem_groupby_operator,
     resolve_groupby_execution_plan,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_groupby_window import WindowOwnedSemGroupbyFunction
-from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, SemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_bounded import WindowOwnedSemGroupbyFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg_kernel import SemAggConfig, SemAggFunction
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
     build_sem_agg_operator,
     resolve_agg_execution_plan,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_agg_window import WindowOwnedSemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_agg_bounded import WindowOwnedSemAggFunction
 from pyflink.semantic_runtime.runtime.plans import (
     resolve_topk_lowering_plan,
     resolve_groupby_lowering_plan,
@@ -209,14 +209,14 @@ from pyflink.semantic_runtime.operators.stateful.sem_groupby_pipeline import (
     build_sem_groupby_operator,
     resolve_groupby_execution_plan,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_groupby_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_groupby_bounded import (
     WindowOwnedSemGroupbyFunction,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
     build_sem_agg_operator,
     resolve_agg_execution_plan,
 )
-from pyflink.semantic_runtime.operators.stateful.sem_agg_window import (
+from pyflink.semantic_runtime.operators.stateful.sem_agg_bounded import (
     WindowOwnedSemAggFunction,
 )
 from pyflink.semantic_runtime.runtime.plans import (
