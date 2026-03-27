@@ -53,6 +53,7 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
     resolve_agg_execution_plan,
 )
 from pyflink.semantic_runtime.operators.stateful.sem_agg_bounded import WindowOwnedSemAggFunction
+from pyflink.semantic_runtime.operators.stateful.sem_topk_kernel import SemTopKConfig
 from pyflink.semantic_runtime.runtime.plans import (
     resolve_topk_lowering_plan,
     resolve_groupby_lowering_plan,
@@ -401,6 +402,10 @@ class TestGroupbyQuerySpec:
     def test_invalid_internal_assignment_batch_size(self):
         with pytest.raises(ValueError, match="assignment_batch_size"):
             SemGroupbyConfig(assignment_batch_size=0)
+
+    def test_groupby_rejects_hybrid_persistence_policy(self):
+        with pytest.raises(ValueError, match="Invalid sem_groupby persistence_policy"):
+            SemGroupbyConfig(persistence_policy="hybrid")
 
     def test_runtime_assign_threshold_used_by_process_path(self):
         cfg = SemGroupbyConfig(
@@ -1448,12 +1453,11 @@ class TestSemLoweringPlans:
         assert plan.lowering_kind == "native_runtime"
         assert plan.classical_operator is None
 
-    def test_join_lowers_to_match_plus_join(self):
+    def test_join_stays_native_runtime(self):
         plan = resolve_join_lowering_plan(JoinQuerySpec())
-        assert plan.lowering_kind == "derived_attribute_then_classical"
-        assert plan.classical_operator == "join/filter"
-        assert plan.derived_attribute is not None
-        assert plan.derived_attribute.attribute_kind == "match"
+        assert plan.lowering_kind == "native_runtime"
+        assert plan.classical_operator is None
+        assert plan.derived_attribute is None
 
 
 class TestAggQuerySpec:
@@ -1549,6 +1553,14 @@ class TestAggQuerySpec:
             input_kind="window_snapshot",
         )
         assert isinstance(op, WindowOwnedSemAggFunction)
+
+    def test_agg_rejects_hybrid_persistence_policy(self):
+        with pytest.raises(ValueError, match="Invalid sem_agg persistence_policy"):
+            SemAggConfig(persistence_policy="hybrid")
+
+    def test_topk_rejects_hybrid_persistence_policy(self):
+        with pytest.raises(ValueError, match="Invalid sem_topk persistence_policy"):
+            SemTopKConfig(persistence_policy="hybrid")
 
     def test_builder_event_stream_defaults_to_operator_owned(self):
         spec = AggQuerySpec()

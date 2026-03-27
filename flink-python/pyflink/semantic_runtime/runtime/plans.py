@@ -593,21 +593,14 @@ def resolve_agg_lowering_plan(
 
 
 def resolve_join_lowering_plan(query_spec: JoinQuerySpec) -> SemLoweringPlan:
-    """Resolve the logical form for future ``sem_join``."""
+    """Resolve the logical form for ``sem_join``."""
+    _ = query_spec
     return SemLoweringPlan(
         operator_name="sem_join",
-        lowering_kind="derived_attribute_then_classical",
-        classical_operator="join/filter",
-        derived_attribute=SemDerivedAttrPlan(
-            attribute_kind="match",
-            output_field="match_score",
-            backend=query_spec.semantic.backend,
-            stable_per_record=False,
-            bounded_context=False,
-        ),
+        lowering_kind="native_runtime",
         notes=(
-            "Logical sem_join can be modeled as semantic match score/predicate "
-            "plus classical join/filter even if runtime still needs native "
-            "candidate generation and pruning.",
+            "sem_join runs as one native continuous two-input stateful runtime "
+            "with semantic matching, event-time finalize boundaries, and "
+            "cross-scope dedupe.",
         ),
     )

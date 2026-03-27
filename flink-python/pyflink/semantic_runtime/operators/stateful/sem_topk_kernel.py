@@ -81,7 +81,7 @@ from pyflink.semantic_runtime.sem_spec import TopKQuerySpec
 logger = logging.getLogger(__name__)
 
 _VALID_INTERNAL_TOPK_SCORERS = {"llm", "embedding", "external_score"}
-_VALID_TOPK_PERSISTENCE_POLICIES = {"persistent_across_scopes", "reset_per_scope", "hybrid"}
+_VALID_TOPK_PERSISTENCE_POLICIES = {"persistent_across_scopes", "reset_per_scope"}
 DEFAULT_TOPK_MAX_CANDIDATES = 100
 DEFAULT_TOPK_RECOMPUTE_INTERVAL_MS = 10_000
 DEFAULT_TOPK_TTL_SECONDS = 3600
@@ -160,7 +160,13 @@ def resolve_topk_persistence_policy(
     """Resolve top-k state persistence independently from scope source."""
     _ = scope_source
     if config.persistence_policy is not None:
-        return str(config.persistence_policy)
+        policy = str(config.persistence_policy)
+        if policy not in _VALID_TOPK_PERSISTENCE_POLICIES:
+            raise ValueError(
+                f"Invalid sem_topk persistence_policy={policy!r}. "
+                f"Must be one of {_VALID_TOPK_PERSISTENCE_POLICIES}."
+            )
+        return policy
     return "persistent_across_scopes"
 
 # ---------------------------------------------------------------------------

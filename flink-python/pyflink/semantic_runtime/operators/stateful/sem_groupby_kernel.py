@@ -89,7 +89,6 @@ _VALID_GROUPBY_VARIANTS = _LOCAL_GROUPBY_VARIANTS | _LLM_GROUPBY_VARIANTS
 _VALID_GROUPBY_PERSISTENCE_POLICIES = {
     "reset_per_scope",
     "persistent_across_scopes",
-    "hybrid",
 }
 DEFAULT_GROUPBY_MAX_GROUPS_PER_KEY = 50
 DEFAULT_GROUPBY_ASSIGNMENT_BATCH_SIZE = 1
@@ -344,8 +343,15 @@ def resolve_groupby_persistence_policy(
     scope_source: str,
 ) -> str:
     """Resolve group-state persistence independently from scope source."""
+    _ = scope_source
     if config.persistence_policy is not None:
-        return str(config.persistence_policy)
+        policy = str(config.persistence_policy)
+        if policy not in _VALID_GROUPBY_PERSISTENCE_POLICIES:
+            raise ValueError(
+                f"Invalid sem_groupby persistence_policy={policy!r}. "
+                f"Must be one of {_VALID_GROUPBY_PERSISTENCE_POLICIES}."
+            )
+        return policy
     return "persistent_across_scopes"
 
 

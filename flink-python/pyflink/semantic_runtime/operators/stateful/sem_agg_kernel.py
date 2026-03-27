@@ -85,7 +85,6 @@ logger = logging.getLogger(__name__)
 _VALID_AGG_PERSISTENCE_POLICIES = {
     "persistent_across_scopes",
     "reset_per_scope",
-    "hybrid",
 }
 DEFAULT_SEM_AGG_MAX_BUFFER_EVENTS = 100
 DEFAULT_SEM_AGG_FLUSH_INTERVAL_MS = 30_000
@@ -246,7 +245,13 @@ def resolve_agg_persistence_policy(
     """Resolve aggregate-state persistence independently from scope source."""
     _ = scope_source
     if config.persistence_policy is not None:
-        return str(config.persistence_policy)
+        policy = str(config.persistence_policy)
+        if policy not in _VALID_AGG_PERSISTENCE_POLICIES:
+            raise ValueError(
+                f"Invalid sem_agg persistence_policy={policy!r}. "
+                f"Must be one of {_VALID_AGG_PERSISTENCE_POLICIES}."
+            )
+        return policy
     return "persistent_across_scopes"
 
 
