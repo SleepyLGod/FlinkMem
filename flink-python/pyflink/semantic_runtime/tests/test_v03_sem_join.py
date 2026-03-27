@@ -649,3 +649,89 @@ def test_sem_join_unsupported_trigger_fails_fast() -> None:
     )
     with pytest.raises(NotImplementedError, match="trigger_policy.mode"):
         fn.open(_FakeRuntimeContext())
+
+
+def test_sem_join_on_scope_close_defers_inner_match_until_finalize() -> None:
+    query_spec = JoinQuerySpec.simple(
+        instruction="Match same issue",
+        backend="embedding",
+        join_type="inner",
+        ttl_seconds=1,
+    )
+    query_spec.semantic.threshold = 0.0
+    query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
+    fn = SemJoinFunction(
+        query_spec=query_spec,
+        llm_config=_llm_config('{"matches": []}'),
+        kernel_config=SemJoinConfig(ttl_seconds=1),
+    )
+    fn.open(_FakeRuntimeContext())
+
+    out1 = list(
+        fn.process_element1(
+            {"key": "k", "text": "left", "event_time_ms": 1000},
+            _FakeContext(1000, current_watermark_ms=1000),
+        )
+    )
+    out2 = list(
+        fn.process_element2(
+            {"key": "k", "text": "right", "event_time_ms": 1000},
+            _FakeContext(1000, current_watermark_ms=1000),
+        )
+    )
+    assert out1 == []
+    assert out2 == []
+
+    out3 = _drain_async_event_time(fn, start_ms=1100, watermark_ms=1500)
+    assert out3 == []
+
+    out4 = _drain_async_event_time(fn, start_ms=2100, watermark_ms=2500)
+    assert len(out4) == 1
+    assert out4[0]["matched"] is True
+    assert out4[0]["left"]["text"] == "left"
+    assert out4[0]["right"]["text"] == "right"
+
+
+def test_sem_join_blocking_pairing_restricts_candidate_pairs() -> None:
+    query_spec = JoinQuerySpec.simple(
+        instruction="Match same issue",
+        backend="embedding",
+        join_type="inner",
+        pairing_method="blocking",
+    )
+    query_spec.semantic.threshold = 0.0
+    fn = SemJoinFunction(
+        query_spec=query_spec,
+        llm_config=_llm_config('{"matches": []}'),
+        kernel_config=SemJoinConfig(ttl_seconds=60),
+    )
+    fn.open(_FakeRuntimeContext())
+
+    list(fn.process_element1({"key": "k", "text": "alpha one"}, _FakeContext(1000)))
+    out = list(fn.process_element2({"key": "k", "text": "beta two"}, _FakeContext(1100)))
+    assert out == []
+
+    out2 = list(fn.process_element2({"key": "k", "text": "alpha three"}, _FakeContext(1200)))
+    assert len(out2) == 1
+    assert out2[0]["matched"] is True
+    assert out2[0]["left"]["text"] == "alpha one"
+    assert out2[0]["right"]["text"] == "alpha three"
+
+
+def test_sem_join_embedding_prefilter_pairing_requires_threshold() -> None:
+    query_spec = JoinQuerySpec.simple(
+        instruction="Match same issue",
+        backend="embedding",
+        join_type="inner",
+        pairing_method="embedding_prefilter",
+    )
+    fn = SemJoinFunction(
+        query_spec=query_spec,
+        llm_config=_llm_config('{"matches": []}'),
+        kernel_config=SemJoinConfig(ttl_seconds=60),
+    )
+    fn.open(_FakeRuntimeContext())
+
+    list(fn.process_element1({"key": "k", "text": "left"}, _FakeContext(1000)))
+    with pytest.raises(ValueError, match="embedding_prefilter pairing requires semantic.threshold"):
+        list(fn.process_element2({"key": "k", "text": "right"}, _FakeContext(1100)))

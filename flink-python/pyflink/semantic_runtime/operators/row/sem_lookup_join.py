@@ -174,7 +174,9 @@ class SemLookupJoinFunction(AsyncFunction):
             self._retriever = MockCandidateRetriever(
                 cfg.mock_candidates, cfg.mock_retrieve_delay_s)
         else:
-            self._retriever = MockCandidateRetriever([], 0.0)
+            raise ValueError(
+                "sem_lookup_join requires either search_backend or mock_candidates"
+            )
         self._retriever.open()
         logger.info(
             "SemLookupJoinFunction opened (max_cand=%d, timeout=%dms, right_block_size=%s)",

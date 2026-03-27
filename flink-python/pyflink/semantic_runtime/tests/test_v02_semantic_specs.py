@@ -241,20 +241,20 @@ class TestSemSpec:
             "Extract sentiment", output_schema={"sentiment": str}
         )
         assert spec.instruction == "Extract sentiment"
-        assert spec.backend == "hybrid"
+        assert spec.backend == "llm"
         assert spec.output_mode == "json"
         assert spec.schema == {"sentiment": str}
 
     def test_for_sem_map_text_mode(self):
         spec = SemSpec.for_sem_map("Summarize", return_mode="text")
-        assert spec.backend == "hybrid"
+        assert spec.backend == "llm"
         assert spec.output_mode == "text"
         assert spec.schema is None
 
     def test_for_sem_filter(self):
         spec = SemSpec.for_sem_filter("Keep weather-related events", threshold=0.8)
         assert spec.instruction == "Keep weather-related events"
-        assert spec.backend == "hybrid"
+        assert spec.backend == "llm"
         assert spec.output_mode == "bool"
         assert spec.threshold == 0.8
 
@@ -263,7 +263,7 @@ class TestSemSpec:
             "Rerank by relevance", threshold=0.5
         )
         assert spec.instruction == "Rerank by relevance"
-        assert spec.backend == "hybrid"
+        assert spec.backend == "llm"
         assert spec.output_mode == "score"
         assert spec.threshold == 0.5
 
@@ -405,6 +405,7 @@ class TestGroupbyQuerySpec:
     def test_runtime_assign_threshold_used_by_process_path(self):
         cfg = SemGroupbyConfig(
             max_groups_per_key=10,
+            variant="rule",
             confidence_threshold=0.4,
             new_group_creation_threshold=0.1,
         )
@@ -599,7 +600,11 @@ class TestGroupbyQuerySpec:
 
     def test_window_owned_does_not_reuse_groups_across_snapshots(self):
         func = WindowOwnedSemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10, confidence_threshold=0.5),
+            SemGroupbyConfig(
+                max_groups_per_key=10,
+                variant="rule",
+                confidence_threshold=0.5,
+            ),
             GroupbyQuerySpec(),
         )
         snapshot1 = {
@@ -935,7 +940,7 @@ class TestGroupbyQuerySpec:
                 return self._ts
 
         func = SemGroupbyFunction(
-            SemGroupbyConfig(max_groups_per_key=10),
+            SemGroupbyConfig(max_groups_per_key=10, variant="rule"),
             GroupbyQuerySpec(
                 maintenance_trigger_policy=TriggerPolicy(mode="periodic", interval_ms=50),
             ),

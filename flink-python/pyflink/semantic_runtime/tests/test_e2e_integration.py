@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 import ast
+import contextlib
+import io
 import statistics
 import sys
 import time
@@ -142,7 +144,8 @@ def parse_result_record(raw: str) -> Dict[str, Any]:
 def assert_job_fails(env: StreamExecutionEnvironment, result_stream, job_name: str) -> None:
     """Assert that the stream job fails during execution."""
     try:
-        collect_results(env, result_stream, job_name)
+        with contextlib.redirect_stderr(io.StringIO()):
+            collect_results(env, result_stream, job_name)
     except Exception:
         return
     raise AssertionError(f"Expected job {job_name!r} to fail")

@@ -57,10 +57,10 @@ def validate_generic_sem_spec(
     Generic semantic operators expose semantic intent only. Backend selection
     remains internal and must not be set on the public spec.
     """
-    if spec.backend != "hybrid":
+    if spec.backend != "llm":
         raise ValueError(
             f"{operator_name} does not expose backend selection. "
-            "Use internal runtime/kernel config for backend planning."
+            "Use semantic.backend='llm' and keep backend planning internal."
         )
     if spec.output_mode not in allowed_output_modes:
         raise ValueError(

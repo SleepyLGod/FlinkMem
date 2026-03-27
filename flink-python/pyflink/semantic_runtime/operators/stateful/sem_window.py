@@ -40,6 +40,7 @@ Timer pattern
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -65,8 +66,13 @@ from pyflink.semantic_runtime.runtime.steps.sem_window_summary import (
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_window_active_windows_descriptor,
+    sem_window_deferred_events_descriptor,
     sem_window_event_buffer_descriptor,
     sem_window_meta_descriptor,
+    sem_window_pending_continuity_descriptor,
+)
+from pyflink.semantic_runtime.runtime.stateful_async_executor import (
+    ensure_thread_pool_executor,
 )
 from pyflink.semantic_runtime.runtime.event_model import (
     SemEvent,
@@ -90,6 +96,8 @@ _VALID_CONTINUITY_VARIANTS = {
     "all_history",
 }
 _DEFAULT_PAIRWISE_CONTINUITY_THRESHOLD = 0.35
+DEFAULT_SEM_WINDOW_ASYNC_MAX_WORKERS = 20
+DEFAULT_SEM_WINDOW_ASYNC_POLL_INTERVAL_MS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +112,9 @@ class SemWindowConfig:
     boundary_flag: str = "topic_shift" # which flag to check for semantic boundary
     continuity_variant: str = "boundary_flag"
     continuity_threshold: float = _DEFAULT_PAIRWISE_CONTINUITY_THRESHOLD
+    llm_async_enabled: bool = True
+    async_max_workers: int = DEFAULT_SEM_WINDOW_ASYNC_MAX_WORKERS
+    async_poll_interval_ms: int = DEFAULT_SEM_WINDOW_ASYNC_POLL_INTERVAL_MS
     ttl_seconds: int = 3600
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
 
@@ -115,6 +126,10 @@ class SemWindowConfig:
             )
         if not isinstance(self.continuity_threshold, (int, float)):
             raise TypeError("continuity_threshold must be numeric")
+        if self.async_max_workers <= 0:
+            raise ValueError("sem_window async_max_workers must be > 0")
+        if self.async_poll_interval_ms <= 0:
+            raise ValueError("sem_window async_poll_interval_ms must be > 0")
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +165,52 @@ def _new_active_window_record(
     }
 
 
+def _evaluate_summary_assignment_with_update(
+    *,
+    client: LLMClient,
+    llm_config: LLMClientConfig,
+    active_records: list[Dict[str, Any]],
+    current_event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Evaluate summary-based assignment and compute updated summary in worker."""
+    best_window_id: Optional[str] = None
+    best_summary: Optional[str] = None
+    best_confidence = float("-inf")
+    for record in active_records:
+        summary = str(record.get("window_summary") or "").strip()
+        if not summary:
+            continue
+        result = evaluate_summary_sem_continuity_sync(
+            client=client,
+            llm_config=llm_config,
+            current_summary=summary,
+            current_event=current_event,
+        )
+        if not bool(result["continue_window"]):
+            continue
+        confidence = float(result["confidence"])
+        if confidence <= best_confidence:
+            continue
+        best_confidence = confidence
+        best_window_id = str(record["window_id"])
+        best_summary = summary
+    if best_window_id is None or best_summary is None:
+        return {
+            "matched_window_id": None,
+            "updated_summary": None,
+        }
+    updated_summary = update_sem_window_summary_sync(
+        client=client,
+        llm_config=llm_config,
+        current_summary=best_summary,
+        current_event=current_event,
+    )
+    return {
+        "matched_window_id": best_window_id,
+        "updated_summary": str(updated_summary),
+    }
+
+
 # ---------------------------------------------------------------------------
 # SemWindowFunction
 # ---------------------------------------------------------------------------
@@ -178,9 +239,13 @@ class SemWindowFunction(KeyedProcessFunction):
         self._event_buffer: Optional[ListState] = None
         self._window_meta: Optional[ValueState] = None
         self._active_windows: Optional[MapState] = None
+        self._pending_continuity: Optional[ValueState] = None
+        self._deferred_events: Optional[ListState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
         self._client: Optional[LLMClient] = None
         self._embedding_runtime: Optional[EmbeddingRuntime] = None
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._pending_futures: Dict[str, concurrent.futures.Future] = {}
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -194,6 +259,12 @@ class SemWindowFunction(KeyedProcessFunction):
         )
         self._active_windows = runtime_context.get_map_state(
             sem_window_active_windows_descriptor(ttl)
+        )
+        self._pending_continuity = runtime_context.get_state(
+            sem_window_pending_continuity_descriptor(ttl)
+        )
+        self._deferred_events = runtime_context.get_list_state(
+            sem_window_deferred_events_descriptor(ttl)
         )
         self._metrics = StatefulOperatorMetrics.from_runtime_context(
             runtime_context, "sem_window",
@@ -209,6 +280,10 @@ class SemWindowFunction(KeyedProcessFunction):
 
     def close(self) -> None:
         """Release continuity runtime resources."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+        self._pending_futures.clear()
         if self._client is not None:
             self._client.close()
             self._client = None
@@ -231,17 +306,28 @@ class SemWindowFunction(KeyedProcessFunction):
             event = SemEvent.from_dict(value)
             event_dict = value
         else:
-            # Fallback: treat as raw payload string
-            event = SemEvent(
-                key=str(ctx.get_current_key()),
-                payload=str(value),
-                seq_id=0,
-            )
-            event_dict = event.to_dict()
+            raise TypeError("sem_window expects SemEvent-shaped dict input")
 
         now_ms = int(time.time() * 1000)
         if self._metrics:
             self._metrics.record_event_processed()
+
+        if self._uses_async_continuity():
+            if self._config.continuity_variant == "summary":
+                yield from self._process_async_summary_event(
+                    event=event,
+                    event_dict=event_dict,
+                    ctx=ctx,
+                    now_ms=now_ms,
+                )
+            else:
+                yield from self._process_async_single_window_event(
+                    event=event,
+                    event_dict=event_dict,
+                    ctx=ctx,
+                    now_ms=now_ms,
+                )
+            return
 
         if self._uses_multi_active_windows():
             yield from self._process_multi_active_event(
@@ -283,6 +369,18 @@ class SemWindowFunction(KeyedProcessFunction):
         This fires when ``window_timeout_ms`` elapses since the window opened.
         Only performs local state operations — no LLM calls.
         """
+        now_ms = int(time.time() * 1000)
+        if self._uses_async_continuity():
+            yield from self._poll_pending_continuity(
+                ctx=ctx,
+                now_ms=now_ms,
+            )
+            if self._has_pending_continuity():
+                ctx.timer_service().register_processing_time_timer(
+                    now_ms + self._config.async_poll_interval_ms
+                )
+                return
+
         if self._uses_multi_active_windows():
             yield from self._on_multi_active_timer(timestamp)
             return
@@ -295,13 +393,21 @@ class SemWindowFunction(KeyedProcessFunction):
             self._metrics.record_timer_fire()
 
         # Resolve which timer category fired
-        category = resolve_timer_category(meta, timestamp)
+        category = resolve_timer_category(meta, timestamp, tolerance_ms=0)
         if category is None:
             return  # stale or unknown timer
 
         if category == TimerCategory.FLUSH:
+            if self._uses_async_continuity() and self._has_pending_continuity():
+                register_timer(
+                    ctx.timer_service(),
+                    meta,
+                    TimerCategory.FLUSH,
+                    now_ms + self._config.async_poll_interval_ms,
+                )
+                self._window_meta.update(meta)
+                return
             clear_timer_registration(meta, TimerCategory.FLUSH)
-            now_ms = int(time.time() * 1000)
             yield from self._emit_snapshot(meta, "time", now_ms)
         elif category == TimerCategory.EVICT:
             # Eviction: clear stale window state without emitting
@@ -330,6 +436,461 @@ class SemWindowFunction(KeyedProcessFunction):
     def _uses_multi_active_windows(self) -> bool:
         """Return whether the variant uses CP-style multi-active windows."""
         return self._config.continuity_variant in {"summary", "embedding"}
+
+    def _uses_async_continuity(self) -> bool:
+        """Return whether current continuity variant uses async bridge."""
+        if not self._config.llm_async_enabled:
+            return False
+        return self._config.continuity_variant in {"pairwise", "all_history", "summary"}
+
+    def _uses_async_single_window_continuity(self) -> bool:
+        """Return whether single-window continuity checks run via async bridge."""
+        return self._uses_async_continuity() and self._config.continuity_variant in {
+            "pairwise",
+            "all_history",
+        }
+
+    def _has_pending_continuity(self) -> bool:
+        """Return whether one continuity request is currently in-flight."""
+        assert self._pending_continuity is not None
+        pending = self._pending_continuity.value()
+        return isinstance(pending, dict) and bool(pending.get("request_id"))
+
+    def _enqueue_deferred_event(self, event_dict: Dict[str, Any]) -> None:
+        """Buffer one event while waiting for an async continuity decision."""
+        assert self._deferred_events is not None
+        self._deferred_events.add(dict(event_dict))
+
+    def _dequeue_deferred_event(self) -> Optional[Dict[str, Any]]:
+        """Pop the oldest deferred event, preserving arrival order."""
+        assert self._deferred_events is not None
+        queued = list(self._deferred_events.get())
+        if not queued:
+            return None
+        first = dict(queued[0])
+        self._deferred_events.clear()
+        for item in queued[1:]:
+            self._deferred_events.add(item)
+        return first
+
+    def _process_async_single_window_event(
+        self,
+        *,
+        event: SemEvent,
+        event_dict: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ):
+        """Process one event with non-blocking async continuity checks."""
+        outputs: list[Dict[str, Any]] = []
+        outputs.extend(self._poll_pending_continuity(ctx=ctx, now_ms=now_ms))
+        if self._has_pending_continuity():
+            self._enqueue_deferred_event(event_dict)
+            ctx.timer_service().register_processing_time_timer(
+                now_ms + self._config.async_poll_interval_ms
+            )
+            yield from outputs
+            return
+
+        outputs.extend(
+            self._process_single_window_event_ready(
+                event=event,
+                event_dict=event_dict,
+                ctx=ctx,
+                now_ms=now_ms,
+            )
+        )
+        while not self._has_pending_continuity():
+            next_event_dict = self._dequeue_deferred_event()
+            if next_event_dict is None:
+                break
+            outputs.extend(
+                self._process_single_window_event_ready(
+                    event=SemEvent.from_dict(next_event_dict),
+                    event_dict=next_event_dict,
+                    ctx=ctx,
+                    now_ms=now_ms,
+                )
+            )
+
+        if self._has_pending_continuity():
+            ctx.timer_service().register_processing_time_timer(
+                now_ms + self._config.async_poll_interval_ms
+            )
+        yield from outputs
+
+    def _process_async_summary_event(
+        self,
+        *,
+        event: SemEvent,
+        event_dict: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ):
+        """Process one summary-variant event with async non-blocking assignment."""
+        outputs: list[Dict[str, Any]] = []
+        outputs.extend(self._poll_pending_continuity(ctx=ctx, now_ms=now_ms))
+        if self._has_pending_continuity():
+            self._enqueue_deferred_event(event_dict)
+            ctx.timer_service().register_processing_time_timer(
+                now_ms + self._config.async_poll_interval_ms
+            )
+            yield from outputs
+            return
+        outputs.extend(
+            self._process_multi_active_summary_event_ready(
+                event=event,
+                event_dict=event_dict,
+                ctx=ctx,
+                now_ms=now_ms,
+            )
+        )
+        while not self._has_pending_continuity():
+            next_event_dict = self._dequeue_deferred_event()
+            if next_event_dict is None:
+                break
+            outputs.extend(
+                self._process_multi_active_summary_event_ready(
+                    event=SemEvent.from_dict(next_event_dict),
+                    event_dict=next_event_dict,
+                    ctx=ctx,
+                    now_ms=now_ms,
+                )
+            )
+        if self._has_pending_continuity():
+            ctx.timer_service().register_processing_time_timer(
+                now_ms + self._config.async_poll_interval_ms
+            )
+        yield from outputs
+
+    def _process_multi_active_summary_event_ready(
+        self,
+        *,
+        event: SemEvent,
+        event_dict: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> list[Dict[str, Any]]:
+        """Process one summary event when no async assignment is in-flight."""
+        records = self._list_active_window_records()
+        if not records:
+            record = self._open_active_window_record(ctx, event, event_dict, now_ms)
+            if int(record["event_count"]) >= self._config.max_window_events:
+                if self._metrics:
+                    self._metrics.record_boundary_trigger()
+                snapshot = self._build_active_window_snapshot(
+                    record=record,
+                    trigger_reason="count",
+                    close_time_ms=now_ms,
+                )
+                self._remove_active_window_record(str(record["window_id"]))
+                return [snapshot.to_dict()]
+            return []
+        self._dispatch_summary_assignment_async(
+            ctx=ctx,
+            now_ms=now_ms,
+            active_records=records,
+            event_dict=event_dict,
+        )
+        return []
+
+    def _process_single_window_event_ready(
+        self,
+        *,
+        event: SemEvent,
+        event_dict: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> list[Dict[str, Any]]:
+        """Process one event when no continuity request is in-flight."""
+        assert self._window_meta is not None
+        assert self._event_buffer is not None
+        outputs: list[Dict[str, Any]] = []
+        meta = self._window_meta.value()
+        if meta is None:
+            meta = self._open_window_meta(ctx, event, now_ms)
+        elif self._should_roll_window_before_continuity_check():
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
+            outputs.extend(list(self._emit_snapshot(meta, "count", now_ms)))
+            meta = self._open_window_meta(ctx, event, now_ms)
+        else:
+            events = list(self._event_buffer.get())
+            if events:
+                self._dispatch_continuity_async(
+                    ctx=ctx,
+                    now_ms=now_ms,
+                    previous_events=events,
+                    event_dict=event_dict,
+                )
+                return outputs
+
+        self._append_event(meta, event_dict)
+        self._refresh_summary_after_buffer_change(meta)
+        self._window_meta.update(meta)
+        trigger_reason = self._check_triggers(event, meta)
+        if trigger_reason:
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
+            outputs.extend(list(self._emit_snapshot(meta, trigger_reason, now_ms)))
+        return outputs
+
+    def _dispatch_continuity_async(
+        self,
+        *,
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+        previous_events: list[Dict[str, Any]],
+        event_dict: Dict[str, Any],
+    ) -> None:
+        """Dispatch one non-blocking continuity request."""
+        if self._client is None or self._llm_config is None:
+            raise RuntimeError("sem_window LLM continuity runtime is not initialized")
+        if self._has_pending_continuity():
+            raise RuntimeError("sem_window continuity single-flight violated")
+        if self._executor is None:
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
+                max_workers=self._config.async_max_workers,
+                thread_name_prefix="sem-window",
+            )
+        variant = self._config.continuity_variant
+        request_id = uuid.uuid4().hex
+        if variant == "pairwise":
+            future = self._executor.submit(
+                evaluate_pairwise_sem_continuity_sync,
+                client=self._client,
+                llm_config=self._llm_config,
+                previous_event=dict(previous_events[-1]),
+                current_event=dict(event_dict),
+            )
+        elif variant == "all_history":
+            future = self._executor.submit(
+                evaluate_all_history_sem_continuity_sync,
+                client=self._client,
+                llm_config=self._llm_config,
+                active_window_events=[dict(item) for item in previous_events],
+                current_event=dict(event_dict),
+            )
+        else:
+            raise ValueError(
+                f"sem_window async continuity does not support variant {variant!r}"
+            )
+        self._pending_futures[request_id] = future
+        assert self._pending_continuity is not None
+        self._pending_continuity.update(
+            {
+                "request_id": request_id,
+                "variant": variant,
+                "event": dict(event_dict),
+                "created_at_ms": int(now_ms),
+            }
+        )
+        ctx.timer_service().register_processing_time_timer(
+            now_ms + self._config.async_poll_interval_ms
+        )
+
+    def _dispatch_summary_assignment_async(
+        self,
+        *,
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+        active_records: list[Dict[str, Any]],
+        event_dict: Dict[str, Any],
+    ) -> None:
+        """Dispatch one async summary assignment+update request."""
+        if self._client is None or self._llm_config is None:
+            raise RuntimeError("sem_window summary runtime is not initialized")
+        if self._has_pending_continuity():
+            raise RuntimeError("sem_window summary assignment single-flight violated")
+        if self._executor is None:
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
+                max_workers=self._config.async_max_workers,
+                thread_name_prefix="sem-window",
+            )
+        request_id = uuid.uuid4().hex
+        future = self._executor.submit(
+            _evaluate_summary_assignment_with_update,
+            client=self._client,
+            llm_config=self._llm_config,
+            active_records=[
+                {
+                    "window_id": str(record["window_id"]),
+                    "window_summary": str(record.get("window_summary") or ""),
+                }
+                for record in active_records
+            ],
+            current_event=dict(event_dict),
+        )
+        self._pending_futures[request_id] = future
+        assert self._pending_continuity is not None
+        self._pending_continuity.update(
+            {
+                "request_id": request_id,
+                "variant": "summary",
+                "event": dict(event_dict),
+                "created_at_ms": int(now_ms),
+            }
+        )
+        ctx.timer_service().register_processing_time_timer(
+            now_ms + self._config.async_poll_interval_ms
+        )
+
+    def _poll_pending_continuity(
+        self,
+        *,
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> list[Dict[str, Any]]:
+        """Apply ready continuity results and drain deferred queue."""
+        assert self._pending_continuity is not None
+        pending = self._pending_continuity.value()
+        if not isinstance(pending, dict):
+            return []
+        request_id = str(pending.get("request_id", ""))
+        if not request_id:
+            return []
+        future = self._pending_futures.get(request_id)
+        if future is None:
+            raise RuntimeError(f"sem_window lost pending continuity future {request_id!r}")
+        if not future.done():
+            return []
+        result = future.result()
+        if not isinstance(result, dict):
+            raise RuntimeError("sem_window continuity result must be a dict")
+        del self._pending_futures[request_id]
+        self._pending_continuity.clear()
+
+        variant = str(pending.get("variant", ""))
+        if variant in {"pairwise", "all_history"}:
+            outputs = self._apply_pending_continuity_result(
+                pending=pending,
+                result=result,
+                ctx=ctx,
+                now_ms=now_ms,
+            )
+        elif variant == "summary":
+            outputs = self._apply_pending_summary_assignment_result(
+                pending=pending,
+                result=result,
+                ctx=ctx,
+                now_ms=now_ms,
+            )
+        else:
+            raise RuntimeError(
+                f"sem_window pending continuity has unsupported variant {variant!r}"
+            )
+        while not self._has_pending_continuity():
+            next_event_dict = self._dequeue_deferred_event()
+            if next_event_dict is None:
+                break
+            if self._config.continuity_variant == "summary":
+                outputs.extend(
+                    self._process_multi_active_summary_event_ready(
+                        event=SemEvent.from_dict(next_event_dict),
+                        event_dict=next_event_dict,
+                        ctx=ctx,
+                        now_ms=now_ms,
+                    )
+                )
+            else:
+                outputs.extend(
+                    self._process_single_window_event_ready(
+                        event=SemEvent.from_dict(next_event_dict),
+                        event_dict=next_event_dict,
+                        ctx=ctx,
+                        now_ms=now_ms,
+                    )
+                )
+        return outputs
+
+    def _apply_pending_continuity_result(
+        self,
+        *,
+        pending: Dict[str, Any],
+        result: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> list[Dict[str, Any]]:
+        """Apply one completed continuity decision in keyed owner context."""
+        assert self._window_meta is not None
+        meta = self._window_meta.value()
+        if meta is None:
+            raise RuntimeError("sem_window pending continuity resolved without active window")
+        event_dict = pending.get("event")
+        if not isinstance(event_dict, dict):
+            raise RuntimeError("sem_window pending continuity payload missing event")
+        event = SemEvent.from_dict(event_dict)
+        outputs: list[Dict[str, Any]] = []
+        if not bool(result.get("continue_window")):
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
+            outputs.extend(list(self._emit_snapshot(meta, "semantic_boundary", now_ms)))
+            meta = self._open_window_meta(ctx, event, now_ms)
+        self._append_event(meta, event_dict)
+        self._refresh_summary_after_buffer_change(meta)
+        self._window_meta.update(meta)
+        trigger_reason = self._check_triggers(event, meta)
+        if trigger_reason:
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
+            outputs.extend(list(self._emit_snapshot(meta, trigger_reason, now_ms)))
+        return outputs
+
+    def _apply_pending_summary_assignment_result(
+        self,
+        *,
+        pending: Dict[str, Any],
+        result: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> list[Dict[str, Any]]:
+        """Apply one completed summary assignment decision in owner context."""
+        event_dict = pending.get("event")
+        if not isinstance(event_dict, dict):
+            raise RuntimeError("sem_window pending summary payload missing event")
+        event = SemEvent.from_dict(event_dict)
+        matched_window_id = result.get("matched_window_id")
+        outputs: list[Dict[str, Any]] = []
+        if matched_window_id is None:
+            record = self._open_active_window_record(ctx, event, event_dict, now_ms)
+        else:
+            window_id = str(matched_window_id)
+            assert self._active_windows is not None
+            record = self._active_windows.get(window_id)
+            if record is None:
+                raise RuntimeError(
+                    f"sem_window summary target window {window_id!r} no longer exists"
+                )
+            events = list(record.get("events", []))
+            events.append(event_dict)
+            record["events"] = events
+            record["event_count"] = len(events)
+            record["last_update_ms"] = now_ms
+            updated_summary = result.get("updated_summary")
+            if not isinstance(updated_summary, str) or not updated_summary.strip():
+                raise RuntimeError("sem_window summary assignment missing updated_summary")
+            record["window_summary"] = updated_summary
+            record["representative_text"] = updated_summary
+            self._register_active_window_flush_timer(
+                ctx=ctx,
+                record=record,
+                base_time_ms=now_ms,
+            )
+            self._put_active_window_record(record)
+        if int(record["event_count"]) >= self._config.max_window_events:
+            if self._metrics:
+                self._metrics.record_boundary_trigger()
+            outputs.append(
+                self._build_active_window_snapshot(
+                    record=record,
+                    trigger_reason="count",
+                    close_time_ms=now_ms,
+                ).to_dict()
+            )
+            self._remove_active_window_record(str(record["window_id"]))
+        return outputs
 
     def _emit_snapshot(
         self, meta: Dict[str, Any], trigger_reason: str, close_time_ms: int
@@ -483,7 +1044,7 @@ class SemWindowFunction(KeyedProcessFunction):
         if self._metrics:
             self._metrics.record_timer_fire()
         for record in self._list_active_window_records():
-            category = resolve_timer_category(record, timestamp)
+            category = resolve_timer_category(record, timestamp, tolerance_ms=0)
             if category != TimerCategory.FLUSH:
                 continue
             clear_timer_registration(record, TimerCategory.FLUSH)

@@ -135,6 +135,24 @@ def sem_window_active_windows_descriptor(
     return desc
 
 
+def sem_window_pending_continuity_descriptor(
+    ttl_seconds: int = 3600,
+) -> ValueStateDescriptor:
+    """ValueState descriptor for in-flight sem_window continuity request metadata."""
+    desc = ValueStateDescriptor("sem_window_pending_continuity", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_window_deferred_events_descriptor(
+    ttl_seconds: int = 3600,
+) -> ListStateDescriptor:
+    """ListState descriptor for sem_window events deferred by async single-flight."""
+    desc = ListStateDescriptor("sem_window_deferred_events", Types.PICKLED_BYTE_ARRAY())
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 # ---------------------------------------------------------------------------
 # sem_groupby descriptors
 # ---------------------------------------------------------------------------

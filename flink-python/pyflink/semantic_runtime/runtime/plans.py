@@ -474,8 +474,6 @@ def lower_sem_join_request(
     query_spec.semantic.instruction = request.intent
     query_spec.join_type = request.join_type
     _join_context_to_runtime_kind(request.context.kind)
-    if request.context.kind == "window" and _is_default_on_event_trigger(query_spec.trigger_policy):
-        query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
     if request.context.kind != "window":
         query_spec.scope_policy.window_kind = None
     return SemJoinPlan(

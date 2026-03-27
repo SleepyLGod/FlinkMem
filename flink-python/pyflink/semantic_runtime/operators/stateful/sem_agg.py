@@ -70,6 +70,9 @@ from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
     single_flight_complete,
     single_flight_get_basis,
 )
+from pyflink.semantic_runtime.runtime.stateful_async_executor import (
+    ensure_thread_pool_executor,
+)
 from pyflink.semantic_runtime.sem_spec import (
     AggQuerySpec,
     AggScopePolicy,
@@ -465,7 +468,8 @@ class SemAggFunction(KeyedProcessFunction):
             runtime_context, "sem_agg",
         )
         if self._resolved_mode in {"summarize", "compressive"}:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
                 max_workers=self._config.async_max_workers,
                 thread_name_prefix="sem-agg",
             )
@@ -724,7 +728,8 @@ class SemAggFunction(KeyedProcessFunction):
     ) -> None:
         """Submit one async summary update from the current buffer contents."""
         if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
                 max_workers=self._config.async_max_workers,
                 thread_name_prefix="sem-agg",
             )

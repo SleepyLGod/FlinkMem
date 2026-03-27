@@ -636,6 +636,8 @@ class RuntimeConfig:
         for field_name in SemTopKConfig.__dataclass_fields__:
             if field_name in kernel_raw:
                 kwargs[field_name] = kernel_raw[field_name]
+        if "scorer_backend" not in kwargs:
+            kwargs["scorer_backend"] = "llm"
         if "overflow_policy" in kwargs:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return SemTopKConfig(**kwargs)
@@ -651,6 +653,8 @@ class RuntimeConfig:
         for field_name in SemGroupbyConfig.__dataclass_fields__:
             if field_name in kernel_raw:
                 kwargs[field_name] = kernel_raw[field_name]
+        if "variant" not in kwargs:
+            kwargs["variant"] = "llm_basic"
         if "overflow_policy" in kwargs:
             kwargs["overflow_policy"] = _coerce_overflow_policy(kwargs["overflow_policy"])
         return SemGroupbyConfig(**kwargs)

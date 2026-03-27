@@ -311,6 +311,8 @@ class TestSemWindowPairwiseContinuity:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
         func._active_windows = _FakeMapState()
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -319,10 +321,12 @@ class TestSemWindowPairwiseContinuity:
 
         first_out = list(func.process_element(first, ctx))
         second_out = list(func.process_element(second, ctx))
+        async_out = _drain_sem_window_async(func, ctx, start_ms=1100)
 
         assert first_out == []
-        assert len(second_out) == 1
-        snapshot = WindowSnapshot.from_dict(second_out[0])
+        assert second_out == []
+        assert len(async_out) == 1
+        snapshot = WindowSnapshot.from_dict(async_out[0])
         assert snapshot.event_count == 1
         assert snapshot.events[0]["payload"] == "alpha topic"
         remaining = func._event_buffer.get()
@@ -349,6 +353,8 @@ class TestSemWindowEmbeddingContinuity:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
         func._active_windows = _FakeMapState()
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -357,6 +363,7 @@ class TestSemWindowEmbeddingContinuity:
 
         first_out = list(func.process_element(first, ctx))
         second_out = list(func.process_element(second, ctx))
+        _drain_sem_window_async(func, ctx, start_ms=1100)
 
         assert first_out == []
         assert second_out == []
@@ -380,6 +387,8 @@ class TestSemWindowEmbeddingContinuity:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
         func._active_windows = _FakeMapState()
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -419,6 +428,8 @@ class TestSemWindowSummaryContinuity:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
         func._active_windows = _FakeMapState()
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -427,6 +438,7 @@ class TestSemWindowSummaryContinuity:
 
         first_out = list(func.process_element(first, ctx))
         second_out = list(func.process_element(second, ctx))
+        _drain_sem_window_async(func, ctx, start_ms=1100)
 
         assert first_out == []
         assert second_out == []
@@ -511,12 +523,15 @@ class TestSemWindowSummaryContinuity:
                 },
             }
         )
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
         func._client = _SequentialMockClient(responses)
 
         ctx = _FakeContext("k")
         third = SemEvent(key="k", payload="alpha budget roadmap", seq_id=3).to_dict()
         outputs = list(func.process_element(third, ctx))
+        _drain_sem_window_async(func, ctx, start_ms=1200)
 
         assert outputs == []
         updated = func._active_windows.get("w2")
@@ -548,6 +563,8 @@ class TestSemWindowAllHistoryContinuity:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
         func._active_windows = _FakeMapState()
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -556,6 +573,7 @@ class TestSemWindowAllHistoryContinuity:
 
         first_out = list(func.process_element(first, ctx))
         second_out = list(func.process_element(second, ctx))
+        _drain_sem_window_async(func, ctx, start_ms=1100)
 
         assert first_out == []
         assert second_out == []
@@ -583,6 +601,8 @@ class TestSemWindowAllHistoryContinuity:
         func._event_buffer = _FakeListState()
         func._window_meta = _FakeValueState(None)
         func._active_windows = _FakeMapState()
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._initialize_continuity_runtime()
 
         ctx = _FakeContext("k")
@@ -591,10 +611,12 @@ class TestSemWindowAllHistoryContinuity:
 
         first_out = list(func.process_element(first, ctx))
         second_out = list(func.process_element(second, ctx))
+        async_out = _drain_sem_window_async(func, ctx, start_ms=1100)
 
         assert first_out == []
-        assert len(second_out) == 1
-        snapshot = WindowSnapshot.from_dict(second_out[0])
+        assert second_out == []
+        assert len(async_out) == 1
+        snapshot = WindowSnapshot.from_dict(async_out[0])
         assert snapshot.event_count == 1
         assert snapshot.events[0]["payload"] == "alpha budget planning"
         remaining = func._event_buffer.get()
@@ -637,6 +659,8 @@ class TestSemWindowAllHistoryContinuity:
                 "key": "k",
             }
         )
+        func._pending_continuity = _FakeValueState(None)
+        func._deferred_events = _FakeListState()
         func._evaluate_all_history_continuity = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
             AssertionError("all_history LLM continuity should not run once the window is full")
         )
@@ -792,7 +816,7 @@ class TestSemGroupbyLocalAssign:
 
     def _make_func_with_groups(self, groups):
         """Create a SemGroupbyFunction with injected mock MapState."""
-        func = SemGroupbyFunction(SemGroupbyConfig())
+        func = SemGroupbyFunction(SemGroupbyConfig(variant="rule"))
         func._group_profiles = _FakeMapState(groups)
         return func
 
@@ -1041,6 +1065,23 @@ class _FakeContext:
 
     def timer_service(self):
         return self._timer_service
+
+
+def _drain_sem_window_async(
+    func: SemWindowFunction,
+    ctx: _FakeContext,
+    *,
+    start_ms: int = 1000,
+    steps: int = 50,
+) -> list[dict]:
+    outputs: list[dict] = []
+    for idx in range(steps):
+        timestamp = start_ms + idx
+        time.sleep(0.005)
+        outputs.extend(list(func.on_timer(timestamp, ctx)))
+        if not func._has_pending_continuity():
+            break
+    return outputs
 
 
 # ============================================================================
@@ -1356,7 +1397,7 @@ class TestSemTopKPureStateMachine:
         assert stored["_updated_ms"] == 1000
         assert stored["_score_version"] == 1
         assert stored["_query_version"] == 1
-        assert stored["_score_backend"] == "external_score"  # default from TopKQuerySpec
+        assert stored["_score_backend"] == "llm"
 
     def test_upsert_preserves_existing_versioning(self):
         func = self._make_func()

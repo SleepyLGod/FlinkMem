@@ -73,7 +73,7 @@ def test_lower_sem_map_request() -> None:
     assert plan.intent == "Extract sentiment: {input}"
     assert plan.output_mode == "json"
     assert plan.output_schema == {"sentiment": str, "confidence": float}
-    assert plan.semantic.backend == "hybrid"
+    assert plan.semantic.backend == "llm"
     assert plan.llm_config.backend == "mock"
 
 
@@ -88,7 +88,7 @@ def test_lower_sem_filter_request() -> None:
     )
     assert plan.intent == "Keep weather-related events"
     assert plan.semantic.output_mode == "bool"
-    assert plan.semantic.backend == "hybrid"
+    assert plan.semantic.backend == "llm"
     assert plan.llm_config.backend == "mock"
 
 
@@ -105,7 +105,7 @@ def test_lower_sem_local_topk_request() -> None:
     assert plan.intent == "Rank candidates"
     assert plan.k == 2
     assert plan.semantic.output_mode == "score"
-    assert plan.semantic.backend == "hybrid"
+    assert plan.semantic.backend == "llm"
     assert plan.items_field == "items"
 
 
@@ -262,4 +262,30 @@ def test_lower_sem_join_request_preserves_internal_window_spec() -> None:
     assert plan.query_spec.scope_policy.window_kind == "session"
     assert plan.query_spec.scope_policy.session_gap_ms == 500
     assert plan.query_spec.scope_policy.time_basis == "processing"
+    assert plan.query_spec.trigger_policy.mode == "on_event"
+
+
+def test_lower_sem_join_request_preserves_explicit_scope_close_trigger() -> None:
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "backend": "llm",
+                        "trigger_policy": {"mode": "on_scope_close"},
+                    },
+                    "kernel": {},
+                }
+            },
+        }
+    )
+    plan = lower_sem_join_request(
+        sem_join(
+            intent="Match related rows",
+            context=context("window"),
+            right_input=object(),
+        ),
+        runtime_config,
+    )
     assert plan.query_spec.trigger_policy.mode == "on_scope_close"

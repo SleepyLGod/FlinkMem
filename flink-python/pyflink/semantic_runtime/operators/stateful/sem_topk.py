@@ -130,7 +130,7 @@ class SemTopKConfig:
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     emission_policy: str = "delta"       # "delta" | "snapshot"
     score_field: str = "score"           # field name in candidate record
-    scorer_backend: str = "external_score"
+    scorer_backend: str = "llm"
     rerank_chunk_size: Optional[int] = None
     persistence_policy: Optional[str] = None
 
@@ -294,7 +294,7 @@ class SemTopKFunction(KeyedProcessFunction):
             self._metrics.record_event_processed()
 
         if not isinstance(value, dict):
-            return
+            raise TypeError("sem_topk expects dict candidate records")
 
         meta = self._meta.value() or {
             "key": str(ctx.get_current_key()),

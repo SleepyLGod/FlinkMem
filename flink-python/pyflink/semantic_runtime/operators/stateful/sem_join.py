@@ -50,6 +50,9 @@ from pyflink.semantic_runtime.runtime.state_descriptors import (
     sem_join_right_buffer_descriptor,
     sem_join_right_seen_seq_descriptor,
 )
+from pyflink.semantic_runtime.runtime.stateful_async_executor import (
+    ensure_thread_pool_executor,
+)
 from pyflink.semantic_runtime.runtime.steps import evaluate_sem_match_block_sync
 from pyflink.semantic_runtime.sem_spec import JoinQuerySpec
 
@@ -63,6 +66,10 @@ LEFT_SIDE = "left"
 RIGHT_SIDE = "right"
 LEFT_JOIN_FAMILY = {"left", "full"}
 RIGHT_JOIN_FAMILY = {"right", "full"}
+PAIRING_METHOD_BRUTE_FORCE = "brute_force"
+PAIRING_METHOD_CANDIDATE_PRUNED = "candidate_pruned"
+PAIRING_METHOD_EMBEDDING_PREFILTER = "embedding_prefilter"
+PAIRING_METHOD_BLOCKING = "blocking"
 
 
 @dataclass
@@ -144,16 +151,82 @@ def _embedding_threshold(query_spec: JoinQuerySpec) -> float:
     return numeric
 
 
+def _pairing_embedding_threshold(query_spec: JoinQuerySpec) -> float:
+    """Return the threshold used by embedding-prefilter pairing."""
+    threshold = query_spec.semantic.threshold
+    if threshold is None:
+        raise ValueError(
+            "sem_join embedding_prefilter pairing requires semantic.threshold in JoinQuerySpec"
+        )
+    numeric = float(threshold)
+    if not 0.0 <= numeric <= 1.0:
+        raise ValueError(
+            "sem_join embedding_prefilter threshold must be within [0.0, 1.0]"
+        )
+    return numeric
+
+
+def _payload_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for field_name in ("payload", "text", "content", "message"):
+            if field_name in payload:
+                return str(payload[field_name])
+        return " ".join(str(value) for value in payload.values())
+    return str(payload)
+
+
+def _blocking_key(payload: Any) -> str:
+    normalized = _payload_text(payload).strip().lower()
+    if not normalized:
+        return ""
+    return normalized.split()[0]
+
+
 def _build_candidate_pairs(
     *,
     left_records: Sequence[Dict[str, Any]],
     right_records: Sequence[Dict[str, Any]],
     kernel_config: SemJoinConfig,
+    pairing_method: str,
+    query_spec: JoinQuerySpec,
 ) -> List[Dict[str, Any]]:
     if not left_records or not right_records:
         return []
 
-    if kernel_config.prefilter_strategy == "none":
+    if pairing_method == PAIRING_METHOD_BRUTE_FORCE:
+        return [
+            {
+                "left_record_id": str(left["record_id"]),
+                "right_record_id": str(right["record_id"]),
+                "left": left["payload"],
+                "right": right["payload"],
+            }
+            for left in left_records
+            for right in right_records
+        ]
+
+    if pairing_method == PAIRING_METHOD_BLOCKING:
+        right_index: Dict[str, List[Dict[str, Any]]] = {}
+        for right in right_records:
+            right_index.setdefault(_blocking_key(right["payload"]), []).append(right)
+        pairs: List[Dict[str, Any]] = []
+        for left in left_records:
+            candidates = right_index.get(_blocking_key(left["payload"]), [])
+            for right in candidates:
+                pairs.append(
+                    {
+                        "left_record_id": str(left["record_id"]),
+                        "right_record_id": str(right["record_id"]),
+                        "left": left["payload"],
+                        "right": right["payload"],
+                    }
+                )
+        return pairs
+
+    if (
+        pairing_method == PAIRING_METHOD_CANDIDATE_PRUNED
+        and kernel_config.prefilter_strategy == "none"
+    ):
         return [
             {
                 "left_record_id": str(left["record_id"]),
@@ -166,15 +239,20 @@ def _build_candidate_pairs(
         ]
 
     encoder = HashingTextEncoder(dim=EMBEDDING_SIMILARITY_DIM)
+    threshold = (
+        _pairing_embedding_threshold(query_spec)
+        if pairing_method == PAIRING_METHOD_EMBEDDING_PREFILTER
+        else float(kernel_config.prefilter_min_score)
+    )
     pairs: List[Dict[str, Any]] = []
     for left in left_records:
         left_payload = left["payload"]
-        left_text = str(left_payload)
+        left_text = _payload_text(left_payload)
         for right in right_records:
             right_payload = right["payload"]
-            right_text = str(right_payload)
+            right_text = _payload_text(right_payload)
             similarity = encoder.similarity(left_text, right_text)
-            if similarity < kernel_config.prefilter_min_score:
+            if similarity < threshold:
                 continue
             pairs.append(
                 {
@@ -288,6 +366,15 @@ class SemJoinFunction(KeyedCoProcessFunction):
         self._right_seen_seq = runtime_context.get_map_state(
             sem_join_right_seen_seq_descriptor(self._kernel_config.ttl_seconds)
         )
+        if self._query_spec.pairing_method not in {
+            PAIRING_METHOD_CANDIDATE_PRUNED,
+            PAIRING_METHOD_EMBEDDING_PREFILTER,
+            PAIRING_METHOD_BLOCKING,
+            PAIRING_METHOD_BRUTE_FORCE,
+        }:
+            raise ValueError(
+                f"sem_join unsupported pairing_method={self._query_spec.pairing_method!r}"
+            )
 
     def close(self) -> None:
         if self._executor is not None:
@@ -325,6 +412,7 @@ class SemJoinFunction(KeyedCoProcessFunction):
         outputs = self._poll_pending_results(key=key, now_ms=now_ms, left_buffer=left_buffer, right_buffer=right_buffer)
         left_buffer, right_buffer, prune_outputs = self._prune_and_finalize(
             key=key,
+            now_ms=now_ms,
             cutoff_ms=cutoff_ms,
             left_buffer=left_buffer,
             right_buffer=right_buffer,
@@ -383,6 +471,8 @@ class SemJoinFunction(KeyedCoProcessFunction):
                     left_records=[left_record],
                     right_records=right_records,
                     kernel_config=self._kernel_config,
+                    pairing_method=self._query_spec.pairing_method,
+                    query_spec=self._query_spec,
                 )
                 right_buffer = right_records
             else:
@@ -402,10 +492,12 @@ class SemJoinFunction(KeyedCoProcessFunction):
                     left_records=left_records,
                     right_records=[right_record],
                     kernel_config=self._kernel_config,
+                    pairing_method=self._query_spec.pairing_method,
+                    query_spec=self._query_spec,
                 )
                 left_buffer = left_records
 
-            if not pair_rows:
+            if not pair_rows or self._query_spec.trigger_policy.mode != "on_event":
                 continue
             outputs.extend(
                 self._dispatch_or_evaluate(
@@ -419,6 +511,7 @@ class SemJoinFunction(KeyedCoProcessFunction):
 
         left_buffer, right_buffer, prune_outputs = self._prune_and_finalize(
             key=key,
+            now_ms=now_ms,
             cutoff_ms=cutoff_ms,
             left_buffer=left_buffer,
             right_buffer=right_buffer,
@@ -452,6 +545,7 @@ class SemJoinFunction(KeyedCoProcessFunction):
             "_event_time_ms": int(event_time_ms) if event_time_ms is not None else None,
             "matched_count": 0,
             "semi_emitted": False,
+            "close_eval_dispatched": False,
         }
 
     def _normalize_ingress_payloads(
@@ -505,7 +599,8 @@ class SemJoinFunction(KeyedCoProcessFunction):
             )
 
         if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
                 max_workers=self._kernel_config.async_max_workers,
                 thread_name_prefix="sem-join",
             )
@@ -677,6 +772,7 @@ class SemJoinFunction(KeyedCoProcessFunction):
         self,
         *,
         key: str,
+        now_ms: int,
         cutoff_ms: Optional[int],
         left_buffer: List[Dict[str, Any]],
         right_buffer: List[Dict[str, Any]],
@@ -685,6 +781,30 @@ class SemJoinFunction(KeyedCoProcessFunction):
             return left_buffer, right_buffer, []
         if cutoff_ms is None:
             return left_buffer, right_buffer, []
+        if self._query_spec.trigger_policy.mode == "on_scope_close":
+            return self._prune_and_finalize_on_scope_close(
+                key=key,
+                now_ms=now_ms,
+                cutoff_ms=cutoff_ms,
+                left_buffer=left_buffer,
+                right_buffer=right_buffer,
+            )
+        return self._prune_and_finalize_on_event(
+            key=key,
+            cutoff_ms=cutoff_ms,
+            left_buffer=left_buffer,
+            right_buffer=right_buffer,
+        )
+
+    def _prune_and_finalize_on_event(
+        self,
+        *,
+        key: str,
+        cutoff_ms: int,
+        left_buffer: List[Dict[str, Any]],
+        right_buffer: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        _ = key
 
         left_outputs: List[Dict[str, Any]] = []
         right_outputs: List[Dict[str, Any]] = []
@@ -714,6 +834,89 @@ class SemJoinFunction(KeyedCoProcessFunction):
                 right_outputs.append(self._unmatched_row(side=RIGHT_SIDE, payload=record["payload"]))
 
         return kept_left, kept_right, left_outputs + right_outputs
+
+    def _prune_and_finalize_on_scope_close(
+        self,
+        *,
+        key: str,
+        now_ms: int,
+        cutoff_ms: int,
+        left_buffer: List[Dict[str, Any]],
+        right_buffer: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        expired_left = [
+            record for record in left_buffer if self._record_time_ms(record) < cutoff_ms
+        ]
+        expired_right = [
+            record for record in right_buffer if self._record_time_ms(record) < cutoff_ms
+        ]
+        kept_left = [
+            record for record in left_buffer if self._record_time_ms(record) >= cutoff_ms
+        ]
+        kept_right = [
+            record for record in right_buffer if self._record_time_ms(record) >= cutoff_ms
+        ]
+        if not expired_left and not expired_right:
+            return left_buffer, right_buffer, []
+
+        dispatch_left = [
+            record for record in expired_left if not bool(record.get("close_eval_dispatched", False))
+        ]
+        dispatch_right = [
+            record for record in expired_right if not bool(record.get("close_eval_dispatched", False))
+        ]
+        pair_rows: List[Dict[str, Any]] = []
+        if dispatch_left:
+            pair_rows.extend(
+                _build_candidate_pairs(
+                    left_records=dispatch_left,
+                    right_records=right_buffer,
+                    kernel_config=self._kernel_config,
+                    pairing_method=self._query_spec.pairing_method,
+                    query_spec=self._query_spec,
+                )
+            )
+        if dispatch_right:
+            pair_rows.extend(
+                _build_candidate_pairs(
+                    left_records=kept_left,
+                    right_records=dispatch_right,
+                    kernel_config=self._kernel_config,
+                    pairing_method=self._query_spec.pairing_method,
+                    query_spec=self._query_spec,
+                )
+            )
+        for record in dispatch_left:
+            record["close_eval_dispatched"] = True
+        for record in dispatch_right:
+            record["close_eval_dispatched"] = True
+
+        outputs: List[Dict[str, Any]] = []
+        if pair_rows:
+            outputs.extend(
+                self._dispatch_or_evaluate(
+                    key=key,
+                    now_ms=now_ms,
+                    pair_rows=pair_rows,
+                    left_buffer=left_buffer,
+                    right_buffer=right_buffer,
+                )
+            )
+            if self._pending_count(key) > 0:
+                return left_buffer, right_buffer, outputs
+
+        join_type = self._query_spec.join_type
+        for record in expired_left:
+            if int(record.get("matched_count", 0)) > 0:
+                continue
+            if join_type in LEFT_JOIN_FAMILY or join_type == "anti":
+                outputs.append(self._unmatched_row(side=LEFT_SIDE, payload=record["payload"]))
+        for record in expired_right:
+            if int(record.get("matched_count", 0)) > 0:
+                continue
+            if join_type in RIGHT_JOIN_FAMILY:
+                outputs.append(self._unmatched_row(side=RIGHT_SIDE, payload=record["payload"]))
+        return kept_left, kept_right, outputs
 
     def _pending_count(self, key: str) -> int:
         return len(self._pending_by_key.get(key, []))

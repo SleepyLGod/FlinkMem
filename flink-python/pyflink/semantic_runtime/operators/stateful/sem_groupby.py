@@ -75,6 +75,9 @@ from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
     single_flight_get_basis,
     single_flight_is_in_flight,
 )
+from pyflink.semantic_runtime.runtime.stateful_async_executor import (
+    ensure_thread_pool_executor,
+)
 from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 
@@ -267,7 +270,7 @@ class SemGroupbyConfig:
     """Internal configuration for the semantic groupby operator."""
 
     max_groups_per_key: int = DEFAULT_GROUPBY_MAX_GROUPS_PER_KEY
-    variant: str = "rule"
+    variant: str = "llm_basic"
     persistence_policy: Optional[str] = None
     assignment_batch_size: int = DEFAULT_GROUPBY_ASSIGNMENT_BATCH_SIZE
     confidence_threshold: float = DEFAULT_GROUPBY_CONFIDENCE_THRESHOLD
@@ -332,7 +335,7 @@ def resolve_groupby_variant(
 ) -> str:
     """Resolve the internal grouping variant."""
     _ = query_spec
-    return str(config.variant or "rule")
+    return str(config.variant or "llm_basic")
 
 
 def resolve_groupby_persistence_policy(
@@ -866,7 +869,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
                     f"sem_groupby variant={self._resolved_variant!r} requires llm_config"
                 )
             if self._enable_async_llm_runtime:
-                self._executor = concurrent.futures.ThreadPoolExecutor(
+                self._executor = ensure_thread_pool_executor(
+                    self._executor,
                     max_workers=self._resolved_async_max_workers,
                     thread_name_prefix="sem-groupby",
                 )
@@ -1462,7 +1466,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
     ) -> Iterable[Dict[str, Any]]:
         """Dispatch one async assignment request."""
         if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
                 max_workers=self._resolved_async_max_workers,
                 thread_name_prefix="sem-groupby",
             )
@@ -1502,7 +1507,8 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if self._resolved_variant != "llm_refine":
             return []
         if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
+            self._executor = ensure_thread_pool_executor(
+                self._executor,
                 max_workers=self._resolved_async_max_workers,
                 thread_name_prefix="sem-groupby",
             )

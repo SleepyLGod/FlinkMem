@@ -114,7 +114,7 @@ class SemSpec:
         output_mode = return_mode  # "json" or "text"
         return cls(
             instruction=instruction,
-            backend="hybrid",
+            backend="llm",
             output_mode=output_mode,
             schema=output_schema,
         )
@@ -129,7 +129,7 @@ class SemSpec:
         """Build a SemSpec suited for ``sem_filter``."""
         return cls(
             instruction=instruction,
-            backend="hybrid",
+            backend="llm",
             output_mode="bool",
             threshold=threshold,
         )
@@ -144,7 +144,7 @@ class SemSpec:
         """Build a SemSpec suited for ``sem_topk`` scoring/reranking."""
         return cls(
             instruction=instruction,
-            backend="hybrid",
+            backend="llm",
             output_mode="score",
             threshold=threshold,
         )

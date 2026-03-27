@@ -39,6 +39,9 @@ from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
     single_flight_get_basis,
     single_flight_is_in_flight,
 )
+from pyflink.semantic_runtime.runtime.stateful_async_executor import (
+    ensure_thread_pool_executor,
+)
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     SemGroupbyConfig,
     SemGroupbyFunction,
@@ -156,7 +159,11 @@ class TestStateSafetyAudit:
 
     def test_groupby_overflow_drop_oldest_evicts(self):
         """sem_groupby: DROP_OLDEST should evict when at max groups."""
-        cfg = SemGroupbyConfig(max_groups_per_key=2, overflow_policy=OverflowPolicy.DROP_OLDEST)
+        cfg = SemGroupbyConfig(
+            max_groups_per_key=2,
+            variant="rule",
+            overflow_policy=OverflowPolicy.DROP_OLDEST,
+        )
         func = SemGroupbyFunction(cfg)
         func._group_profiles = _FakeMapState({
             "g1": {"label": "old group", "event_count": 1, "last_update_ms": 100,
@@ -173,7 +180,11 @@ class TestStateSafetyAudit:
 
     def test_groupby_overflow_drop_newest_refuses(self):
         """sem_groupby: DROP_NEWEST should refuse to create group at limit."""
-        cfg = SemGroupbyConfig(max_groups_per_key=2, overflow_policy=OverflowPolicy.DROP_NEWEST)
+        cfg = SemGroupbyConfig(
+            max_groups_per_key=2,
+            variant="rule",
+            overflow_policy=OverflowPolicy.DROP_NEWEST,
+        )
         func = SemGroupbyFunction(cfg)
         func._group_profiles = _FakeMapState({
             "g1": {"label": "a", "event_count": 1, "last_update_ms": 100},
@@ -422,7 +433,7 @@ class TestKeyedCountConservation:
 
     def test_groupby_count_conservation(self):
         """Each event assigned to a group increments that group's event_count."""
-        cfg = SemGroupbyConfig(max_groups_per_key=10)
+        cfg = SemGroupbyConfig(max_groups_per_key=10, variant="rule")
         func = SemGroupbyFunction(cfg)
         func._group_profiles = _FakeMapState({
             "g1": _new_group_profile("g1", "topic alpha beta", 100),
@@ -508,6 +519,7 @@ class TestStateBoundEnforcement:
         """Groupby should respect max_groups_per_key."""
         cfg = SemGroupbyConfig(
             max_groups_per_key=2,
+            variant="rule",
             overflow_policy=OverflowPolicy.DROP_OLDEST,
         )
         func = SemGroupbyFunction(cfg)
@@ -666,7 +678,7 @@ class TestGroupAssignmentStability:
 
     def test_same_topic_stays_in_group(self):
         """Events about the same topic should be assigned to the same group."""
-        cfg = SemGroupbyConfig(max_groups_per_key=10)
+        cfg = SemGroupbyConfig(max_groups_per_key=10, variant="rule")
         func = SemGroupbyFunction(cfg)
         func._group_profiles = _FakeMapState({
             "g1": _new_group_profile("g1", "machine learning algorithms", 100),
@@ -684,7 +696,7 @@ class TestGroupAssignmentStability:
 
     def test_different_topic_goes_to_different_group(self):
         """Events about different topics should go to different groups."""
-        cfg = SemGroupbyConfig(max_groups_per_key=10)
+        cfg = SemGroupbyConfig(max_groups_per_key=10, variant="rule")
         func = SemGroupbyFunction(cfg)
         func._group_profiles = _FakeMapState({
             "g1": _new_group_profile("g1", "machine learning algorithms", 100),
@@ -970,7 +982,7 @@ class TestEndToEndRAGConsistency:
         assert len(events_out) == 3
 
         # Simulate groupby: assign all to same group
-        cfg_gb = SemGroupbyConfig(max_groups_per_key=10)
+        cfg_gb = SemGroupbyConfig(max_groups_per_key=10, variant="rule")
         func_gb = SemGroupbyFunction(cfg_gb)
         func_gb._group_profiles = _FakeMapState({
             "g1": _new_group_profile("g1", "flink streaming great", 100),
@@ -1096,6 +1108,34 @@ class TestStatefulAsyncPrimitives:
             )
             is True
         )
+
+    def test_ensure_thread_pool_executor_creates_pool(self):
+        executor = ensure_thread_pool_executor(
+            None,
+            max_workers=1,
+            thread_name_prefix="sem-test",
+        )
+        try:
+            future = executor.submit(lambda: 7)
+            assert future.result() == 7
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_ensure_thread_pool_executor_reuses_pool(self):
+        executor = ensure_thread_pool_executor(
+            None,
+            max_workers=1,
+            thread_name_prefix="sem-test",
+        )
+        try:
+            reused = ensure_thread_pool_executor(
+                executor,
+                max_workers=2,
+                thread_name_prefix="ignored",
+            )
+            assert reused is executor
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 class TestGroupbyLlmLaneDiscipline:
