@@ -30,13 +30,14 @@ from __future__ import annotations
 import concurrent.futures
 import time
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext
 from pyflink.datastream.state import ListState, MapState, ValueState
 
-from pyflink.semantic_runtime.llm_client import LLMClientConfig
+from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime.state_descriptors import (
     OverflowPolicy,
     sem_agg_buffer_descriptor,
@@ -51,7 +52,7 @@ from pyflink.semantic_runtime.runtime.event_model import (
     window_snapshot_to_sem_events,
 )
 from pyflink.semantic_runtime.runtime.steps import (
-    evaluate_sem_agg_summary_update_from_config_sync,
+    evaluate_sem_agg_summary_update_sync,
 )
 from pyflink.semantic_runtime.runtime.timer_policy import (
     TimerCategory,
@@ -61,6 +62,14 @@ from pyflink.semantic_runtime.runtime.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
+    AsyncApplyGuard,
+    AsyncResultEnvelope,
+    AsyncRequestBasis,
+    single_flight_begin,
+    single_flight_complete,
+    single_flight_get_basis,
+)
 from pyflink.semantic_runtime.sem_spec import (
     AggQuerySpec,
     AggScopePolicy,
@@ -148,6 +157,50 @@ class _AggScopeRuntime:
                 decision.post_reset_reason = "semantic_boundary"
 
         return decision
+
+
+class _SemAggSummaryClientPool:
+    """Thread-local LLM client pool for sem_agg summary workers."""
+
+    def __init__(self, llm_config: LLMClientConfig) -> None:
+        self._llm_config = llm_config
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._clients: Dict[int, LLMClient] = {}
+
+    def _get_client(self) -> LLMClient:
+        client = getattr(self._local, "client", None)
+        if client is not None:
+            return client
+        created = create_llm_client(self._llm_config)
+        self._local.client = created
+        with self._lock:
+            self._clients[threading.get_ident()] = created
+        return created
+
+    def evaluate(
+        self,
+        *,
+        mode: str,
+        current_summary: str,
+        added_events: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Evaluate one summary update using the current worker-thread client."""
+        client = self._get_client()
+        return evaluate_sem_agg_summary_update_sync(
+            client=client,
+            mode=mode,
+            current_summary=current_summary,
+            added_events=added_events,
+        )
+
+    def close(self) -> None:
+        """Close all materialized worker clients."""
+        with self._lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for client in clients:
+            client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +398,9 @@ class SemAggFunction(KeyedProcessFunction):
         self._scope_progress: Optional[MapState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._summary_client_pool: Optional[_SemAggSummaryClientPool] = None
         self._pending_futures: Dict[str, concurrent.futures.Future] = {}
+        self._pending_envelopes: Dict[str, AsyncResultEnvelope] = {}
         (
             self._resolved_mode,
             self._resolved_ttl_seconds,
@@ -414,6 +469,7 @@ class SemAggFunction(KeyedProcessFunction):
                 max_workers=self._config.async_max_workers,
                 thread_name_prefix="sem-agg",
             )
+            self._summary_client_pool = _SemAggSummaryClientPool(self._llm_config)
         logger.info(
             "SemAggFunction opened (mode=%s, max_buffer=%d)",
             self._resolved_mode, self._resolved_max_buffer_events,
@@ -425,9 +481,13 @@ class SemAggFunction(KeyedProcessFunction):
 
     def close(self) -> None:
         if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
+        if self._summary_client_pool is not None:
+            self._summary_client_pool.close()
+            self._summary_client_pool = None
         self._pending_futures.clear()
+        self._pending_envelopes.clear()
 
     # -- core ----------------------------------------------------------------
 
@@ -668,6 +728,8 @@ class SemAggFunction(KeyedProcessFunction):
                 max_workers=self._config.async_max_workers,
                 thread_name_prefix="sem-agg",
             )
+        if self._summary_client_pool is None:
+            self._summary_client_pool = _SemAggSummaryClientPool(self._llm_config)
         if meta.get("pending_summarize"):
             return
         buffered_events = list(self._buffer.get())
@@ -681,20 +743,29 @@ class SemAggFunction(KeyedProcessFunction):
         scope_epoch = int(
             meta.get("scope_epoch", 0) if request_scope_epoch is None else request_scope_epoch
         )
+        request_basis = AsyncRequestBasis(
+            request_id=request_id,
+            key=str(meta.get("key", "")),
+            scope_epoch=scope_epoch,
+            state_version=int(meta.get("version", 0) or 0),
+            trigger_reason=(
+                "scope_close" if scope_close_pending else str(self._trigger_mode)
+            ),
+        )
+        single_flight_begin(meta, "summarize", request_basis)
         self._buffer.clear()
         future = self._executor.submit(
-            evaluate_sem_agg_summary_update_from_config_sync,
-            llm_config=self._llm_config,
+            self._summary_client_pool.evaluate,
             mode=self._resolved_mode,
             current_summary=current_summary,
             added_events=buffered_events,
         )
         self._pending_futures[request_id] = future
+        self._pending_envelopes[request_id] = AsyncResultEnvelope.from_basis(
+            request_basis,
+            payload={"scope_close_pending": scope_close_pending},
+        )
         meta["pending_summarize"] = True
-        meta["pending_request_id"] = request_id
-        meta["pending_scope_epoch"] = scope_epoch
-        meta["pending_scope_close"] = scope_close_pending
-        meta["pending_added_event_count"] = len(buffered_events)
         if self._metrics:
             self._metrics.record_async_emit()
         register_timer(
@@ -711,9 +782,10 @@ class SemAggFunction(KeyedProcessFunction):
         now_ms: int,
     ):
         """Poll one pending summary future and merge it into canonical state."""
-        request_id = str(meta.get("pending_request_id", "") or "")
-        if not meta.get("pending_summarize") or not request_id:
+        request_basis = single_flight_get_basis(meta, "summarize")
+        if not meta.get("pending_summarize") or request_basis is None:
             return
+        request_id = request_basis.request_id
         future = self._pending_futures.get(request_id)
         if future is None:
             raise RuntimeError(f"sem_agg lost pending async request {request_id!r}")
@@ -725,34 +797,49 @@ class SemAggFunction(KeyedProcessFunction):
                 now_ms + self._resolved_async_poll_interval_ms,
             )
             return
+        request_basis = single_flight_complete(meta, "summarize", request_id)
+        envelope = self._pending_envelopes.pop(request_id, None)
+        if envelope is None:
+            raise RuntimeError(f"sem_agg lost pending async envelope {request_id!r}")
         del self._pending_futures[request_id]
         result = future.result()
         summary = str(result["summary"])
-        result_scope_epoch = int(meta.get("pending_scope_epoch", 0) or 0)
-        result_scope_close = bool(meta.get("pending_scope_close", False))
+        result_scope_epoch = int(request_basis.scope_epoch)
+        result_scope_close = bool(envelope.payload.get("scope_close_pending", False))
         meta["pending_summarize"] = False
-        meta.pop("pending_request_id", None)
-        meta.pop("pending_scope_epoch", None)
-        meta.pop("pending_scope_close", None)
-        meta.pop("pending_added_event_count", None)
         meta["version"] = int(meta.get("version", 0) or 0) + 1
         aggregate = {
             "summary": summary,
             "version": meta["version"],
             "updated_ms": now_ms,
         }
-        if not result_scope_close and result_scope_epoch == int(meta.get("scope_epoch", 0) or 0):
-            self._agg_value.update(aggregate)
-        self._meta.update(meta)
-        yield {
-            "key": meta.get("key", ""),
-            "aggregate": aggregate,
-            "version": meta["version"],
-            "mode": f"{self._resolved_mode}_scope_close_async" if result_scope_close else f"{self._resolved_mode}_async",
-            "event_count": int(meta.get("event_count", 0) or 0),
-            "timestamp_ms": now_ms,
-            "scope_epoch": result_scope_epoch,
-        }
+        stale = AsyncApplyGuard.is_stale(
+            basis=request_basis,
+            current_scope_epoch=int(meta.get("scope_epoch", 0) or 0),
+            current_state_version=int(meta.get("version", 0) or 0),
+            enforce_state_version=False,
+        )
+        if stale and not result_scope_close:
+            if self._metrics:
+                self._metrics.record_stale_window()
+            self._meta.update(meta)
+        else:
+            if not result_scope_close:
+                self._agg_value.update(aggregate)
+            self._meta.update(meta)
+            yield {
+                "key": meta.get("key", ""),
+                "aggregate": aggregate,
+                "version": meta["version"],
+                "mode": (
+                    f"{self._resolved_mode}_scope_close_async"
+                    if result_scope_close
+                    else f"{self._resolved_mode}_async"
+                ),
+                "event_count": int(meta.get("event_count", 0) or 0),
+                "timestamp_ms": now_ms,
+                "scope_epoch": result_scope_epoch,
+            }
         if result_scope_close:
             return
         if not list(self._buffer.get()):
@@ -822,7 +909,20 @@ class SemAggFunction(KeyedProcessFunction):
             yield from self._emit_current_aggregate(meta, now_ms, reason=reason)
             return
         if meta.get("pending_summarize"):
-            meta["pending_scope_close"] = True
+            basis = single_flight_get_basis(meta, "summarize")
+            if basis is None:
+                raise RuntimeError("sem_agg pending_summarize missing single-flight basis")
+            envelope = self._pending_envelopes.get(basis.request_id)
+            if envelope is None:
+                raise RuntimeError(
+                    f"sem_agg pending_summarize missing async envelope {basis.request_id!r}"
+                )
+            merged_payload = dict(envelope.payload)
+            merged_payload["scope_close_pending"] = True
+            self._pending_envelopes[basis.request_id] = AsyncResultEnvelope.from_basis(
+                envelope.basis,
+                payload=merged_payload,
+            )
             self._meta.update(meta)
             return
         current_aggregate = self._agg_value.value()

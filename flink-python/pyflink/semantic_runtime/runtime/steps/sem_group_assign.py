@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any, Dict, List
 
 from pyflink.semantic_runtime.llm_client import LLMClient
 from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_group_assign_prompt
+
+_THREAD_LOCAL = threading.local()
+
+
+def _run_sync(coro):
+    """Run one coroutine on a thread-local event loop."""
+    loop = getattr(_THREAD_LOCAL, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _THREAD_LOCAL.loop = loop
+    return loop.run_until_complete(coro)
 
 
 async def _call_json(
@@ -29,11 +41,7 @@ async def _call_json(
 
 def _call_json_sync(client: LLMClient, prompt: str, *, step_name: str) -> Dict[str, Any]:
     """Run one synchronous LLM call and parse one JSON object."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_call_json(client, prompt, step_name=step_name))
-    finally:
-        loop.close()
+    return _run_sync(_call_json(client, prompt, step_name=step_name))
 
 
 def parse_sem_group_assignments(
@@ -153,15 +161,11 @@ def evaluate_sem_group_assignment_chunks_sync(
     event_chunks: List[List[Dict[str, Any]]],
 ) -> List[List[Dict[str, Any]]]:
     """Evaluate multiple semantic group-assignment chunks concurrently."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(
-            evaluate_sem_group_assignment_chunks(
-                client=client,
-                intent=intent,
-                existing_groups=existing_groups,
-                event_chunks=event_chunks,
-            )
+    return _run_sync(
+        evaluate_sem_group_assignment_chunks(
+            client=client,
+            intent=intent,
+            existing_groups=existing_groups,
+            event_chunks=event_chunks,
         )
-    finally:
-        loop.close()
+    )

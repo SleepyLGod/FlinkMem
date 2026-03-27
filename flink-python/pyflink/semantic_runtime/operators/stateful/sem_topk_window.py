@@ -81,6 +81,8 @@ class ScopedPersistentSemTopKFunction(KeyedProcessFunction):
             raise ValueError(
                 "sem_topk external_window persistent path requires top_items/topk list"
             )
+        incoming_scope_epoch = int(value.get("scope_epoch", 0) or 0)
+        incoming_scope_version = self._resolve_scope_version(value, now_ms)
 
         meta = self._meta.value() or {
             "key": str(ctx.get_current_key()),
@@ -99,10 +101,27 @@ class ScopedPersistentSemTopKFunction(KeyedProcessFunction):
         assert self._scope_contributions is not None
         assert self._snapshot is not None
         assert self._meta is not None
+        existing = self._scope_contributions.get(scope_id)
+        if existing is not None:
+            existing_scope_epoch = int(existing.get("scope_epoch", 0) or 0)
+            existing_scope_version = int(existing.get("scope_version", 0) or 0)
+            if (
+                incoming_scope_epoch < existing_scope_epoch
+                or (
+                    incoming_scope_epoch == existing_scope_epoch
+                    and incoming_scope_version < existing_scope_version
+                )
+            ):
+                if self._metrics:
+                    self._metrics.record_stale_window()
+                self._meta.update(meta)
+                return
         self._scope_contributions.put(
             scope_id,
             {
                 "scope_id": scope_id,
+                "scope_epoch": incoming_scope_epoch,
+                "scope_version": incoming_scope_version,
                 "top_items": [dict(item) for item in top_items],
                 "query": meta["last_ranking_text"],
                 "query_seq_id": meta["last_query_seq_id"],
@@ -114,6 +133,19 @@ class ScopedPersistentSemTopKFunction(KeyedProcessFunction):
 
         yield from self._recompute_and_emit(meta, now_ms)
         self._meta.update(meta)
+
+    @staticmethod
+    def _resolve_scope_version(value: Dict[str, Any], now_ms: int) -> int:
+        """Resolve one monotonic scope contribution version."""
+        for field in ("scope_version", "version", "timestamp_ms"):
+            raw = value.get(field)
+            if raw is None:
+                continue
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                continue
+        return int(now_ms)
 
     def _recompute_and_emit(self, meta: Dict[str, Any], now_ms: int):
         assert self._scope_contributions is not None

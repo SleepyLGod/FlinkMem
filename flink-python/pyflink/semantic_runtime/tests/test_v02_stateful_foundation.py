@@ -1785,6 +1785,45 @@ class TestScopedPersistentSemTopK:
         )
         assert second[0]["top_ids"] == ["c1", "c2"]
 
+    def test_drops_stale_scope_contribution_by_version(self):
+        func = self._make_func(k=1)
+        ctx = _FakeContext("k")
+        first = list(
+            func.process_element(
+                {
+                    "key": "k",
+                    "scope_id": "w1",
+                    "scope_epoch": 0,
+                    "scope_version": 2,
+                    "top_items": [{"candidate_id": "c2", "score": 0.9}],
+                    "query": "best weather",
+                    "query_seq_id": 1,
+                    "source": "scope_1",
+                },
+                ctx,
+            )
+        )
+        stale = list(
+            func.process_element(
+                {
+                    "key": "k",
+                    "scope_id": "w1",
+                    "scope_epoch": 0,
+                    "scope_version": 1,
+                    "top_items": [{"candidate_id": "c1", "score": 0.5}],
+                    "query": "best weather",
+                    "query_seq_id": 1,
+                    "source": "scope_1",
+                },
+                ctx,
+            )
+        )
+        assert first[0]["top_ids"] == ["c2"]
+        assert stale == []
+        contribution = func._scope_contributions.get("w1")
+        assert contribution["scope_version"] == 2
+        assert contribution["top_items"][0]["candidate_id"] == "c2"
+
 
 # ============================================================================
 # SemSpec & RuntimeConfig Tests

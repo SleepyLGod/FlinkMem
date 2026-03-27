@@ -183,7 +183,16 @@ def build_contextual_snapshot_query_spec(
         )
         return replace(query_spec, trigger_policy=eff_trigger)
     if plan.close_surrogate == "periodic_snapshot":
-        interval_ms = topk_config.recompute_interval_ms
+        interval_ms = 0
+        if trigger.interval_ms is not None and int(trigger.interval_ms) > 0:
+            interval_ms = int(trigger.interval_ms)
+        elif topk_config.recompute_interval_ms > 0:
+            interval_ms = int(topk_config.recompute_interval_ms)
+        elif (
+            query_spec.scope_policy.ttl_seconds is not None
+            and int(query_spec.scope_policy.ttl_seconds) > 0
+        ):
+            interval_ms = int(query_spec.scope_policy.ttl_seconds) * 1000
         if interval_ms <= 0:
             raise ValueError("topk_contextual_periodic_snapshot_requires_positive_recompute_interval_ms")
         eff_trigger = TriggerPolicy(
@@ -410,6 +419,8 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
 
     def _extract_pool(self, value: Dict[str, Any]) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
+        scope_epoch = int(value.get("scope_epoch", 0) or 0)
+        scope_version = int(value.get("scope_version", 0) or 0)
         for idx, cand in enumerate(value.get("candidates", [])):
             out = dict(cand)
             if "candidate_id" not in out:
@@ -418,6 +429,8 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
             out["query"] = value.get("query", "")
             out["query_seq_id"] = int(value.get("query_seq_id", 0))
             out["scope_id"] = str(value.get("scope_id", value.get("window_id", "")) or "")
+            out["scope_epoch"] = scope_epoch
+            out["scope_version"] = scope_version
             out.setdefault("source", value.get("source", ""))
             out.setdefault("error", value.get("error", ""))
             items.append(out)
@@ -550,6 +563,14 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
                     )
                     or ""
                 ),
+                "scope_epoch": int(original_value.get("scope_epoch", 0) or 0),
+                "scope_version": int(
+                    original_value.get(
+                        "scope_version",
+                        original_value.get("timestamp_ms", 0),
+                    )
+                    or 0
+                ),
                 "window_id": original_value.get("window_id", ""),
                 "topk": top_rows,
                 "top_items": top_rows,
@@ -559,7 +580,13 @@ class _BaseBoundedPoolRerankerWorker(AsyncFunction):
                 "source": source,
                 "total_candidates": len(scored_rows),
                 "stale_candidates": 0,
-                "version": 1,
+                "version": int(
+                    original_value.get(
+                        "scope_version",
+                        original_value.get("timestamp_ms", 1),
+                    )
+                    or 1
+                ),
                 "changed": True,
                 "emission_policy": emission_policy,
                 "error": str(original_value.get("error", "")),

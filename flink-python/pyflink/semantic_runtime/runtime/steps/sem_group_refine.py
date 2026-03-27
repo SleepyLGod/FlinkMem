@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any, Dict, List
 
 from pyflink.semantic_runtime.llm_client import LLMClient
 from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_group_refine_prompt
+
+_THREAD_LOCAL = threading.local()
+
+
+def _run_sync(coro):
+    """Run one coroutine on a thread-local event loop."""
+    loop = getattr(_THREAD_LOCAL, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _THREAD_LOCAL.loop = loop
+    return loop.run_until_complete(coro)
 
 
 async def _call_json(client: LLMClient, prompt: str) -> Dict[str, Any]:
@@ -24,11 +36,7 @@ async def _call_json(client: LLMClient, prompt: str) -> Dict[str, Any]:
 
 def _call_json_sync(client: LLMClient, prompt: str) -> Dict[str, Any]:
     """Run one synchronous LLM call and parse one JSON object."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_call_json(client, prompt))
-    finally:
-        loop.close()
+    return _run_sync(_call_json(client, prompt))
 
 
 def parse_sem_group_refine_plan(

@@ -25,14 +25,16 @@ For each incoming event, the operator decides one of two outcomes:
 
 The decision backend is an internal execution concern. Local methods such as
 keyword overlap or embedding similarity assign synchronously. LLM-backed
-variants also run synchronously in the canonical state owner so that group
-assignment and refinement mutate one coherent group-state machine.
+variants keep one canonical keyed-state owner; persistent paths may dispatch
+LLM calls asynchronously and apply results serially in the owner.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -65,6 +67,14 @@ from pyflink.semantic_runtime.runtime.timer_policy import (
     clear_timer_registration,
 )
 from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMetrics
+from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
+    AsyncApplyGuard,
+    AsyncRequestBasis,
+    single_flight_begin,
+    single_flight_complete,
+    single_flight_get_basis,
+    single_flight_is_in_flight,
+)
 from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 
@@ -87,12 +97,16 @@ DEFAULT_GROUPBY_NEW_GROUP_CREATION_THRESHOLD = 0.3
 DEFAULT_GROUPBY_MAX_GROUP_EXAMPLES = 8
 DEFAULT_GROUPBY_RULE_SPLIT_SEED_SIMILARITY_THRESHOLD = 0.2
 DEFAULT_GROUPBY_EMBEDDING_SPLIT_SEED_SIMILARITY_THRESHOLD = 0.5
+DEFAULT_GROUPBY_ASYNC_MAX_WORKERS = 20
+DEFAULT_GROUPBY_ASYNC_POLL_INTERVAL_MS = 200
 GROUPBY_MERGE_THRESHOLD_EMBEDDING_FLOOR = 0.8
 GROUPBY_MERGE_THRESHOLD_GENERIC_FLOOR = 0.65
 GROUPBY_MIN_EXAMPLES_FOR_SPLIT = 4
 GROUPBY_LOCAL_ENCODER_DIM = 128
 GROUPBY_DERIVED_LABEL_TOKEN_LIMIT = 5
 GROUPBY_ID_HEX_CHARS = 8
+GROUPBY_META_ASYNC_POLL_DUE_MS = "_async_poll_due_ms"
+GROUPBY_META_MAINTENANCE_DUE_MS = "_maintenance_due_ms"
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +187,78 @@ class _GroupbyScopeRuntime:
 
 
 # ---------------------------------------------------------------------------
+# Async client pool
+# ---------------------------------------------------------------------------
+
+
+class _SemGroupbyLLMClientPool:
+    """Thread-local LLM client pool for sem_groupby async workers."""
+
+    def __init__(self, llm_config: LLMClientConfig) -> None:
+        self._llm_config = llm_config
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._clients: Dict[int, LLMClient] = {}
+
+    def _get_client(self) -> LLMClient:
+        client = getattr(self._local, "client", None)
+        if client is not None:
+            return client
+        created = create_llm_client(self._llm_config)
+        self._local.client = created
+        with self._lock:
+            self._clients[threading.get_ident()] = created
+        return created
+
+    def evaluate_assignments(
+        self,
+        *,
+        intent: str,
+        existing_groups: List[Dict[str, Any]],
+        event_chunks: List[List[Dict[str, Any]]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Evaluate assignment chunks with the worker-thread client."""
+        client = self._get_client()
+        if len(event_chunks) == 1:
+            return [
+                evaluate_sem_group_assignments_sync(
+                    client=client,
+                    intent=intent,
+                    existing_groups=existing_groups,
+                    events=event_chunks[0],
+                )
+            ]
+        return evaluate_sem_group_assignment_chunks_sync(
+            client=client,
+            intent=intent,
+            existing_groups=existing_groups,
+            event_chunks=event_chunks,
+        )
+
+    def evaluate_refine(
+        self,
+        *,
+        intent: str,
+        groups: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Evaluate one semantic refine pass with the worker-thread client."""
+        client = self._get_client()
+        return evaluate_sem_group_refine_sync(
+            client=client,
+            intent=intent,
+            groups=groups,
+        )
+
+    def close(self) -> None:
+        """Close all materialized worker clients."""
+        with self._lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for client in clients:
+            client.close()
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -197,6 +283,8 @@ class SemGroupbyConfig:
     local_embedding_split_seed_similarity_threshold: float = (
         DEFAULT_GROUPBY_EMBEDDING_SPLIT_SEED_SIMILARITY_THRESHOLD
     )
+    async_max_workers: int = DEFAULT_GROUPBY_ASYNC_MAX_WORKERS
+    async_poll_interval_ms: int = DEFAULT_GROUPBY_ASYNC_POLL_INTERVAL_MS
 
     def __post_init__(self) -> None:
         if self.variant not in _VALID_GROUPBY_VARIANTS:
@@ -216,6 +304,10 @@ class SemGroupbyConfig:
             raise ValueError("assignment_batch_size must be a positive integer.")
         if self.max_group_examples <= 0:
             raise ValueError("max_group_examples must be a positive integer.")
+        if self.async_max_workers <= 0:
+            raise ValueError("async_max_workers must be a positive integer.")
+        if self.async_poll_interval_ms <= 0:
+            raise ValueError("async_poll_interval_ms must be a positive integer.")
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +788,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._meta: Optional[ValueState] = None
         self._metrics: Optional[StatefulOperatorMetrics] = None
         self._client: Optional[LLMClient] = None
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._llm_client_pool: Optional[_SemGroupbyLLMClientPool] = None
+        self._pending_llm_futures: Dict[str, concurrent.futures.Future] = {}
+        self._pending_llm_payloads: Dict[str, Dict[str, Any]] = {}
         self._resolved_variant = resolve_groupby_variant(
             self._config,
             query_spec,
@@ -730,6 +826,17 @@ class SemGroupbyFunction(KeyedProcessFunction):
         ) = resolve_groupby_runtime_params(self._config, self._query_spec)
         self._resolved_assignment_batch_size = int(self._config.assignment_batch_size)
         self._resolved_max_group_examples = int(self._config.max_group_examples)
+        self._resolved_async_poll_interval_ms = int(self._config.async_poll_interval_ms)
+        self._resolved_async_max_workers = int(self._config.async_max_workers)
+        self._enable_async_llm_runtime = (
+            self._resolved_variant in _LLM_GROUPBY_VARIANTS
+            and self._resolved_persistence_policy == "persistent_across_scopes"
+            and self._llm_config is not None
+            and not (
+                self._maintenance_trigger_policy is not None
+                and self._maintenance_trigger_policy.mode == "on_scope_close"
+            )
+        )
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -758,7 +865,14 @@ class SemGroupbyFunction(KeyedProcessFunction):
                 raise ValueError(
                     f"sem_groupby variant={self._resolved_variant!r} requires llm_config"
                 )
-            self._client = create_llm_client(self._llm_config)
+            if self._enable_async_llm_runtime:
+                self._executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._resolved_async_max_workers,
+                    thread_name_prefix="sem-groupby",
+                )
+                self._llm_client_pool = _SemGroupbyLLMClientPool(self._llm_config)
+            else:
+                self._client = create_llm_client(self._llm_config)
         logger.info(
             "SemGroupbyFunction opened (max_groups=%d, reuse_threshold=%.2f, maintenance_merge_threshold=%.2f, variant=%s, persistence=%s)",
             self._resolved_max_groups_per_key,
@@ -772,6 +886,14 @@ class SemGroupbyFunction(KeyedProcessFunction):
         if self._client is not None:
             self._client.close()
             self._client = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+        if self._llm_client_pool is not None:
+            self._llm_client_pool.close()
+            self._llm_client_pool = None
+        self._pending_llm_futures.clear()
+        self._pending_llm_payloads.clear()
 
     # -- core ----------------------------------------------------------------
 
@@ -784,6 +906,9 @@ class SemGroupbyFunction(KeyedProcessFunction):
         now_ms = int(time.time() * 1000)
         if self._metrics:
             self._metrics.record_event_processed()
+        meta = self._meta.value()
+        if meta is not None and self._enable_async_llm_runtime:
+            yield from self._poll_pending_llm(meta, ctx, now_ms)
 
         # Detect WindowSnapshot input → expand into individual events
         if isinstance(value, dict) and is_window_snapshot(value):
@@ -807,6 +932,7 @@ class SemGroupbyFunction(KeyedProcessFunction):
             "scope_last_time_ms": now_ms,
             "scope_bucket_id": None,
         }
+        self._maybe_initialize_maintenance_due(meta, now_ms)
         scope_events = list(window_snapshot_to_sem_events(snapshot))
         if self._resolved_persistence_policy == "reset_per_scope":
             if self._resolved_variant in _LOCAL_GROUPBY_VARIANTS:
@@ -839,7 +965,18 @@ class SemGroupbyFunction(KeyedProcessFunction):
             for sub_event_dict in unseen_scope_events:
                 yield from self._process_single_event(sub_event_dict, ctx, now_ms)
         else:
-            yield from self._assign_with_llm_events(unseen_scope_events, now_ms, meta=meta)
+            if self._enable_async_llm_runtime:
+                for sub_event_dict in unseen_scope_events:
+                    event = SemEvent.from_dict(sub_event_dict)
+                    yield from self._enqueue_llm_assignment(
+                        event_dict=sub_event_dict,
+                        event=event,
+                        meta=meta,
+                        now_ms=now_ms,
+                        ctx=ctx,
+                    )
+            else:
+                yield from self._assign_with_llm_events(unseen_scope_events, now_ms, meta=meta)
 
         if self._scope_progress is not None:
             self._scope_progress.put(
@@ -909,12 +1046,16 @@ class SemGroupbyFunction(KeyedProcessFunction):
             and self._maintenance_trigger_policy is not None
             and self._maintenance_trigger_policy.mode == "periodic"
         ):
-            register_timer(
-                ctx.timer_service(),
-                meta,
-                TimerCategory.RECOMPUTE,
-                now_ms + int(self._maintenance_trigger_policy.interval_ms),
-            )
+            self._maybe_initialize_maintenance_due(meta, now_ms)
+            if self._enable_async_llm_runtime:
+                self._schedule_recompute_timer(meta, ctx.timer_service())
+            else:
+                register_timer(
+                    ctx.timer_service(),
+                    meta,
+                    TimerCategory.RECOMPUTE,
+                    now_ms + int(self._maintenance_trigger_policy.interval_ms),
+                )
 
         meta["scope_last_time_ms"] = decision.event_time_ms
         if decision.scope_bucket_id is not None:
@@ -926,12 +1067,21 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._meta.update(meta)
             yield assignment_row
         elif self._resolved_variant in _LLM_GROUPBY_VARIANTS:
-            yield from self._enqueue_llm_assignment(
-                event_dict=event_dict,
-                event=event,
-                meta=meta,
-                now_ms=now_ms,
-            )
+            if self._enable_async_llm_runtime:
+                yield from self._enqueue_llm_assignment(
+                    event_dict=event_dict,
+                    event=event,
+                    meta=meta,
+                    now_ms=now_ms,
+                    ctx=ctx,
+                )
+            else:
+                yield from self._enqueue_llm_assignment_sync(
+                    event_dict=event_dict,
+                    event=event,
+                    meta=meta,
+                    now_ms=now_ms,
+                )
         else:
             raise ValueError(
                 f"Unsupported internal groupby variant={self._resolved_variant!r}."
@@ -982,17 +1132,16 @@ class SemGroupbyFunction(KeyedProcessFunction):
             return outputs
         if category == TimerCategory.RECOMPUTE:
             clear_timer_registration(meta, TimerCategory.RECOMPUTE)
+            if self._enable_async_llm_runtime:
+                outputs.extend(self._on_recompute_timer_async(meta, ctx, timestamp))
+                self._meta.update(meta)
+                return outputs
             self._run_maintenance(meta, timestamp)
-            if (
-                self._maintenance_trigger_policy is not None
-                and self._maintenance_trigger_policy.mode == "periodic"
-            ):
-                register_timer(
-                    ctx.timer_service(),
-                    meta,
-                    TimerCategory.RECOMPUTE,
-                    int(time.time() * 1000) + int(self._maintenance_trigger_policy.interval_ms),
+            if self._maintenance_trigger_policy is not None and self._maintenance_trigger_policy.mode == "periodic":
+                meta[GROUPBY_META_MAINTENANCE_DUE_MS] = (
+                    int(time.time() * 1000) + int(self._maintenance_trigger_policy.interval_ms)
                 )
+                self._schedule_recompute_timer(meta, ctx.timer_service())
             self._meta.update(meta)
             return outputs
         if category != TimerCategory.EVICT:
@@ -1069,9 +1218,29 @@ class SemGroupbyFunction(KeyedProcessFunction):
         event: SemEvent,
         meta: Dict[str, Any],
         now_ms: int,
+        ctx: "KeyedProcessFunction.Context",
     ) -> Iterable[Any]:
-        """Append one event to the LLM assignment batch and flush when full."""
+        """Append one event to async LLM assignment queue and dispatch if ready."""
+        _ = event
         pending = self._append_pending_event(event_dict)
+        self._maybe_initialize_maintenance_due(meta, now_ms)
+        self._meta.update(meta)
+        if len(pending) < self._resolved_assignment_batch_size:
+            return
+        yield from self._maybe_dispatch_assignment(meta, ctx, now_ms)
+
+    def _enqueue_llm_assignment_sync(
+        self,
+        *,
+        event_dict: Dict[str, Any],
+        event: SemEvent,
+        meta: Dict[str, Any],
+        now_ms: int,
+    ) -> Iterable[Any]:
+        """Append one event to synchronous LLM assignment batch and flush when full."""
+        _ = event
+        pending = self._append_pending_event(event_dict)
+        self._maybe_initialize_maintenance_due(meta, now_ms)
         self._meta.update(meta)
         if len(pending) < self._resolved_assignment_batch_size:
             return
@@ -1162,41 +1331,291 @@ class SemGroupbyFunction(KeyedProcessFunction):
             raise RuntimeError("sem_groupby LLM runtime is not initialized")
         if not event_dicts:
             return
+        request_basis: Optional[AsyncRequestBasis] = None
+        if meta is not None:
+            request_basis = self._begin_llm_lane(
+                meta=meta,
+                lane="assignment",
+                now_ms=now_ms,
+                trigger_reason="assignment",
+            )
         existing_groups = self._existing_groups_payload()
         event_chunks = self._split_assignment_chunks(event_dicts)
         intent = self._query_spec.semantic.instruction
-        if len(event_chunks) == 1:
-            assignments = evaluate_sem_group_assignments_sync(
+        try:
+            if len(event_chunks) == 1:
+                assignments = evaluate_sem_group_assignments_sync(
+                    client=self._client,
+                    intent=intent,
+                    existing_groups=existing_groups,
+                    events=event_chunks[0],
+                )
+                yield from self._apply_assignment_rows(
+                    event_dicts=event_chunks[0],
+                    assignments=assignments,
+                    now_ms=now_ms,
+                )
+                if meta is not None:
+                    meta["total_assigned"] = int(meta.get("total_assigned", 0)) + len(event_chunks[0])
+                    self._meta.update(meta)
+                return
+
+            assignment_chunks = evaluate_sem_group_assignment_chunks_sync(
                 client=self._client,
                 intent=intent,
                 existing_groups=existing_groups,
-                events=event_chunks[0],
+                event_chunks=event_chunks,
             )
-            yield from self._apply_assignment_rows(
-                event_dicts=event_chunks[0],
-                assignments=assignments,
-                now_ms=now_ms,
-            )
+            for event_chunk, assignment_chunk in zip(event_chunks, assignment_chunks):
+                yield from self._apply_assignment_rows(
+                    event_dicts=event_chunk,
+                    assignments=assignment_chunk,
+                    now_ms=now_ms,
+                )
             if meta is not None:
-                meta["total_assigned"] = int(meta.get("total_assigned", 0)) + len(event_chunks[0])
+                meta["total_assigned"] = int(meta.get("total_assigned", 0)) + len(event_dicts)
                 self._meta.update(meta)
-            return
+        finally:
+            if meta is not None and request_basis is not None:
+                single_flight_complete(meta, "assignment", request_basis.request_id)
+                self._meta.update(meta)
 
-        assignment_chunks = evaluate_sem_group_assignment_chunks_sync(
-            client=self._client,
-            intent=intent,
-            existing_groups=existing_groups,
+    def _evaluate_assignment_request(
+        self,
+        *,
+        intent: str,
+        existing_groups: List[Dict[str, Any]],
+        event_chunks: List[List[Dict[str, Any]]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Worker task: evaluate assignment chunks."""
+        if self._llm_client_pool is not None:
+            return self._llm_client_pool.evaluate_assignments(
+                intent=intent,
+                existing_groups=existing_groups,
+                event_chunks=event_chunks,
+            )
+        if self._client is not None:
+            if len(event_chunks) == 1:
+                return [
+                    evaluate_sem_group_assignments_sync(
+                        client=self._client,
+                        intent=intent,
+                        existing_groups=existing_groups,
+                        events=event_chunks[0],
+                    )
+                ]
+            return evaluate_sem_group_assignment_chunks_sync(
+                client=self._client,
+                intent=intent,
+                existing_groups=existing_groups,
+                event_chunks=event_chunks,
+            )
+        raise RuntimeError("sem_groupby assignment worker has no LLM runtime")
+
+    def _evaluate_refine_request(
+        self,
+        *,
+        intent: str,
+        groups: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Worker task: evaluate semantic refinement."""
+        if self._llm_client_pool is not None:
+            return self._llm_client_pool.evaluate_refine(
+                intent=intent,
+                groups=groups,
+            )
+        if self._client is not None:
+            return evaluate_sem_group_refine_sync(
+                client=self._client,
+                intent=intent,
+                groups=groups,
+            )
+        raise RuntimeError("sem_groupby refine worker has no LLM runtime")
+
+    def _maybe_dispatch_assignment(
+        self,
+        meta: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+    ) -> Iterable[Dict[str, Any]]:
+        """Dispatch pending assignment chunk when lane is free."""
+        outputs: List[Dict[str, Any]] = []
+        while True:
+            if single_flight_is_in_flight(meta, "assignment") or single_flight_is_in_flight(meta, "refine"):
+                break
+            pending = self._pending_event_values()
+            if len(pending) < self._resolved_assignment_batch_size:
+                break
+            chunk = list(pending[: self._resolved_assignment_batch_size])
+            self._replace_pending_events(list(pending[self._resolved_assignment_batch_size :]))
+            outputs.extend(self._dispatch_assignment_request(meta, ctx, now_ms, chunk))
+            if single_flight_is_in_flight(meta, "assignment"):
+                break
+        return outputs
+
+    def _dispatch_assignment_request(
+        self,
+        meta: Dict[str, Any],
+        ctx: "KeyedProcessFunction.Context",
+        now_ms: int,
+        event_dicts: List[Dict[str, Any]],
+    ) -> Iterable[Dict[str, Any]]:
+        """Dispatch one async assignment request."""
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._resolved_async_max_workers,
+                thread_name_prefix="sem-groupby",
+            )
+        if not event_dicts:
+            return []
+        request_basis = self._begin_llm_lane(
+            meta=meta,
+            lane="assignment",
+            now_ms=now_ms,
+            trigger_reason="assignment",
+        )
+        event_chunks = self._split_assignment_chunks(event_dicts)
+        future = self._executor.submit(
+            self._evaluate_assignment_request,
+            intent=self._query_spec.semantic.instruction,
+            existing_groups=self._existing_groups_payload(),
             event_chunks=event_chunks,
         )
-        for event_chunk, assignment_chunk in zip(event_chunks, assignment_chunks):
-            yield from self._apply_assignment_rows(
-                event_dicts=event_chunk,
-                assignments=assignment_chunk,
-                now_ms=now_ms,
+        self._pending_llm_futures[request_basis.request_id] = future
+        self._pending_llm_payloads[request_basis.request_id] = {
+            "lane": "assignment",
+            "event_chunks": event_chunks,
+            "event_count": sum(len(chunk) for chunk in event_chunks),
+        }
+        self._set_async_poll_due(meta, now_ms + self._resolved_async_poll_interval_ms)
+        self._schedule_recompute_timer(meta, ctx.timer_service())
+        self._meta.update(meta)
+        return list(self._poll_pending_llm(meta, ctx, now_ms))
+
+    def _dispatch_refine_request(
+        self,
+        meta: Dict[str, Any],
+        ctx: "KeyedProcessFunction.OnTimerContext",
+        now_ms: int,
+    ) -> Iterable[Dict[str, Any]]:
+        """Dispatch one async refine request for llm_refine."""
+        if self._resolved_variant != "llm_refine":
+            return []
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._resolved_async_max_workers,
+                thread_name_prefix="sem-groupby",
             )
-        if meta is not None:
-            meta["total_assigned"] = int(meta.get("total_assigned", 0)) + len(event_dicts)
+        if single_flight_is_in_flight(meta, "assignment") or single_flight_is_in_flight(meta, "refine"):
+            return []
+        groups: List[Dict[str, Any]] = []
+        for group_id in self._group_profiles.keys():
+            profile = self._group_profiles.get(group_id)
+            if profile is None:
+                continue
+            groups.append(
+                {
+                    "group_id": group_id,
+                    "label": str(profile.get("label", "") or ""),
+                    "summary": str(profile.get("summary", "") or ""),
+                    "event_count": int(profile.get("event_count", 0)),
+                    "examples": list(profile.get("examples", [])),
+                }
+            )
+        if not groups:
+            return []
+        request_basis = self._begin_llm_lane(
+            meta=meta,
+            lane="refine",
+            now_ms=now_ms,
+            trigger_reason="maintenance_refine",
+        )
+        future = self._executor.submit(
+            self._evaluate_refine_request,
+            intent=self._query_spec.semantic.instruction,
+            groups=groups,
+        )
+        self._pending_llm_futures[request_basis.request_id] = future
+        self._pending_llm_payloads[request_basis.request_id] = {
+            "lane": "refine",
+        }
+        if self._maintenance_trigger_policy is not None and self._maintenance_trigger_policy.mode == "periodic":
+            meta[GROUPBY_META_MAINTENANCE_DUE_MS] = now_ms + int(self._maintenance_trigger_policy.interval_ms)
+        self._set_async_poll_due(meta, now_ms + self._resolved_async_poll_interval_ms)
+        self._schedule_recompute_timer(meta, ctx.timer_service())
+        self._meta.update(meta)
+        return list(self._poll_pending_llm(meta, ctx, now_ms))
+
+    def _poll_pending_llm(
+        self,
+        meta: Dict[str, Any],
+        ctx: Any,
+        now_ms: int,
+    ) -> Iterable[Dict[str, Any]]:
+        """Poll one in-flight async LLM request and apply if completed."""
+        basis = single_flight_get_basis(meta, "assignment")
+        lane = "assignment"
+        if basis is None:
+            basis = single_flight_get_basis(meta, "refine")
+            lane = "refine"
+        if basis is None:
+            self._set_async_poll_due(meta, None)
             self._meta.update(meta)
+            return []
+        future = self._pending_llm_futures.get(basis.request_id)
+        if future is None:
+            raise RuntimeError(f"sem_groupby lost pending async request {basis.request_id!r}")
+        if not future.done():
+            self._set_async_poll_due(meta, now_ms + self._resolved_async_poll_interval_ms)
+            self._schedule_recompute_timer(meta, ctx.timer_service())
+            self._meta.update(meta)
+            return []
+
+        request_basis = single_flight_complete(meta, lane, basis.request_id)
+        payload = self._pending_llm_payloads.pop(basis.request_id, None)
+        if payload is None:
+            raise RuntimeError(f"sem_groupby lost pending async payload {basis.request_id!r}")
+        del self._pending_llm_futures[basis.request_id]
+        self._set_async_poll_due(meta, None)
+        stale = AsyncApplyGuard.is_stale(
+            basis=request_basis,
+            current_scope_epoch=int(meta.get("scope_epoch", 0) or 0),
+            current_state_version=int(meta.get("total_assigned", 0) or 0),
+            enforce_state_version=False,
+        )
+        outputs: List[Dict[str, Any]] = []
+        if lane == "assignment":
+            assignment_chunks = future.result()
+            if not stale:
+                event_chunks = payload.get("event_chunks")
+                if not isinstance(event_chunks, list) or len(event_chunks) != len(assignment_chunks):
+                    raise RuntimeError("sem_groupby assignment async payload mismatch")
+                for event_chunk, assignment_chunk in zip(event_chunks, assignment_chunks):
+                    outputs.extend(
+                        self._apply_assignment_rows(
+                            event_dicts=list(event_chunk),
+                            assignments=list(assignment_chunk),
+                            now_ms=now_ms,
+                        )
+                    )
+                meta["total_assigned"] = int(meta.get("total_assigned", 0)) + int(payload.get("event_count", 0))
+            outputs.extend(self._maybe_dispatch_assignment(meta, ctx, now_ms))
+        else:
+            refine_plan = future.result()
+            if not stale:
+                split_count = self._apply_llm_splits(refine_plan["splits"], now_ms)
+                merge_count = self._apply_llm_merges(refine_plan["merges"], now_ms)
+                rename_count = self._apply_llm_renames(refine_plan["renames"])
+                meta["last_refine_ms"] = now_ms
+                meta["refine_count"] = int(meta.get("refine_count", 0)) + 1
+                meta["last_split_count"] = split_count
+                meta["last_merge_count"] = merge_count
+                meta["last_rename_count"] = rename_count
+                if self._metrics:
+                    self._metrics.record_recompute()
+        self._schedule_recompute_timer(meta, ctx.timer_service())
+        self._meta.update(meta)
+        return outputs
 
     def _assign_locally(self, event: SemEvent, now_ms: int) -> Dict[str, Any]:
         """Assign one event using the configured local method."""
@@ -1328,7 +1747,10 @@ class SemGroupbyFunction(KeyedProcessFunction):
         """
         rename_count = 0
         if self._resolved_variant == "llm_refine":
-            split_count, merge_count, rename_count = self._refine_groups_with_llm(now_ms)
+            split_count, merge_count, rename_count = self._refine_groups_with_llm(
+                now_ms,
+                meta=meta,
+            )
         else:
             split_count = self._split_mixed_groups(now_ms)
             merge_count = self._merge_similar_groups(now_ms)
@@ -1358,6 +1780,71 @@ class SemGroupbyFunction(KeyedProcessFunction):
         self._run_maintenance(meta, now_ms)
         self._reset_scope_state(meta, reason=reason)
         self._meta.update(meta)
+
+    def _maybe_initialize_maintenance_due(self, meta: Dict[str, Any], now_ms: int) -> None:
+        """Initialize periodic maintenance due timestamp once for this key."""
+        if self._maintenance_trigger_policy is None or self._maintenance_trigger_policy.mode != "periodic":
+            return
+        if int(meta.get(GROUPBY_META_MAINTENANCE_DUE_MS, 0) or 0) > 0:
+            return
+        meta[GROUPBY_META_MAINTENANCE_DUE_MS] = now_ms + int(self._maintenance_trigger_policy.interval_ms)
+
+    def _set_async_poll_due(self, meta: Dict[str, Any], due_ms: Optional[int]) -> None:
+        """Set or clear async poll due timestamp."""
+        if due_ms is None:
+            meta.pop(GROUPBY_META_ASYNC_POLL_DUE_MS, None)
+            return
+        meta[GROUPBY_META_ASYNC_POLL_DUE_MS] = int(due_ms)
+
+    def _schedule_recompute_timer(self, meta: Dict[str, Any], timer_service: Any) -> None:
+        """Schedule the next recompute timer for async poll and maintenance."""
+        due_values: List[int] = []
+        async_due = int(meta.get(GROUPBY_META_ASYNC_POLL_DUE_MS, 0) or 0)
+        maintenance_due = int(meta.get(GROUPBY_META_MAINTENANCE_DUE_MS, 0) or 0)
+        if async_due > 0:
+            due_values.append(async_due)
+        if maintenance_due > 0:
+            due_values.append(maintenance_due)
+        if not due_values:
+            clear_timer_registration(meta, TimerCategory.RECOMPUTE)
+            return
+        next_due = min(due_values)
+        register_timer(
+            timer_service,
+            meta,
+            TimerCategory.RECOMPUTE,
+            next_due,
+        )
+
+    def _on_recompute_timer_async(
+        self,
+        meta: Dict[str, Any],
+        ctx: "KeyedProcessFunction.OnTimerContext",
+        timestamp: int,
+    ) -> List[Any]:
+        """Handle recompute timer in async groupby runtime."""
+        outputs: List[Any] = []
+        outputs.extend(self._poll_pending_llm(meta, ctx, timestamp))
+        if self._maintenance_trigger_policy is None or self._maintenance_trigger_policy.mode != "periodic":
+            self._schedule_recompute_timer(meta, ctx.timer_service())
+            return outputs
+        due = int(meta.get(GROUPBY_META_MAINTENANCE_DUE_MS, 0) or 0)
+        if due <= 0 or timestamp < due:
+            self._schedule_recompute_timer(meta, ctx.timer_service())
+            return outputs
+        if single_flight_is_in_flight(meta, "assignment") or single_flight_is_in_flight(meta, "refine"):
+            self._schedule_recompute_timer(meta, ctx.timer_service())
+            return outputs
+        if self._pending_event_values():
+            self._schedule_recompute_timer(meta, ctx.timer_service())
+            return outputs
+        if self._resolved_variant == "llm_refine":
+            outputs.extend(self._dispatch_refine_request(meta, ctx, timestamp))
+        else:
+            self._run_maintenance(meta, timestamp)
+            meta[GROUPBY_META_MAINTENANCE_DUE_MS] = timestamp + int(self._maintenance_trigger_policy.interval_ms)
+        self._schedule_recompute_timer(meta, ctx.timer_service())
+        return outputs
 
     def _maintenance_merge_threshold(self) -> float:
         return resolve_groupby_maintenance_merge_threshold(
@@ -1425,10 +1912,21 @@ class SemGroupbyFunction(KeyedProcessFunction):
             self._group_profiles.put(group_id, profile)
         return rename_count
 
-    def _refine_groups_with_llm(self, now_ms: int) -> Tuple[int, int, int]:
+    def _refine_groups_with_llm(
+        self,
+        now_ms: int,
+        *,
+        meta: Dict[str, Any],
+    ) -> Tuple[int, int, int]:
         """Run one true semantic refinement pass over current groups."""
         if self._client is None:
             raise RuntimeError("sem_groupby llm_refine runtime is not initialized")
+        request_basis = self._begin_llm_lane(
+            meta=meta,
+            lane="refine",
+            now_ms=now_ms,
+            trigger_reason="maintenance_refine",
+        )
         groups: List[Dict[str, Any]] = []
         for group_id in self._group_profiles.keys():
             profile = self._group_profiles.get(group_id)
@@ -1443,17 +1941,51 @@ class SemGroupbyFunction(KeyedProcessFunction):
                     "examples": list(profile.get("examples", [])),
                 }
             )
-        if not groups:
-            return 0, 0, 0
-        refine_plan = evaluate_sem_group_refine_sync(
-            client=self._client,
-            intent=self._query_spec.semantic.instruction,
-            groups=groups,
+        try:
+            if not groups:
+                return 0, 0, 0
+            refine_plan = evaluate_sem_group_refine_sync(
+                client=self._client,
+                intent=self._query_spec.semantic.instruction,
+                groups=groups,
+            )
+            split_count = self._apply_llm_splits(refine_plan["splits"], now_ms)
+            merge_count = self._apply_llm_merges(refine_plan["merges"], now_ms)
+            rename_count = self._apply_llm_renames(refine_plan["renames"])
+            return split_count, merge_count, rename_count
+        finally:
+            single_flight_complete(meta, "refine", request_basis.request_id)
+
+    def _begin_llm_lane(
+        self,
+        *,
+        meta: Dict[str, Any],
+        lane: str,
+        now_ms: int,
+        trigger_reason: str,
+    ) -> AsyncRequestBasis:
+        """Start one controlled LLM lane request for this key."""
+        if lane not in {"assignment", "refine"}:
+            raise ValueError(f"Unsupported sem_groupby lane={lane!r}")
+        other_lane = "refine" if lane == "assignment" else "assignment"
+        if single_flight_is_in_flight(meta, other_lane):
+            raise RuntimeError(
+                f"sem_groupby {lane} cannot start while {other_lane} is in flight for the same key"
+            )
+        request_basis = AsyncRequestBasis(
+            request_id=(
+                f"{lane}:{meta.get('key', '')}:"
+                f"{int(meta.get('scope_epoch', 0) or 0)}:"
+                f"{int(meta.get('total_assigned', 0) or 0)}:"
+                f"{now_ms}"
+            ),
+            key=str(meta.get("key", "")),
+            scope_epoch=int(meta.get("scope_epoch", 0) or 0),
+            state_version=int(meta.get("total_assigned", 0) or 0),
+            trigger_reason=trigger_reason,
         )
-        split_count = self._apply_llm_splits(refine_plan["splits"], now_ms)
-        merge_count = self._apply_llm_merges(refine_plan["merges"], now_ms)
-        rename_count = self._apply_llm_renames(refine_plan["renames"])
-        return split_count, merge_count, rename_count
+        single_flight_begin(meta, lane, request_basis)
+        return request_basis
 
     def _apply_llm_splits(self, splits: List[Dict[str, Any]], now_ms: int) -> int:
         """Apply semantic split operations using retained examples."""

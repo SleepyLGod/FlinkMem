@@ -309,6 +309,8 @@ def apply_sem_agg_from_request(
     *,
     request: SemAggRequest,
     runtime_config: RuntimeConfig,
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
 ) -> DataStream:
     """Apply a stateful semantic aggregation request to one input stream."""
     from pyflink.semantic_runtime.operators.stateful.sem_agg_pipeline import (
@@ -333,12 +335,13 @@ def apply_sem_agg_from_request(
     if (
         execution_plan.scope_source == "external_window"
         and execution_plan.persistence_policy == "reset_per_scope"
-        and plan.mode == "algebraic"
     ):
         return apply_sem_agg_pushdown(
             agg_input,
             request=request,
             runtime_config=runtime_config,
+            timeout_ms=timeout_ms,
+            async_capacity=async_capacity,
         )
     op = build_sem_agg_from_request(request, runtime_config)
     return agg_input.key_by(lambda value: value.get("key", "")).process(op)

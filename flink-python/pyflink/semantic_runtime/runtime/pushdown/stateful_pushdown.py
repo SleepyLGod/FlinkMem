@@ -40,6 +40,10 @@ from pyflink.semantic_runtime.operators.stateful.sem_topk_workers import (
     extract_topk_candidate_text,
     lexical_similarity,
 )
+from pyflink.semantic_runtime.operators.stateful.sem_agg_window import (
+    COMPRESSIVE_KEEP_DIVISOR,
+    COMPRESSIVE_MIN_EVENTS_FOR_TRUNCATION,
+)
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 from pyflink.semantic_runtime.llm_client import LLMClient, create_llm_client
 
@@ -491,6 +495,81 @@ class WindowAlgebraicAggProjector(MapFunction):
         }
 
 
+class WindowOwnedAsyncAggSummarizer(AsyncFunction):
+    """Async semantic summarizer for one bounded agg snapshot."""
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        max_buffer_events: int,
+        llm_config: "LLMClientConfig",
+    ) -> None:
+        self._mode = mode
+        self._max_buffer_events = int(max_buffer_events)
+        self._llm_config = llm_config
+        self._client: Optional[LLMClient] = None
+
+    def open(self, runtime_context: RuntimeContext) -> None:
+        self._client = create_llm_client(self._llm_config)
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def async_invoke(self, value: Any) -> List[Dict[str, Any]]:
+        """Summarize one window snapshot with one async LLM call."""
+        if self._client is None:
+            raise RuntimeError("sem_agg pushdown async runtime is not initialized")
+        from pyflink.semantic_runtime.runtime.steps.sem_agg_summary import (
+            evaluate_sem_agg_summary_update,
+        )
+
+        snapshot = parse_window_snapshot(value, operator_name="sem_agg pushdown")
+        raw_events = list(window_snapshot_to_sem_events(snapshot))
+        if not raw_events:
+            raise ValueError("sem_agg pushdown requires non-empty window snapshot")
+        events_for_summary = self._compress_events(raw_events)
+        result = await evaluate_sem_agg_summary_update(
+            client=self._client,
+            mode=self._mode,
+            current_summary="",
+            added_events=events_for_summary,
+        )
+        now_ms = int(time.time() * 1000)
+        return [
+            {
+                "key": str(snapshot.get("key", "")),
+                "aggregate": {
+                    "summary": str(result["summary"]),
+                    "version": 1,
+                    "updated_ms": now_ms,
+                },
+                "version": 1,
+                "mode": f"{self._mode}_async",
+                "event_count": len(events_for_summary),
+                "timestamp_ms": now_ms,
+                "scope_id": str(snapshot.get("window_id", "")),
+            }
+        ]
+
+    def timeout(self, value: Any) -> List[Dict[str, Any]]:
+        """Fail fast when one async agg pushdown request times out."""
+        raise TimeoutError("sem_agg pushdown async summarization timed out")
+
+    def _compress_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self._mode != "compressive":
+            return events
+        if len(events) <= COMPRESSIVE_MIN_EVENTS_FOR_TRUNCATION:
+            return events
+        keep = max(
+            1,
+            min(len(events), self._max_buffer_events // COMPRESSIVE_KEEP_DIVISOR),
+        )
+        return events[-keep:]
+
+
 def apply_sem_groupby_pushdown(
     input_stream: DataStream,
     *,
@@ -602,17 +681,38 @@ def apply_sem_agg_pushdown(
     *,
     request: SemAggRequest,
     runtime_config: "RuntimeConfig",
+    timeout_ms: int = 30_000,
+    async_capacity: int = 20,
 ) -> DataStream:
-    """Apply bounded algebraic aggregation as native projection over window snapshots."""
+    """Apply bounded agg pushdown over window snapshots."""
+    if timeout_ms <= 0:
+        raise ValueError("sem_agg pushdown requires timeout_ms > 0")
+    if async_capacity <= 0:
+        raise ValueError("sem_agg pushdown requires async_capacity > 0")
     plan = lower_sem_agg_request(request, runtime_config)
     if plan.context_kind != "window":
         raise ValueError("sem_agg pushdown requires window context")
-    if plan.mode != "algebraic":
-        raise ValueError("sem_agg pushdown only supports algebraic mode")
-    return input_stream.map(
-        WindowAlgebraicAggProjector(config=plan.kernel_config),
-        output_type=Types.PICKLED_BYTE_ARRAY(),
-    )
+    if plan.mode == "algebraic":
+        return input_stream.map(
+            WindowAlgebraicAggProjector(config=plan.kernel_config),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+    if plan.mode in {"summarize", "compressive"}:
+        return AsyncDataStream.unordered_wait(
+            input_stream,
+            WindowOwnedAsyncAggSummarizer(
+                mode=plan.mode,
+                max_buffer_events=int(plan.kernel_config.max_buffer_events),
+                llm_config=runtime_config.get_operator_llm_client_config(
+                    "sem_agg",
+                    allow_query_spec=True,
+                ),
+            ),
+            Time.milliseconds(timeout_ms),
+            async_capacity,
+            Types.PICKLED_BYTE_ARRAY(),
+        )
+    raise ValueError(f"Unsupported sem_agg pushdown mode {plan.mode!r}")
 
 
 __all__ = [
@@ -623,6 +723,7 @@ __all__ = [
     "TopKEmbeddingEnvelopeBuilder",
     "StatefulTopKProjector",
     "WindowAlgebraicAggProjector",
+    "WindowOwnedAsyncAggSummarizer",
     "apply_sem_groupby_pushdown",
     "apply_sem_topk_pushdown",
     "apply_sem_agg_pushdown",

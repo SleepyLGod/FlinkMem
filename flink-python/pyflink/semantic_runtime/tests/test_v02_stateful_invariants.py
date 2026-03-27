@@ -13,6 +13,7 @@ if not _sem_runtime_dst.exists():
 # ---------------------------------------------------------------------------
 
 import time
+from collections import deque
 
 import pytest
 
@@ -29,6 +30,15 @@ from pyflink.semantic_runtime.runtime.stateful_metrics import StatefulOperatorMe
 from pyflink.semantic_runtime.runtime.timer_policy import encode_timer_key, TimerCategory, resolve_timer_category
 from pyflink.semantic_runtime.runtime.async_bridge import ASYNC_WORK_TAG
 from pyflink.semantic_runtime.runtime.async_bridge import build_async_bridge
+from pyflink.semantic_runtime.runtime.stateful_async_primitives import (
+    AsyncApplyGuard,
+    AsyncResultEnvelope,
+    AsyncRequestBasis,
+    single_flight_begin,
+    single_flight_complete,
+    single_flight_get_basis,
+    single_flight_is_in_flight,
+)
 from pyflink.semantic_runtime.operators.stateful.sem_groupby import (
     SemGroupbyConfig,
     SemGroupbyFunction,
@@ -40,6 +50,7 @@ from pyflink.semantic_runtime.operators.stateful.sem_agg import SemAggConfig, Se
 from pyflink.semantic_runtime.sem_spec import GroupbyQuerySpec, GroupbyScopePolicy, TriggerPolicy, AggQuerySpec, AggScopePolicy, TopKQuerySpec
 from pyflink.semantic_runtime.runtime.external_search_backend import MockSearchBackend
 from pyflink.semantic_runtime.runtime.continuous_rag_workflow import ContinuousRAGConfig
+from pyflink.semantic_runtime.llm_client import LLMClientConfig
 
 
 class _FakeMapState:
@@ -1010,6 +1021,423 @@ class TestEndToEndRAGConsistency:
         assert len(warnings) > 0
         assert any("window" in w.lower() for w in warnings)
 
+
+class TestStatefulAsyncPrimitives:
+    """Invariant tests for shared stateful async primitives."""
+
+    def test_single_flight_roundtrip(self):
+        meta: dict[str, object] = {}
+        basis = AsyncRequestBasis(
+            request_id="req-1",
+            key="k1",
+            scope_epoch=2,
+            state_version=7,
+            trigger_reason="on_event",
+        )
+        assert single_flight_is_in_flight(meta, "summarize") is False
+        single_flight_begin(meta, "summarize", basis)
+        assert single_flight_is_in_flight(meta, "summarize") is True
+        loaded = single_flight_get_basis(meta, "summarize")
+        assert loaded is not None
+        assert loaded.request_id == "req-1"
+        completed = single_flight_complete(meta, "summarize", "req-1")
+        assert completed.key == "k1"
+        assert single_flight_is_in_flight(meta, "summarize") is False
+
+    def test_stale_guard_epoch_and_version(self):
+        basis = AsyncRequestBasis(
+            request_id="req-2",
+            key="k2",
+            scope_epoch=3,
+            state_version=10,
+            trigger_reason="periodic",
+        )
+        assert (
+            AsyncApplyGuard.is_stale(
+                basis=basis,
+                current_scope_epoch=3,
+                current_state_version=10,
+                enforce_state_version=True,
+            )
+            is False
+        )
+        assert (
+            AsyncApplyGuard.is_stale(
+                basis=basis,
+                current_scope_epoch=4,
+                current_state_version=10,
+                enforce_state_version=True,
+            )
+            is True
+        )
+
+    def test_result_envelope_roundtrip(self):
+        basis = AsyncRequestBasis(
+            request_id="req-3",
+            key="k3",
+            scope_epoch=5,
+            state_version=11,
+            trigger_reason="assignment",
+        )
+        env = AsyncResultEnvelope.from_basis(
+            basis,
+            payload={"lane": "assignment", "event_count": 3},
+        )
+        restored = AsyncResultEnvelope.from_dict(env.to_dict())
+        assert restored.basis.request_id == "req-3"
+        assert restored.payload["lane"] == "assignment"
+        assert restored.payload["event_count"] == 3
+        assert (
+            AsyncApplyGuard.is_stale(
+                basis=basis,
+                current_scope_epoch=3,
+                current_state_version=11,
+                enforce_state_version=True,
+            )
+            is True
+        )
+
+
+class TestGroupbyLlmLaneDiscipline:
+    """Validate assignment/refine lane mutual exclusion in sem_groupby."""
+
+    def test_groupby_lane_rejects_parallel_refine(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(variant="llm_refine"),
+            query_spec=GroupbyQuerySpec(),
+        )
+        meta = {"key": "k1", "scope_epoch": 1, "total_assigned": 3}
+        assignment_basis = func._begin_llm_lane(
+            meta=meta,
+            lane="assignment",
+            now_ms=1000,
+            trigger_reason="assignment",
+        )
+        with pytest.raises(RuntimeError, match="cannot start while assignment is in flight"):
+            func._begin_llm_lane(
+                meta=meta,
+                lane="refine",
+                now_ms=1001,
+                trigger_reason="maintenance_refine",
+            )
+        single_flight_complete(meta, "assignment", assignment_basis.request_id)
+
+    def test_groupby_lane_rejects_parallel_assignment(self):
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(variant="llm_refine"),
+            query_spec=GroupbyQuerySpec(),
+        )
+        meta = {"key": "k1", "scope_epoch": 1, "total_assigned": 3}
+        refine_basis = func._begin_llm_lane(
+            meta=meta,
+            lane="refine",
+            now_ms=1000,
+            trigger_reason="maintenance_refine",
+        )
+        with pytest.raises(RuntimeError, match="cannot start while refine is in flight"):
+            func._begin_llm_lane(
+                meta=meta,
+                lane="assignment",
+                now_ms=1001,
+                trigger_reason="assignment",
+            )
+        single_flight_complete(meta, "refine", refine_basis.request_id)
+
+
+class _ControllableFuture:
+    """Controllable future for async dispatch/apply tests."""
+
+    def __init__(self) -> None:
+        self._done = False
+        self._value = None
+        self._exc = None
+
+    def done(self) -> bool:
+        return self._done
+
+    def set_result(self, value) -> None:
+        self._done = True
+        self._value = value
+        self._exc = None
+
+    def set_exception(self, exc: Exception) -> None:
+        self._done = True
+        self._exc = exc
+        self._value = None
+
+    def result(self):
+        if not self._done:
+            raise RuntimeError("future result requested before completion")
+        if self._exc is not None:
+            raise self._exc
+        return self._value
+
+
+class _QueuedExecutor:
+    """Executor that returns pre-seeded futures in submit order."""
+
+    def __init__(self, futures: list[_ControllableFuture]) -> None:
+        self._futures = deque(futures)
+        self.submitted = 0
+
+    def submit(self, fn, *args, **kwargs):  # noqa: ANN001
+        _ = (fn, args, kwargs)
+        self.submitted += 1
+        if not self._futures:
+            raise RuntimeError("queued executor has no future available")
+        return self._futures.popleft()
+
+
+class _AsyncTimerService:
+    """Timer service stub recording registrations."""
+
+    def __init__(self) -> None:
+        self.processing: list[int] = []
+        self.event: list[int] = []
+
+    def register_processing_time_timer(self, ts: int) -> None:
+        self.processing.append(int(ts))
+
+    def register_event_time_timer(self, ts: int) -> None:
+        self.event.append(int(ts))
+
+
+class _AsyncContext:
+    """Context stub for sem_groupby async runtime tests."""
+
+    def __init__(self, key: str = "k") -> None:
+        self._key = key
+        self._ts = _AsyncTimerService()
+
+    def get_current_key(self) -> str:
+        return self._key
+
+    def timer_service(self) -> _AsyncTimerService:
+        return self._ts
+
+    def output(self, tag, value) -> None:  # noqa: ANN001
+        _ = (tag, value)
+
+
+class TestGroupbyPersistentAsyncApply:
+    """Focused invariants for persistent sem_groupby async dispatch/apply."""
+
+    class _PendingListState:
+        """ListState stub with update support for pending-queue replacement."""
+
+        def __init__(self, values: list[dict] | None = None) -> None:
+            self._values = list(values) if values is not None else []
+
+        def add(self, value: dict) -> None:
+            self._values.append(value)
+
+        def get(self) -> list[dict]:
+            return list(self._values)
+
+        def update(self, values: list[dict]) -> None:
+            self._values = list(values)
+
+        def clear(self) -> None:
+            self._values = []
+
+    def _build_async_groupby(self) -> SemGroupbyFunction:
+        func = SemGroupbyFunction(
+            SemGroupbyConfig(
+                variant="llm_basic",
+                assignment_batch_size=1,
+                async_poll_interval_ms=50,
+            ),
+            query_spec=GroupbyQuerySpec(),
+            llm_config=LLMClientConfig(backend="mock"),
+        )
+        func._group_profiles = _FakeMapState({})
+        func._pending_events = self._PendingListState()
+        func._meta = _FakeValueState(
+            {
+                "key": "k",
+                "total_assigned": 0,
+                "scope_epoch": 0,
+                "scope_last_time_ms": 0,
+                "scope_bucket_id": None,
+            }
+        )
+        func._metrics = StatefulOperatorMetrics.noop("sem_groupby")
+        assert func._enable_async_llm_runtime is True
+        return func
+
+    def test_async_pending_then_apply(self) -> None:
+        func = self._build_async_groupby()
+        pending_future = _ControllableFuture()
+        func._executor = _QueuedExecutor([pending_future])
+        ctx = _AsyncContext("k")
+
+        outs = list(
+            func.process_element(
+                SemEvent(key="k", payload="alpha", seq_id=1).to_dict(),
+                ctx,
+            )
+        )
+        assert outs == []
+        meta = func._meta.value()
+        assert single_flight_is_in_flight(meta, "assignment") is True
+        assert int(meta.get("total_assigned", 0)) == 0
+
+        pending_future.set_result(
+            [[
+                {
+                    "event_seq_id": 1,
+                    "decision": "new",
+                    "group_id": "",
+                    "label": "alpha",
+                    "confidence": 0.9,
+                    "reason": "new",
+                }
+            ]]
+        )
+        recompute_ts = int(meta[encode_timer_key(TimerCategory.RECOMPUTE)])
+        timer_out = list(func.on_timer(recompute_ts, ctx))
+        assert len(timer_out) == 1
+        assert timer_out[0]["event_seq_id"] == 1
+        assert timer_out[0]["group_id"]
+        after = func._meta.value()
+        assert single_flight_is_in_flight(after, "assignment") is False
+        assert int(after.get("total_assigned", 0)) == 1
+
+    def test_async_stale_result_dropped(self) -> None:
+        func = self._build_async_groupby()
+        pending_future = _ControllableFuture()
+        func._executor = _QueuedExecutor([pending_future])
+        ctx = _AsyncContext("k")
+
+        _ = list(
+            func.process_element(
+                SemEvent(key="k", payload="alpha", seq_id=1).to_dict(),
+                ctx,
+            )
+        )
+        meta = func._meta.value()
+        meta["scope_epoch"] = int(meta.get("scope_epoch", 0)) + 1
+        func._meta.update(meta)
+
+        pending_future.set_result(
+            [[
+                {
+                    "event_seq_id": 1,
+                    "decision": "new",
+                    "group_id": "",
+                    "label": "alpha",
+                    "confidence": 0.9,
+                    "reason": "new",
+                }
+            ]]
+        )
+        recompute_ts = int(meta[encode_timer_key(TimerCategory.RECOMPUTE)])
+        timer_out = list(func.on_timer(recompute_ts, ctx))
+        assert timer_out == []
+        after = func._meta.value()
+        assert int(after.get("total_assigned", 0)) == 0
+        assert len(func._group_profiles.keys()) == 0
+        assert single_flight_is_in_flight(after, "assignment") is False
+
+    def test_async_inflight_buffers_next_event_and_serializes_dispatch(self) -> None:
+        func = self._build_async_groupby()
+        first_future = _ControllableFuture()
+        second_future = _ControllableFuture()
+        func._executor = _QueuedExecutor([first_future, second_future])
+        ctx = _AsyncContext("k")
+
+        first_out = list(
+            func.process_element(
+                SemEvent(key="k", payload="alpha", seq_id=1).to_dict(),
+                ctx,
+            )
+        )
+        assert first_out == []
+        second_out = list(
+            func.process_element(
+                SemEvent(key="k", payload="beta", seq_id=2).to_dict(),
+                ctx,
+            )
+        )
+        assert second_out == []
+        assert len(func._pending_event_values()) == 1
+        assert func._executor.submitted == 1
+
+        first_future.set_result(
+            [[
+                {
+                    "event_seq_id": 1,
+                    "decision": "new",
+                    "group_id": "",
+                    "label": "alpha",
+                    "confidence": 0.9,
+                    "reason": "new",
+                }
+            ]]
+        )
+        meta = func._meta.value()
+        recompute_ts = int(meta[encode_timer_key(TimerCategory.RECOMPUTE)])
+        timer_out = list(func.on_timer(recompute_ts, ctx))
+        assert len(timer_out) == 1
+        assert timer_out[0]["event_seq_id"] == 1
+        assert func._executor.submitted == 2
+        assert single_flight_is_in_flight(func._meta.value(), "assignment") is True
+
+
+class TestSemAggPersistentAsyncApply:
+    """Focused invariants for persistent sem_agg async dispatch/apply."""
+
+    class _SummaryPoolStub:
+        """Minimal summary worker stub for queued-executor tests."""
+
+        def evaluate(self, **kwargs):  # noqa: ANN003
+            _ = kwargs
+            raise RuntimeError("queued executor should bypass evaluate() execution")
+
+    def _build_async_agg(self) -> SemAggFunction:
+        func = SemAggFunction(
+            SemAggConfig(
+                mode="summarize",
+                max_buffer_events=1,
+                flush_interval_ms=0,
+                async_poll_interval_ms=50,
+            ),
+        )
+        func._buffer = _FakeListState()
+        func._agg_value = _FakeValueState()
+        func._meta = _FakeValueState(
+            {
+                "key": "k",
+                "event_count": 1,
+                "version": 0,
+                "scope_epoch": 0,
+                "scope_last_time_ms": 0,
+                "scope_bucket_id": None,
+                "pending_summarize": False,
+            }
+        )
+        func._metrics = StatefulOperatorMetrics.noop("sem_agg")
+        func._summary_client_pool = self._SummaryPoolStub()
+        return func
+
+    def test_async_stale_non_scope_close_is_dropped(self) -> None:
+        func = self._build_async_agg()
+        pending_future = _ControllableFuture()
+        func._executor = _QueuedExecutor([pending_future])
+        ctx = _AsyncContext("k")
+
+        func._buffer.add({"key": "k", "payload": "alpha", "seq_id": 1})
+        meta = func._meta.value()
+        func._dispatch_summary_request(meta, ctx.timer_service(), now_ms=1000)
+        meta["scope_epoch"] = int(meta.get("scope_epoch", 0)) + 1
+        func._meta.update(meta)
+
+        pending_future.set_result({"summary": "late"})
+        out = list(func._poll_pending_summary(func._meta.value(), ctx, now_ms=1100))
+        assert out == []
+        assert func._agg_value.value() is None
+        after = func._meta.value()
+        assert after["pending_summarize"] is False
 
 # ============================================================================
 # Run

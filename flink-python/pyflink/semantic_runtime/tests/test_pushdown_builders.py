@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import sentinel
 
 import pytest
@@ -286,6 +287,98 @@ def test_apply_sem_agg_pushdown_aggregates_one_snapshot() -> None:
     ).map(snapshot)
     assert out["mode"] == "algebraic_window"
     assert out["aggregate"]["total"] == 8
+
+
+def test_apply_sem_agg_pushdown_summarize_uses_async_runtime(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_unordered_wait(input_stream, async_fn, timeout, async_capacity, output_type):
+        captured["input_stream"] = input_stream
+        captured["async_fn"] = async_fn
+        captured["timeout"] = timeout
+        captured["async_capacity"] = async_capacity
+        captured["output_type"] = output_type
+        return sentinel.agg_async_stream
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.pushdown.stateful_pushdown.AsyncDataStream.unordered_wait",
+        fake_unordered_wait,
+    )
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_agg": {
+                    "query_spec": {},
+                    "kernel": {
+                        "mode": "summarize",
+                        "mock_delay_s": 0.01,
+                        "mock_response": '{"summary":"ok"}',
+                    },
+                }
+            },
+        }
+    )
+    result = stateful_pushdown.apply_sem_agg_pushdown(
+        sentinel.input_stream,
+        request=sem_agg(intent="Summarize", mode="summarize", context=context("window")),
+        runtime_config=runtime_config,
+        timeout_ms=12_345,
+        async_capacity=7,
+    )
+
+    assert result is sentinel.agg_async_stream
+    assert captured["input_stream"] is sentinel.input_stream
+    assert captured["async_fn"].__class__.__name__ == "WindowOwnedAsyncAggSummarizer"
+    assert captured["async_capacity"] == 7
+
+
+def test_apply_sem_agg_pushdown_rejects_invalid_runtime_numbers() -> None:
+    runtime_config = RuntimeConfig.from_dict({"operators": {"sem_agg": {"query_spec": {}, "kernel": {}}}})
+    request = sem_agg(intent="Aggregate", mode="algebraic", context=context("window"))
+
+    with pytest.raises(ValueError, match="timeout_ms > 0"):
+        stateful_pushdown.apply_sem_agg_pushdown(
+            sentinel.input_stream,
+            request=request,
+            runtime_config=runtime_config,
+            timeout_ms=0,
+        )
+    with pytest.raises(ValueError, match="async_capacity > 0"):
+        stateful_pushdown.apply_sem_agg_pushdown(
+            sentinel.input_stream,
+            request=request,
+            runtime_config=runtime_config,
+            async_capacity=0,
+        )
+
+
+def test_window_owned_async_agg_summarizer_emits_summary_row() -> None:
+    class _FakeClient:
+        async def call(self, prompt):
+            return ('{"summary":"merged"}', {"latency_ms": 1})
+
+    worker = stateful_pushdown.WindowOwnedAsyncAggSummarizer(
+        mode="summarize",
+        max_buffer_events=10,
+        llm_config=RuntimeConfig.from_dict({"llm": {"backend": "mock"}}).to_llm_client_config(),
+    )
+    worker._client = _FakeClient()
+    snapshot = {
+        "key": "k1",
+        "window_id": "w1",
+        "trigger_reason": "close",
+        "events": [
+            {"key": "k1", "payload": "hello", "seq_id": 1},
+            {"key": "k1", "payload": "world", "seq_id": 2},
+        ],
+    }
+    rows = asyncio.run(worker.async_invoke(snapshot))
+    assert len(rows) == 1
+    assert rows[0]["mode"] == "summarize_async"
+    assert rows[0]["aggregate"]["summary"] == "merged"
+    assert rows[0]["event_count"] == 2
 
 
 def test_apply_sem_filter_pushdown_rejects_invalid_runtime_numbers() -> None:

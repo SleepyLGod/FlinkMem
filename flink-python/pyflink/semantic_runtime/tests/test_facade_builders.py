@@ -436,6 +436,59 @@ def test_apply_sem_agg_from_request_uses_pushdown_for_window_algebraic(monkeypat
     assert captured["args"] == (sentinel.window_snapshots,)
 
 
+def test_apply_sem_agg_from_request_uses_pushdown_for_window_summarize(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    sentinel.window_snapshots = _FakeDataStream()
+
+    def fake_apply_sem_agg_pushdown(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel.agg_stream
+
+    def fake_materialize_window_stream(*args, **kwargs):
+        return sentinel.window_snapshots
+
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.apply_sem_agg_pushdown",
+        fake_apply_sem_agg_pushdown,
+    )
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.facade_builders.materialize_window_stream",
+        fake_materialize_window_stream,
+    )
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_agg": {
+                    "query_spec": {
+                        "scope_policy": {
+                            "window_kind": "tumbling",
+                            "window_size_ms": 1000,
+                        },
+                    },
+                    "kernel": {
+                        "persistence_policy": "reset_per_scope",
+                        "mode": "summarize",
+                        "mock_delay_s": 0.01,
+                        "mock_response": '{"summary":"ok"}',
+                    },
+                }
+            }
+        }
+    )
+
+    result = facade_builders.apply_sem_agg_from_request(
+        sentinel.input_ds,
+        request=sem_agg(intent="Summarize scope", mode="summarize", context=context("window")),
+        runtime_config=runtime_config,
+    )
+
+    assert result is sentinel.agg_stream
+    assert captured["args"] == (sentinel.window_snapshots,)
+
+
 def test_apply_sem_join_from_request_connects_two_streams() -> None:
     left_ds = _FakeDataStream()
     right_ds = _FakeDataStream()

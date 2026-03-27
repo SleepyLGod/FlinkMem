@@ -313,6 +313,10 @@ def window_snapshot_to_topk_pool(
         "source": "window_snapshot",
         "window_id": snap.get("window_id", ""),
         "scope_id": snap.get("window_id", ""),
+        "scope_epoch": 0,
+        "scope_version": int(
+            snap.get("close_time_ms", snap.get("open_time_ms", 0)) or 0
+        ),
     }
 
 

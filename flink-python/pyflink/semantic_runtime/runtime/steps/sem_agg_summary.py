@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any, Dict, List
 
 from pyflink.semantic_runtime.llm_client import (
@@ -14,6 +15,17 @@ from pyflink.semantic_runtime.llm_client import (
 from pyflink.semantic_runtime.runtime.prompt_templates import (
     build_sem_agg_summary_update_prompt,
 )
+
+_THREAD_LOCAL = threading.local()
+
+
+def _run_sync(coro):
+    """Run one coroutine on a thread-local event loop."""
+    loop = getattr(_THREAD_LOCAL, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _THREAD_LOCAL.loop = loop
+    return loop.run_until_complete(coro)
 
 
 async def _call_json(
@@ -71,18 +83,14 @@ def evaluate_sem_agg_summary_update_sync(
     added_events: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Evaluate one synchronous semantic summary update."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(
-            evaluate_sem_agg_summary_update(
-                client=client,
-                mode=mode,
-                current_summary=current_summary,
-                added_events=added_events,
-            )
+    return _run_sync(
+        evaluate_sem_agg_summary_update(
+            client=client,
+            mode=mode,
+            current_summary=current_summary,
+            added_events=added_events,
         )
-    finally:
-        loop.close()
+    )
 
 
 def evaluate_sem_agg_summary_update_from_config_sync(
