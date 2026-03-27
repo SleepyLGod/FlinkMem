@@ -376,7 +376,6 @@ def apply_sem_join_from_request(
     """Apply a public semantic join request to two keyed streams."""
     from pyflink.semantic_runtime.operators.stateful.sem_join import (
         build_sem_join_operator,
-        build_window_owned_sem_join_operator,
     )
 
     if request.context.kind not in {"stream", "window"}:
@@ -386,15 +385,15 @@ def apply_sem_join_from_request(
             "sem_join right_input must be a stream-like object with key_by(...) "
             "for true two-input runtime"
         )
+    if not callable(left_key_selector):
+        raise TypeError("sem_join left_key_selector must be callable")
+    if not callable(right_key_selector):
+        raise TypeError("sem_join right_key_selector must be callable")
 
     plan = lower_sem_join_request(request, runtime_config)
     left_stream = left_input_ds
     right_stream = request.right_input
     if request.context.kind == "window":
-        if plan.query_spec.scope_policy.window_kind == "semantic":
-            raise NotImplementedError(
-                "window-owned sem_join does not support semantic-window pairing yet"
-            )
         left_stream = materialize_window_stream(
             left_input_ds,
             scope_policy=plan.query_spec.scope_policy,
@@ -419,18 +418,11 @@ def apply_sem_join_from_request(
         "sem_join",
         allow_query_spec=True,
     )
-    if request.context.kind == "window":
-        op = build_window_owned_sem_join_operator(
-            query_spec=plan.query_spec,
-            llm_config=llm_config,
-            kernel_config=plan.kernel_config,
-        )
-    else:
-        op = build_sem_join_operator(
-            query_spec=plan.query_spec,
-            llm_config=llm_config,
-            kernel_config=plan.kernel_config,
-        )
+    op = build_sem_join_operator(
+        query_spec=plan.query_spec,
+        llm_config=llm_config,
+        kernel_config=plan.kernel_config,
+    )
     return (
         left_stream.key_by(left_key_selector)
         .connect(right_stream.key_by(right_key_selector))

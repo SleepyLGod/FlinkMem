@@ -660,22 +660,16 @@ def test_true_two_input_sem_join_pipeline() -> None:
             "llm": {"backend": "mock"},
             "operators": {
                 "sem_join": {
-                    "query_spec": {"backend": "llm"},
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match contradictory facts",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
                     "kernel": {
                         "pair_block_size": 1,
-                        "mock_delay_s": 0.01,
-                        "mock_response": json.dumps(
-                            {
-                                "matches": [
-                                    {
-                                        "pair_idx": 0,
-                                        "matched": True,
-                                        "match_score": 0.97,
-                                        "reason": "contradiction",
-                                    }
-                                ]
-                            }
-                        ),
                     },
                 }
             },
@@ -687,6 +681,7 @@ def test_true_two_input_sem_join_pipeline() -> None:
             intent="Match contradictory facts",
             context=context("stream"),
             right_input=right_ds,
+            join_type="inner",
         ),
         runtime_config=runtime_config,
         left_key_selector=lambda row: row[0],
@@ -696,13 +691,241 @@ def test_true_two_input_sem_join_pipeline() -> None:
     assert len(results) == 1
     parsed = parse_result_record(results[0])
     assert parsed["matched"] is True
-    assert parsed["match_score"] == 0.97
+    assert parsed["match_score"] >= 0.0
     assert parsed["left"][0] == "alice"
     assert parsed["right"][0] == "alice"
 
 
-def test_window_owned_sem_join_pipeline() -> None:
-    """Positive path for window-owned sem_join should succeed."""
+def test_true_two_input_left_sem_join_pipeline() -> None:
+    """Positive path for left sem_join should emit matched rows on semantic match."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_rows = [
+        ("alice", "Alice lives in Beijing"),
+    ]
+    right_rows = [
+        ("alice", "Alice currently lives in Beijing"),
+    ]
+    left_ds = env.from_collection(left_rows, type_info=Types.TUPLE([Types.STRING(), Types.STRING()]))
+    right_ds = env.from_collection(
+        right_rows,
+        type_info=Types.TUPLE([Types.STRING(), Types.STRING()]),
+    )
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match same fact",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
+                    "kernel": {
+                        "pair_block_size": 1,
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match same fact",
+            context=context("stream"),
+            right_input=right_ds,
+            join_type="left",
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row[0],
+        right_key_selector=lambda row: row[0],
+    )
+    results = collect_results(env, result, "test_true_two_input_left_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["join_type"] == "left"
+    assert parsed["left"][0] == "alice"
+    assert parsed["right"][0] == "alice"
+
+
+def test_true_two_input_right_sem_join_pipeline() -> None:
+    """Positive path for right sem_join should emit matched rows on semantic match."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_rows = [
+        ("alice", "Alice lives in Beijing"),
+    ]
+    right_rows = [
+        ("alice", "Alice currently lives in Beijing"),
+    ]
+    left_ds = env.from_collection(left_rows, type_info=Types.TUPLE([Types.STRING(), Types.STRING()]))
+    right_ds = env.from_collection(
+        right_rows,
+        type_info=Types.TUPLE([Types.STRING(), Types.STRING()]),
+    )
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match same fact",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
+                    "kernel": {
+                        "pair_block_size": 1,
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match same fact",
+            context=context("stream"),
+            right_input=right_ds,
+            join_type="right",
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row[0],
+        right_key_selector=lambda row: row[0],
+    )
+    results = collect_results(env, result, "test_true_two_input_right_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["join_type"] == "right"
+    assert parsed["left"][0] == "alice"
+    assert parsed["right"][0] == "alice"
+
+
+def test_true_two_input_full_sem_join_pipeline() -> None:
+    """Positive path for full sem_join should emit matched rows on semantic match."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_rows = [
+        ("alice", "Alice lives in Beijing"),
+    ]
+    right_rows = [
+        ("alice", "Alice currently lives in Beijing"),
+    ]
+    left_ds = env.from_collection(left_rows, type_info=Types.TUPLE([Types.STRING(), Types.STRING()]))
+    right_ds = env.from_collection(
+        right_rows,
+        type_info=Types.TUPLE([Types.STRING(), Types.STRING()]),
+    )
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match same fact",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
+                    "kernel": {
+                        "pair_block_size": 1,
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match same fact",
+            context=context("stream"),
+            right_input=right_ds,
+            join_type="full",
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row[0],
+        right_key_selector=lambda row: row[0],
+    )
+    results = collect_results(env, result, "test_true_two_input_full_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["join_type"] == "full"
+    assert parsed["left"][0] == "alice"
+    assert parsed["right"][0] == "alice"
+
+
+def test_true_two_input_semi_sem_join_pipeline() -> None:
+    """Positive path for semi sem_join should emit left side once on semantic match."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_rows = [
+        ("alice", "Alice lives in Beijing"),
+    ]
+    right_rows = [
+        ("alice", "Alice currently lives in Beijing"),
+    ]
+    left_ds = env.from_collection(left_rows, type_info=Types.TUPLE([Types.STRING(), Types.STRING()]))
+    right_ds = env.from_collection(
+        right_rows,
+        type_info=Types.TUPLE([Types.STRING(), Types.STRING()]),
+    )
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match same fact",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
+                    "kernel": {
+                        "pair_block_size": 1,
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match same fact",
+            context=context("stream"),
+            right_input=right_ds,
+            join_type="semi",
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: row[0],
+        right_key_selector=lambda row: row[0],
+    )
+    results = collect_results(env, result, "test_true_two_input_semi_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["join_type"] == "semi"
+    assert parsed["left"][0] == "alice"
+    assert parsed["right"] is None
+
+
+def test_window_context_sem_join_pipeline() -> None:
+    """Window-context sem_join should ingest snapshot deltas into the same continuous join runtime."""
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
@@ -733,22 +956,16 @@ def test_window_owned_sem_join_pipeline() -> None:
             "llm": {"backend": "mock"},
             "operators": {
                 "sem_join": {
-                    "query_spec": {"backend": "llm"},
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match contradictory facts",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
                     "kernel": {
                         "pair_block_size": 1,
-                        "mock_delay_s": 0.01,
-                        "mock_response": json.dumps(
-                            {
-                                "matches": [
-                                    {
-                                        "pair_idx": 0,
-                                        "matched": True,
-                                        "match_score": 0.93,
-                                        "reason": "contradiction",
-                                    }
-                                ]
-                            }
-                        ),
                     },
                 }
             },
@@ -765,11 +982,149 @@ def test_window_owned_sem_join_pipeline() -> None:
         left_key_selector=lambda row: json.loads(row)["key"],
         right_key_selector=lambda row: json.loads(row)["key"],
     )
-    results = collect_results(env, result, "test_window_owned_sem_join_pipeline")
+    results = collect_results(env, result, "test_window_context_sem_join_pipeline")
     assert len(results) == 1
     parsed = parse_result_record(results[0])
     assert parsed["matched"] is True
-    assert parsed["window_id"] == "w1"
+    assert parsed["left"] == "Alice lives in Beijing"
+    assert parsed["right"] == "Alice lives in Shanghai"
+
+
+def test_mixed_scope_sem_join_pipeline() -> None:
+    """Mixed scope join should work: left snapshot stream, right row stream."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_snapshots = [
+        json.dumps(
+            {
+                "key": "alice",
+                "window_id": "left-w1",
+                "events": [{"key": "alice", "payload": "Alice lives in Beijing", "seq_id": 1}],
+                "trigger_reason": "close",
+            }
+        )
+    ]
+    right_rows = [
+        ("alice", "Alice currently lives in Beijing"),
+    ]
+    left_ds = env.from_collection(left_snapshots, type_info=Types.STRING())
+    right_ds = env.from_collection(right_rows, type_info=Types.TUPLE([Types.STRING(), Types.STRING()]))
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match same fact",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
+                    "kernel": {
+                        "pair_block_size": 1,
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match same fact",
+            context=context("stream"),
+            right_input=right_ds,
+            join_type="inner",
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: json.loads(row)["key"],
+        right_key_selector=lambda row: row[0],
+    )
+    results = collect_results(env, result, "test_mixed_scope_sem_join_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["left"] == "Alice lives in Beijing"
+    assert parsed["right"][0] == "alice"
+
+
+def test_sem_join_cross_scope_seq_dedupe_pipeline() -> None:
+    """Repeated seq_id across scopes should not produce duplicate join matches."""
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    left_snapshots = [
+        json.dumps(
+            {
+                "key": "alice",
+                "window_id": "left-w1",
+                "events": [{"key": "alice", "payload": "L", "seq_id": 1}],
+                "trigger_reason": "close",
+            }
+        )
+    ]
+    right_snapshots = [
+        json.dumps(
+            {
+                "key": "alice",
+                "window_id": "right-w1",
+                "events": [{"key": "alice", "payload": "R", "seq_id": 2}],
+                "trigger_reason": "close",
+            }
+        ),
+        json.dumps(
+            {
+                "key": "alice",
+                "window_id": "right-w2",
+                "events": [{"key": "alice", "payload": "R", "seq_id": 2}],
+                "trigger_reason": "close",
+            }
+        ),
+    ]
+    left_ds = env.from_collection(left_snapshots, type_info=Types.STRING())
+    right_ds = env.from_collection(right_snapshots, type_info=Types.STRING())
+
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {
+                        "semantic": {
+                            "instruction": "Match same fact",
+                            "backend": "embedding",
+                            "output_mode": "bool",
+                            "threshold": 0.0,
+                        }
+                    },
+                    "kernel": {
+                        "pair_block_size": 1,
+                    },
+                }
+            },
+        }
+    )
+    result = apply_sem_join_from_request(
+        left_ds,
+        request=sem_join(
+            intent="Match same fact",
+            context=context("stream"),
+            right_input=right_ds,
+            join_type="inner",
+        ),
+        runtime_config=runtime_config,
+        left_key_selector=lambda row: json.loads(row)["key"],
+        right_key_selector=lambda row: json.loads(row)["key"],
+    )
+    results = collect_results(env, result, "test_sem_join_cross_scope_seq_dedupe_pipeline")
+    assert len(results) == 1
+    parsed = parse_result_record(results[0])
+    assert parsed["matched"] is True
+    assert parsed["left"] == "L"
+    assert parsed["right"] == "R"
 
 
 TESTS = {
@@ -783,7 +1138,13 @@ TESTS = {
     "stateful_topk": test_stateful_topk_pushdown_pipeline,
     "agg": test_window_algebraic_agg_pushdown_pipeline,
     "sem_join": test_true_two_input_sem_join_pipeline,
-    "window_sem_join": test_window_owned_sem_join_pipeline,
+    "left_sem_join": test_true_two_input_left_sem_join_pipeline,
+    "right_sem_join": test_true_two_input_right_sem_join_pipeline,
+    "full_sem_join": test_true_two_input_full_sem_join_pipeline,
+    "semi_sem_join": test_true_two_input_semi_sem_join_pipeline,
+    "window_sem_join": test_window_context_sem_join_pipeline,
+    "mixed_scope_sem_join": test_mixed_scope_sem_join_pipeline,
+    "cross_scope_dedupe_sem_join": test_sem_join_cross_scope_seq_dedupe_pipeline,
     "real": test_real_pipeline_if_enabled,
 }
 
@@ -804,11 +1165,18 @@ if __name__ == "__main__":
             "stateful_topk",
             "agg",
             "sem_join",
+            "left_sem_join",
+            "right_sem_join",
+            "full_sem_join",
+            "semi_sem_join",
             "window_sem_join",
+            "mixed_scope_sem_join",
+            "cross_scope_dedupe_sem_join",
         ):
             fn = TESTS[name]
             try:
                 fn()
+                print(f"  ✓ {name}")
                 passed += 1
             except Exception as exc:
                 print(f"  ✗ {name}: {exc}")
@@ -818,6 +1186,7 @@ if __name__ == "__main__":
             sys.exit(1)
     elif which in TESTS:
         TESTS[which]()
+        print(f"✓ {which}")
     else:
         print(f"Unknown: {which}. Options: {list(TESTS.keys())} or 'all'")
         sys.exit(1)

@@ -525,7 +525,7 @@ def test_apply_sem_join_from_request_connects_two_streams() -> None:
     assert left_ds.connected.processed_with.__class__.__name__ == "SemJoinFunction"
 
 
-def test_apply_sem_join_from_request_uses_window_owned_runtime() -> None:
+def test_apply_sem_join_from_request_uses_continuous_runtime_for_window_context() -> None:
     left_ds = _FakeDataStream()
     right_ds = _FakeDataStream()
     runtime_config = RuntimeConfig.from_dict(
@@ -551,7 +551,7 @@ def test_apply_sem_join_from_request_uses_window_owned_runtime() -> None:
         right_key_selector=lambda row: row["key"],
     )
     assert result is sentinel.join_stream
-    assert left_ds.connected.processed_with.__class__.__name__ == "WindowOwnedSemJoinFunction"
+    assert left_ds.connected.processed_with.__class__.__name__ == "SemJoinFunction"
 
 
 def test_apply_sem_join_from_request_materializes_native_windows(monkeypatch) -> None:
@@ -604,3 +604,48 @@ def test_apply_sem_join_from_request_materializes_native_windows(monkeypatch) ->
     assert captured["count"] == 2
     assert materialized_left.connected is not None
     assert materialized_left.connected.right is materialized_right
+
+
+def test_apply_sem_join_from_request_rejects_non_callable_key_selectors() -> None:
+    left_ds = _FakeDataStream()
+    right_ds = _FakeDataStream()
+    runtime_config = RuntimeConfig.from_dict(
+        {
+            "llm": {"backend": "mock"},
+            "operators": {
+                "sem_join": {
+                    "query_spec": {"backend": "llm"},
+                    "kernel": {
+                        "mock_delay_s": 0.01,
+                        "mock_response": '{"matches": []}',
+                    },
+                }
+            },
+        }
+    )
+
+    with pytest.raises(TypeError, match="left_key_selector must be callable"):
+        facade_builders.apply_sem_join_from_request(
+            left_ds,
+            request=sem_join(
+                intent="Match if same issue",
+                context=context("stream"),
+                right_input=right_ds,
+            ),
+            runtime_config=runtime_config,
+            left_key_selector="not-callable",
+            right_key_selector=lambda row: row["key"],
+        )
+
+    with pytest.raises(TypeError, match="right_key_selector must be callable"):
+        facade_builders.apply_sem_join_from_request(
+            left_ds,
+            request=sem_join(
+                intent="Match if same issue",
+                context=context("stream"),
+                right_input=right_ds,
+            ),
+            runtime_config=runtime_config,
+            left_key_selector=lambda row: row["key"],
+            right_key_selector="not-callable",
+        )

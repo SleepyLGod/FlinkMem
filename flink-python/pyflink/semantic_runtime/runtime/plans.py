@@ -278,7 +278,7 @@ def _join_context_to_runtime_kind(kind: str) -> str:
     if kind == "stream":
         return "two_input_stream"
     if kind == "window":
-        return "window_owned"
+        return "two_input_stream"
     raise ValueError(f"sem_join does not support context {kind!r}.")
 
 
@@ -472,10 +472,11 @@ def lower_sem_join_request(
     """Lower a public stateful semantic join request into one internal plan."""
     query_spec = runtime_config.get_join_query_spec()
     query_spec.semantic.instruction = request.intent
-    runtime_kind = _join_context_to_runtime_kind(request.context.kind)
-    if runtime_kind == "window_owned" and _is_default_on_event_trigger(query_spec.trigger_policy):
+    query_spec.join_type = request.join_type
+    _join_context_to_runtime_kind(request.context.kind)
+    if request.context.kind == "window" and _is_default_on_event_trigger(query_spec.trigger_policy):
         query_spec.trigger_policy = TriggerPolicy(mode="on_scope_close")
-    if runtime_kind != "window_owned":
+    if request.context.kind != "window":
         query_spec.scope_policy.window_kind = None
     return SemJoinPlan(
         intent=request.intent,

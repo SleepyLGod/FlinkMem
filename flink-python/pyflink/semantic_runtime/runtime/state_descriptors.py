@@ -337,6 +337,64 @@ def sem_join_right_buffer_descriptor(
     return desc
 
 
+def sem_join_left_scope_progress_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for left-side external-scope delta ingestion progress."""
+    desc = MapStateDescriptor(
+        "sem_join_left_scope_progress",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_join_right_scope_progress_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for right-side external-scope delta ingestion progress."""
+    desc = MapStateDescriptor(
+        "sem_join_right_scope_progress",
+        Types.STRING(),
+        Types.PICKLED_BYTE_ARRAY(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_join_left_seen_seq_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for left-side globally ingested sequence ids.
+
+    Key: seq_id (int), Value: observed timestamp milliseconds (int).
+    """
+    desc = MapStateDescriptor(
+        "sem_join_left_seen_seq",
+        Types.LONG(),
+        Types.LONG(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
+def sem_join_right_seen_seq_descriptor(
+    ttl_seconds: int = 3600,
+) -> MapStateDescriptor:
+    """MapState descriptor for right-side globally ingested sequence ids.
+
+    Key: seq_id (int), Value: observed timestamp milliseconds (int).
+    """
+    desc = MapStateDescriptor(
+        "sem_join_right_seen_seq",
+        Types.LONG(),
+        Types.LONG(),
+    )
+    desc.enable_time_to_live(build_ttl_config(ttl_seconds))
+    return desc
+
+
 def sem_join_left_windows_descriptor(
     ttl_seconds: int = 3600,
 ) -> MapStateDescriptor:

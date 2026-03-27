@@ -297,6 +297,7 @@ class TopKScopePolicy:
 
 VALID_RANKING_METHODS = {"pointwise", "pairwise", "listwise"}
 VALID_AGG_METHODS = {"algebraic", "summarize", "compressive"}
+VALID_JOIN_TYPES = {"inner", "left", "right", "full", "semi", "anti"}
 VALID_JOIN_PAIRING_METHODS = {
     "candidate_pruned",
     "embedding_prefilter",
@@ -391,7 +392,13 @@ class TopKQuerySpec:
         Defines the active candidate scope (TTL, pool cap, window).
     """
 
-    semantic: SemSpec = field(default_factory=lambda: SemSpec.for_sem_topk())
+    semantic: SemSpec = field(
+        default_factory=lambda: SemSpec(
+            instruction="",
+            backend="llm",
+            output_mode="score",
+        )
+    )
     k: int = 10
     query_id: str = "default"
     query_version: int = 1
@@ -400,10 +407,10 @@ class TopKQuerySpec:
     scope_policy: TopKScopePolicy = field(default_factory=TopKScopePolicy)
 
     def __post_init__(self):
-        if self.semantic.backend != "hybrid":
+        if self.semantic.backend != "llm":
             raise ValueError(
-                "TopKQuerySpec does not expose backend selection. "
-                "Use internal planner/kernel config for scorer backend."
+                "TopKQuerySpec requires semantic.backend='llm'. "
+                "Backend implementation is internal and configured by runtime kernel settings."
             )
         if self.ranking_method not in VALID_RANKING_METHODS:
             raise ValueError(
@@ -436,7 +443,11 @@ class TopKQuerySpec:
             )
         """
         return cls(
-            semantic=SemSpec.for_sem_topk(instruction),
+            semantic=SemSpec(
+                instruction=instruction,
+                backend="llm",
+                output_mode="score",
+            ),
             k=k,
             trigger_policy=TriggerPolicy(),
             scope_policy=TopKScopePolicy(
@@ -530,7 +541,7 @@ class GroupbyQuerySpec:
     semantic: SemSpec = field(
         default_factory=lambda: SemSpec(
             instruction="Assign tuples to semantic groups.",
-            backend="hybrid",
+            backend="llm",
             output_mode="label",
         )
     )
@@ -541,10 +552,10 @@ class GroupbyQuerySpec:
     scope_policy: GroupbyScopePolicy = field(default_factory=GroupbyScopePolicy)
 
     def __post_init__(self) -> None:
-        if self.semantic.backend != "hybrid":
+        if self.semantic.backend != "llm":
             raise ValueError(
-                "GroupbyQuerySpec does not expose backend selection. "
-                "Use internal planner/kernel config for grouping backend."
+                "GroupbyQuerySpec requires semantic.backend='llm'. "
+                "Backend implementation is internal and configured by runtime kernel settings."
             )
 
     @classmethod
@@ -558,7 +569,7 @@ class GroupbyQuerySpec:
         return cls(
             semantic=SemSpec(
                 instruction=instruction,
-                backend="hybrid",
+                backend="llm",
                 output_mode="label",
             ),
             trigger_policy=TriggerPolicy(),
@@ -652,7 +663,7 @@ class AggQuerySpec:
     semantic: SemSpec = field(
         default_factory=lambda: SemSpec(
             instruction="Aggregate semantic state over a keyed stream.",
-            backend="hybrid",
+            backend="llm",
             output_mode="summary",
         )
     )
@@ -663,10 +674,10 @@ class AggQuerySpec:
     scope_policy: AggScopePolicy = field(default_factory=AggScopePolicy)
 
     def __post_init__(self):
-        if self.semantic.backend != "hybrid":
+        if self.semantic.backend != "llm":
             raise ValueError(
-                "AggQuerySpec does not expose backend selection. "
-                "Use internal planner/kernel config for aggregation backend."
+                "AggQuerySpec requires semantic.backend='llm'. "
+                "Backend implementation is internal and configured by runtime kernel settings."
             )
         if self.agg_method not in VALID_AGG_METHODS:
             raise ValueError(
@@ -686,7 +697,7 @@ class AggQuerySpec:
         return cls(
             semantic=SemSpec(
                 instruction=instruction,
-                backend="hybrid",
+                backend="llm",
                 output_mode="summary",
             ),
             agg_method=agg_method,
@@ -780,11 +791,17 @@ class JoinQuerySpec:
     )
     query_id: str = "default"
     query_version: int = 1
+    join_type: str = "inner"
     pairing_method: str = "candidate_pruned"
     trigger_policy: TriggerPolicy = field(default_factory=TriggerPolicy)
     scope_policy: JoinScopePolicy = field(default_factory=JoinScopePolicy)
 
     def __post_init__(self):
+        if self.join_type not in VALID_JOIN_TYPES:
+            raise ValueError(
+                f"Invalid join_type={self.join_type!r}. "
+                f"Must be one of {VALID_JOIN_TYPES}."
+            )
         if self.pairing_method not in VALID_JOIN_PAIRING_METHODS:
             raise ValueError(
                 f"Invalid pairing_method={self.pairing_method!r}. "
@@ -797,6 +814,7 @@ class JoinQuerySpec:
         instruction: str = "Decide whether left and right tuples semantically join.",
         *,
         backend: str = "llm",
+        join_type: str = "inner",
         pairing_method: str = "candidate_pruned",
         ttl_seconds: Optional[int] = None,
         max_left_buffer: Optional[int] = None,
@@ -808,6 +826,7 @@ class JoinQuerySpec:
                 backend=backend,
                 output_mode="bool",
             ),
+            join_type=join_type,
             pairing_method=pairing_method,
             trigger_policy=TriggerPolicy(),
             scope_policy=JoinScopePolicy(
@@ -822,6 +841,7 @@ class JoinQuerySpec:
             "semantic": self.semantic.to_dict(),
             "query_id": self.query_id,
             "query_version": self.query_version,
+            "join_type": self.join_type,
             "pairing_method": self.pairing_method,
             "trigger_policy": self.trigger_policy.to_dict(),
             "scope_policy": self.scope_policy.to_dict(),
@@ -833,6 +853,7 @@ class JoinQuerySpec:
             semantic=SemSpec.from_dict(d.get("semantic", {})),
             query_id=d.get("query_id", "default"),
             query_version=d.get("query_version", 1),
+            join_type=d.get("join_type", "inner"),
             pairing_method=d.get("pairing_method", "candidate_pruned"),
             trigger_policy=TriggerPolicy.from_dict(d.get("trigger_policy", {})),
             scope_policy=JoinScopePolicy.from_dict(d.get("scope_policy", {})),

@@ -91,6 +91,17 @@ def test_sem_join_request() -> None:
     assert req.intent == "Match contradictory facts"
     assert req.context.kind == "stream"
     assert req.right_input is right_input
+    assert req.join_type == "inner"
+
+
+def test_sem_join_request_rejects_invalid_join_type() -> None:
+    with pytest.raises(ValueError, match="Invalid sem_join join_type"):
+        sem_join(
+            intent="Match contradictory facts",
+            context=context("stream"),
+            right_input=object(),
+            join_type="cross",
+        )
 
 
 def test_top_level_public_surface_exposes_only_facade() -> None:

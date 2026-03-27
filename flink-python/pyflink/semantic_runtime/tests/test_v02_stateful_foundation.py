@@ -1211,7 +1211,7 @@ class TestSemTopKConfig:
         qs = TopKQuerySpec.simple("rank by relevance", k=5,
                                   ttl_seconds=600, max_candidates=50)
         assert qs.k == 5
-        assert qs.semantic.backend == "hybrid"
+        assert qs.semantic.backend == "llm"
         assert qs.scope_policy.ttl_seconds == 600
         assert qs.scope_policy.max_candidates == 50
 
@@ -1227,7 +1227,11 @@ class TestSemTopKConfig:
 
     def test_topk_query_spec_roundtrip_with_session_scope(self):
         spec = TopKQuerySpec(
-            semantic=SemSpec.for_sem_topk("rank best weather days"),
+            semantic=SemSpec(
+                instruction="rank best weather days",
+                backend="llm",
+                output_mode="score",
+            ),
             k=4,
             query_id="topk1",
             query_version=3,
@@ -1251,7 +1255,7 @@ class TestSemTopKConfig:
     def test_public_topk_backend_is_rejected(self):
         import pytest
 
-        with pytest.raises(ValueError, match="does not expose backend selection"):
+        with pytest.raises(ValueError, match="requires semantic.backend='llm'"):
             TopKQuerySpec(
                 semantic=SemSpec(
                     instruction="rank best weather days",

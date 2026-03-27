@@ -228,6 +228,7 @@ def test_lower_sem_join_request_stream() -> None:
     assert plan.context_kind == "stream"
     assert plan.right_input is right_input
     assert plan.query_spec.semantic.instruction == "Match contradictory facts"
+    assert plan.query_spec.join_type == "inner"
     assert plan.kernel_config.pair_block_size == 4
 
 

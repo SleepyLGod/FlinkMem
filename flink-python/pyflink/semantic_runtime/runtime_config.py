@@ -225,7 +225,7 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
                 "sem_topk query_spec.semantic no longer accepts backend; "
                 "move scoring backend selection into operators.sem_topk.kernel."
             )
-        semantic.setdefault("backend", "hybrid")
+        semantic.setdefault("backend", "llm")
         out = dict(raw)
         out["semantic"] = semantic
         out["scope_policy"] = _inject_scope_defaults(
@@ -245,8 +245,10 @@ def _normalize_topk_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
             scope[field] = raw[field]
 
     out: Dict[str, Any] = {
-        "semantic": SemSpec.for_sem_topk(
-            raw.get("instruction", ""),
+        "semantic": SemSpec(
+            instruction=raw.get("instruction", ""),
+            backend="llm",
+            output_mode="score",
             threshold=raw.get("threshold"),
         ).to_dict(),
         "k": raw.get("k", 10),
@@ -279,7 +281,7 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
                 "sem_groupby query_spec.semantic no longer accepts backend; "
                 "move grouping backend selection into operators.sem_groupby.kernel."
             )
-        semantic.setdefault("backend", "hybrid")
+        semantic.setdefault("backend", "llm")
         out = dict(raw)
         out["semantic"] = semantic
         out["scope_policy"] = _inject_scope_defaults(
@@ -301,7 +303,7 @@ def _normalize_groupby_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: i
     return {
         "semantic": SemSpec(
             instruction=raw.get("instruction", "Assign tuples to semantic groups."),
-            backend="hybrid",
+            backend="llm",
             output_mode="label",
         ).to_dict(),
         "query_id": raw.get("query_id", "default"),
@@ -326,7 +328,7 @@ def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) 
                 "sem_agg query_spec.semantic no longer accepts backend; "
                 "move backend selection into internal planner/kernel config."
             )
-        semantic.setdefault("backend", "hybrid")
+        semantic.setdefault("backend", "llm")
         out = dict(raw)
         out["semantic"] = semantic
         out["scope_policy"] = _inject_scope_defaults(
@@ -350,7 +352,7 @@ def _normalize_agg_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int) 
     return {
         "semantic": SemSpec(
             instruction=raw.get("instruction", "Aggregate semantic state over a keyed stream."),
-            backend="hybrid",
+            backend="llm",
             output_mode="summary",
         ).to_dict(),
         "query_id": raw.get("query_id", "default"),
@@ -394,6 +396,7 @@ def _normalize_join_query_raw(raw: Dict[str, Any], *, defaults_ttl_seconds: int)
         ).to_dict(),
         "query_id": raw.get("query_id", "default"),
         "query_version": raw.get("query_version", 1),
+        "join_type": raw.get("join_type", "inner"),
         "pairing_method": raw.get("pairing_method", "candidate_pruned"),
         "trigger_policy": dict(raw.get("trigger_policy", {})),
         "scope_policy": scope,

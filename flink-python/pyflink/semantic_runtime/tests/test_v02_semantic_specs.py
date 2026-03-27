@@ -334,7 +334,7 @@ class TestGroupbyQuerySpec:
     def test_defaults(self):
         spec = GroupbyQuerySpec()
         assert spec.semantic.output_mode == "label"
-        assert spec.semantic.backend == "hybrid"
+        assert spec.semantic.backend == "llm"
         assert spec.query_version == 1
         assert spec.trigger_policy.mode == "on_event"
 
@@ -344,7 +344,7 @@ class TestGroupbyQuerySpec:
             ttl_seconds=600,
             max_groups_per_key=20,
         )
-        assert spec.semantic.backend == "hybrid"
+        assert spec.semantic.backend == "llm"
         assert spec.scope_policy.ttl_seconds == 600
         assert spec.scope_policy.max_groups_per_key == 20
 
@@ -352,7 +352,7 @@ class TestGroupbyQuerySpec:
         spec = GroupbyQuerySpec(
             semantic=SemSpec(
                 instruction="Group similar memories",
-                backend="hybrid",
+                backend="llm",
                 output_mode="label",
             ),
             query_id="g1",
@@ -1466,7 +1466,7 @@ class TestAggQuerySpec:
             max_buffer_events=50,
             flush_interval_ms=10000,
         )
-        assert spec.semantic.backend == "hybrid"
+        assert spec.semantic.backend == "llm"
         assert spec.agg_method == "summarize"
         assert spec.scope_policy.max_buffer_events == 50
 
@@ -1479,7 +1479,7 @@ class TestAggQuerySpec:
         spec = AggQuerySpec(
             semantic=SemSpec(
                 instruction="Compress memory",
-                backend="hybrid",
+                backend="llm",
                 output_mode="summary",
             ),
             query_id="agg1",
@@ -1896,6 +1896,7 @@ class TestJoinQuerySpec:
     def test_defaults(self):
         spec = JoinQuerySpec()
         assert spec.semantic.output_mode == "bool"
+        assert spec.join_type == "inner"
         assert spec.pairing_method == "candidate_pruned"
         assert spec.trigger_policy.mode == "on_event"
 
@@ -1909,8 +1910,14 @@ class TestJoinQuerySpec:
             max_right_buffer=200,
         )
         assert spec.semantic.backend == "embedding"
+        assert spec.join_type == "inner"
         assert spec.pairing_method == "embedding_prefilter"
         assert spec.scope_policy.max_right_buffer == 200
+
+    def test_invalid_join_type(self):
+        import pytest
+        with pytest.raises(ValueError, match="Invalid join_type"):
+            JoinQuerySpec(join_type="cross")
 
     def test_invalid_pairing_method(self):
         import pytest
@@ -1925,6 +1932,7 @@ class TestJoinQuerySpec:
             ),
             query_id="join1",
             query_version=4,
+            join_type="left",
             pairing_method="blocking",
             trigger_policy=TriggerPolicy(mode="idle_flush", idle_ms=800),
             scope_policy=JoinScopePolicy(
@@ -1939,6 +1947,7 @@ class TestJoinQuerySpec:
         restored = JoinQuerySpec.from_dict(spec.to_dict())
         assert restored.query_id == "join1"
         assert restored.query_version == 4
+        assert restored.join_type == "left"
         assert restored.pairing_method == "blocking"
         assert restored.trigger_policy.mode == "idle_flush"
         assert restored.scope_policy.window_kind == "sliding"
@@ -1948,7 +1957,7 @@ class TestGenericSemanticBackendBoundaries:
     def test_topk_query_spec_rejects_public_backend(self):
         import pytest
 
-        with pytest.raises(ValueError, match="does not expose backend selection"):
+        with pytest.raises(ValueError, match="requires semantic.backend='llm'"):
             TopKQuerySpec(
                 semantic=SemSpec(
                     instruction="rank by relevance",
@@ -1960,11 +1969,11 @@ class TestGenericSemanticBackendBoundaries:
     def test_groupby_query_spec_rejects_public_backend(self):
         import pytest
 
-        with pytest.raises(ValueError, match="does not expose backend selection"):
+        with pytest.raises(ValueError, match="requires semantic.backend='llm'"):
             GroupbyQuerySpec(
                 semantic=SemSpec(
                     instruction="group by topic",
-                    backend="llm",
+                    backend="embedding",
                     output_mode="label",
                 )
             )
@@ -1972,7 +1981,7 @@ class TestGenericSemanticBackendBoundaries:
     def test_agg_query_spec_rejects_public_backend(self):
         import pytest
 
-        with pytest.raises(ValueError, match="does not expose backend selection"):
+        with pytest.raises(ValueError, match="requires semantic.backend='llm'"):
             AggQuerySpec(
                 semantic=SemSpec(
                     instruction="aggregate semantic state",

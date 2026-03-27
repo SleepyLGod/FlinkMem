@@ -38,6 +38,7 @@ VALID_CONTEXT_KINDS = {
     "semantic_segment",
 }
 VALID_AGG_MODES = {"algebraic", "summarize", "compressive"}
+VALID_JOIN_TYPES = {"inner", "left", "right", "full", "semi", "anti"}
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,14 @@ class SemJoinRequest:
     intent: str
     context: SemContext
     right_input: Any
+    join_type: str = "inner"
+
+    def __post_init__(self) -> None:
+        if self.join_type not in VALID_JOIN_TYPES:
+            raise ValueError(
+                f"Invalid sem_join join_type {self.join_type!r}. "
+                f"Expected one of {sorted(VALID_JOIN_TYPES)!r}."
+            )
 
 
 def context(kind: str, **metadata: Any) -> SemContext:
@@ -199,6 +208,17 @@ def sem_agg(*, intent: str, mode: str, context: SemContext) -> SemAggRequest:
     return SemAggRequest(intent=intent, mode=mode, context=context)
 
 
-def sem_join(*, intent: str, context: SemContext, right_input: Any) -> SemJoinRequest:
+def sem_join(
+    *,
+    intent: str,
+    context: SemContext,
+    right_input: Any,
+    join_type: str = "inner",
+) -> SemJoinRequest:
     """Create a public stateful semantic join request."""
-    return SemJoinRequest(intent=intent, context=context, right_input=right_input)
+    return SemJoinRequest(
+        intent=intent,
+        context=context,
+        right_input=right_input,
+        join_type=join_type,
+    )

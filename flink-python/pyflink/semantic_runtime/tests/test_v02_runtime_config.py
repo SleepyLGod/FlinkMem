@@ -95,7 +95,7 @@ class TestRuntimeConfig:
         )
         bundle = cfg.resolve_groupby_runtime_bundle(input_kind="window_snapshot")
         assert bundle.lowering_plan.lowering_kind == "native_runtime"
-        assert bundle.query_spec.semantic.backend == "hybrid"
+        assert bundle.query_spec.semantic.backend == "llm"
 
     def test_groupby_runtime_bundle_reset_per_scope_lowers_to_classical_groupby(self):
         cfg = RuntimeConfig.from_dict(

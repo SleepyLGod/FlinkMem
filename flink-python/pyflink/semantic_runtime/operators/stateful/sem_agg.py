@@ -317,7 +317,7 @@ def _build_default_agg_query_spec(config: SemAggConfig) -> AggQuerySpec:
     return AggQuerySpec(
         semantic=SemSpec(
             instruction="Aggregate semantic events into one result.",
-            backend="hybrid",
+            backend="llm",
             output_mode="summary" if config.mode != "algebraic" else "json",
         ),
         agg_method="algebraic" if config.mode == "algebraic" else config.mode,
