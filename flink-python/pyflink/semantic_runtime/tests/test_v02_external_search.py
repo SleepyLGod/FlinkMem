@@ -228,6 +228,39 @@ class TestExternalSearchBackendInterface:
         assert parsed["join_result"]["selected_candidate"]["candidate_id"] == "c3"
         assert parsed["join_result"]["match_score"] == 0.95
 
+    def test_sem_lookup_join_embedding_only_backend(self):
+        fn = SemLookupJoinFunction(
+            "Unused for embedding backend: {input} {candidates}",
+            LLMClientConfig(backend="mock"),
+            SemLookupJoinConfig(
+                max_candidates_per_record=3,
+                right_block_size=2,
+                match_backend="embedding_only",
+                embedding_similarity_threshold=0.2,
+                mock_candidates=[
+                    {"candidate_id": "c1", "content": "apple banana"},
+                    {"candidate_id": "c2", "content": "network socket kernel"},
+                    {"candidate_id": "c3", "content": "apple pie recipe"},
+                ],
+            ),
+        )
+
+        class _FakeRuntimeContext:
+            pass
+
+        fn.open(_FakeRuntimeContext())
+        try:
+            out = asyncio.run(fn.async_invoke("apple dessert"))[0]
+        finally:
+            fn.close()
+
+        parsed = json.loads(out)
+        assert parsed["candidate_count"] == 3
+        assert parsed["join_result"]["reason"] == "embedding_similarity"
+        assert parsed["join_result"]["matched"] is True
+        selected = parsed["join_result"]["selected_candidate"]
+        assert selected["candidate_id"] in {"c1", "c3"}
+
 
 # ============================================================================
 # State Safety Audit Tests
