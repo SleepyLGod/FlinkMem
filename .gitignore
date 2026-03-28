@@ -80,3 +80,4 @@ tools/japicmp-output
 /docs/.hugo_build.lock
 .isolation/
 .env
+flink-python/pyflink/semantic_runtime/docs/history/
