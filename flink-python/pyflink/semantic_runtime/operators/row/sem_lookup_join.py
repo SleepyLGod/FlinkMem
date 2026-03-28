@@ -45,12 +45,17 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators.row._common import attach_metrics
+from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 from pyflink.semantic_runtime.runtime.external_search_backend import (
     ExternalSearchBackend,
     SearchResult,
 )
 
 logger = logging.getLogger(__name__)
+
+_VALID_MATCH_BACKENDS = {"llm", "embedding_only"}
+DEFAULT_LOOKUP_JOIN_EMBEDDING_THRESHOLD = 0.7
+DEFAULT_LOOKUP_JOIN_EMBEDDING_DIM = 128
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +129,9 @@ class SemLookupJoinConfig:
     retrieve_timeout_ms: float = 5000.0
     left_block_size: int = 1
     right_block_size: Optional[int] = None
+    match_backend: str = "llm"
+    embedding_similarity_threshold: float = DEFAULT_LOOKUP_JOIN_EMBEDDING_THRESHOLD
+    embedding_dim: int = DEFAULT_LOOKUP_JOIN_EMBEDDING_DIM
     search_backend: Optional[ExternalSearchBackend] = None
     # mock-specific
     mock_candidates: Optional[List[Any]] = None
@@ -168,6 +176,17 @@ class SemLookupJoinFunction(AsyncFunction):
             raise ValueError("row-level sem_lookup_join requires left_block_size == 1")
         if cfg.right_block_size is not None and cfg.right_block_size <= 0:
             raise ValueError("sem_lookup_join requires right_block_size > 0 when set")
+        if cfg.match_backend not in _VALID_MATCH_BACKENDS:
+            raise ValueError(
+                f"sem_lookup_join requires match_backend in {_VALID_MATCH_BACKENDS}, "
+                f"got {cfg.match_backend!r}"
+            )
+        if not 0.0 <= float(cfg.embedding_similarity_threshold) <= 1.0:
+            raise ValueError(
+                "sem_lookup_join requires embedding_similarity_threshold in [0.0, 1.0]"
+            )
+        if int(cfg.embedding_dim) <= 0:
+            raise ValueError("sem_lookup_join requires embedding_dim > 0")
         if cfg.search_backend is not None:
             self._retriever = CandidateRetrieverFromSearchBackend(cfg.search_backend)
         elif cfg.mock_candidates is not None:
@@ -228,7 +247,14 @@ class SemLookupJoinFunction(AsyncFunction):
                         cfg.max_candidates_per_record)
 
         # 3. Pair-block semantic matching
-        parsed = await self._evaluate_candidate_blocks(value, candidates, om)
+        if cfg.match_backend == "embedding_only":
+            parsed = self._evaluate_candidate_blocks_with_embedding(value, candidates)
+        elif cfg.match_backend == "llm":
+            parsed = await self._evaluate_candidate_blocks(value, candidates, om)
+        else:
+            raise RuntimeError(
+                f"sem_lookup_join received unsupported match_backend={cfg.match_backend!r}"
+            )
 
         result = {
             "_input": value,
@@ -273,6 +299,77 @@ class SemLookupJoinFunction(AsyncFunction):
             candidates[start : start + block_size]
             for start in range(0, len(candidates), block_size)
         ]
+
+    def _evaluate_candidate_blocks_with_embedding(
+        self,
+        value: Any,
+        candidates: List[Any],
+    ) -> Dict[str, Any]:
+        """Evaluate candidate blocks using local embedding-style similarity only."""
+        best_result: Optional[Dict[str, Any]] = None
+        for block in self._candidate_blocks(candidates):
+            block_result = self._evaluate_one_block_with_embedding(value, block)
+            if best_result is None or float(block_result["match_score"]) > float(best_result["match_score"]):
+                best_result = block_result
+        if best_result is None:
+            return {
+                "matched": False,
+                "match_score": 0.0,
+                "selected_candidate": None,
+                "reason": "no candidates",
+            }
+        return best_result
+
+    def _evaluate_one_block_with_embedding(
+        self,
+        value: Any,
+        candidates: List[Any],
+    ) -> Dict[str, Any]:
+        """Evaluate one candidate block using local hashing-embedding similarity."""
+        if not candidates:
+            return {
+                "matched": False,
+                "match_score": 0.0,
+                "selected_candidate": None,
+                "reason": "no candidates",
+            }
+        encoder = HashingTextEncoder(dim=int(self._join_config.embedding_dim))
+        query_text = str(value)
+        threshold = float(self._join_config.embedding_similarity_threshold)
+        best_candidate: Optional[Any] = None
+        best_score = float("-inf")
+        for candidate in candidates:
+            candidate_text = self._candidate_text(candidate)
+            score = float(encoder.similarity(query_text, candidate_text))
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+        if best_candidate is None:
+            raise RuntimeError("sem_lookup_join embedding backend failed to score candidates")
+        return {
+            "matched": bool(best_score >= threshold),
+            "match_score": float(best_score),
+            "selected_candidate": best_candidate,
+            "reason": "embedding_similarity",
+        }
+
+    def _candidate_text(self, candidate: Any) -> str:
+        """Extract candidate text used by embedding-only matching."""
+        if isinstance(candidate, str):
+            return candidate
+        if isinstance(candidate, dict):
+            for field in ("content", "text", "payload"):
+                if field in candidate:
+                    return str(candidate[field])
+            raise ValueError(
+                "sem_lookup_join embedding backend requires candidate dict to "
+                "contain one of {'content', 'text', 'payload'}"
+            )
+        if hasattr(candidate, "text"):
+            return str(candidate.text)
+        raise TypeError(
+            "sem_lookup_join embedding backend requires candidate to be str/dict/text-like object"
+        )
 
     async def _evaluate_one_block(
         self,
