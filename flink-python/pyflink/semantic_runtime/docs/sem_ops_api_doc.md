@@ -1,7 +1,7 @@
 # Semantic Operators — Complete Technical Reference
 
-> **Applicable Versions**: V0.1 (Non-Stateful) + V0.2 (Stateful) + V0.2+ (Alignment)
-> **Generated On**: 2026-03-17
+> **Applicable Versions**: V0.1 (Non-Stateful) + V0.2 (Stateful) + V0.2+ (Alignment) + V0.3 (`sem_join`)
+> **Generated On**: 2026-03-23
 > **Code Path**: `flink-python/pyflink/semantic_runtime/`
 
 ---
@@ -40,10 +40,12 @@ This project builds a set of **Semantic Operators** on top of Apache Flink (PyFl
 | Phase | Operator Type | Flink Base Class | State Management | LLM Interaction |
 |------|---------------|------------------|------------------|-----------------|
 | **V0.1** | Non-Stateful | `AsyncFunction` | No keyed state | Each record directly calls the LLM |
-| **V0.2** | Stateful | `KeyedProcessFunction` | Flink keyed state + TTL | Uses Async Bridge side outputs for asynchronous LLM calls |
+| **V0.2** | Stateful | `KeyedProcessFunction` | Flink keyed state + TTL | Mixed async model: operator-native async where needed (`sem_agg` summarize/compressive), plus Async Bridge for external async stages (`sem_search`) |
 
 **V0.1** provides four public row-style operators: `sem_filter`, `sem_map`, `sem_lookup_join`, and `sem_local_topk`.
-**V0.2** provides four public stateful operators: `sem_window`, `sem_groupby`, `sem_agg`, and `sem_topk`. It also contains the internal workflow helper `sem_search`; workflow composition and the metric system are documented separately in Sections 5 and 7.
+**V0.2** provides four public stateful operators: `sem_window`, `sem_groupby`, `sem_agg`, and `sem_topk`.
+**V0.3** adds public `sem_join`.
+The package also contains the internal workflow helper `sem_search`; workflow composition and the metric system are documented separately in Sections 5 and 7.
 
 **V0.2+ internal lowering view**:
 - pointwise `sem_topk` is treated as an internal logical lowering:
@@ -52,13 +54,38 @@ This project builds a set of **Semantic Operators** on top of Apache Flink (PyFl
 - bounded/window-owned `sem_groupby` is treated as:
   - semantic label generation
   - followed by classical group-by semantics
-- future `sem_join` follows the same logical pattern:
+- `sem_join` follows the same logical pattern:
   - semantic match predicate / score
   - followed by classical join/filter semantics
 - `sem_agg` remains the main exception:
   - `summarize` and `compressive` are modeled as native semantic reduce
 - internal lowering may use semantic score/label/match steps, but these are
   implementation details rather than public first-class operators
+
+### 1.0.1 V0.4 Deferred Runtime Convergence Note
+
+The following runtime direction is accepted for V0.4 but not fully implemented
+yet:
+
+1. move remote semantic calls out of keyed state-owner hot paths,
+2. keep owner-side keyed apply strictly serial per key,
+3. enforce request-basis stale guards (`scope_epoch` / `state_version`),
+4. reuse long-lived async client/session in worker stages,
+5. avoid per-request event-loop and client construction overhead.
+
+Current behavior remains valid and supported; this is a documented deferred
+implementation track for upcoming V0.4 async/runtime convergence.
+
+### 1.0.2 V0.4 Runtime Boundary (Implemented, 2026-03-27)
+
+Current implementation boundary is explicit:
+
+1. `persistent_across_scopes` stateful operators keep owner-internal async
+   control paths.
+2. no-feedback bounded paths (`window` + `reset_per_scope`) use standard Flink
+   async pushdown topology.
+3. for `sem_agg`, bounded `summarize` / `compressive` pushdown now runs through
+   `AsyncDataStream.unordered_wait`; persistent fold semantics are unchanged.
 
 ---
 
@@ -85,6 +112,7 @@ facade:
 - `sem_topk(...)`
 - `sem_groupby(...)`
 - `sem_agg(...)`
+- `sem_join(...)`
 
 The following remain available in submodules, but they are internal or
 expert-layer concepts rather than the intended user-facing API:
@@ -205,16 +233,16 @@ All V0.1 operators inherit from `AsyncFunction` and use Flink's `AsyncDataStream
 
 | Item | Description |
 |------|-------------|
-| **Input** | JSON string that must contain the candidate list designated by `candidates_field` |
-| **Output** | JSON: `{"_input": ..., "top_k": [reranked list], "k": int, "original_count": int, "_metrics": {...}}` |
+| **Input** | JSON string that must contain the bounded item list designated by `items_field` |
+| **Output** | JSON: `{"_input": ..., "top_k": [ranked items], "k": int, "original_count": int}` |
 | **Semantic intent** | `SemSpec.for_sem_topk(...)` |
 | **Failure** | Input parse failure or non-list LLM output fails the operator run under strict mode |
 
 **Implementation idea**:
 1. The low-level builder validates semantic intent and binds internal runtime config
-2. `async_invoke(value)` → parse the input JSON → extract the `candidates` field
-2. Send the full record and the candidate list to the LLM using the prompt
-3. The LLM returns a reranked JSON list → truncate to top-k
+2. `async_invoke(value)` → parse the input JSON → extract the `items` field
+3. Run the internal `sem_score` step over the bounded items (one-by-one or block-scored is internal)
+4. Sort by score → truncate to top-k
 4. Wrap the result → return
 
 **V0.1 vs V0.2 TopK comparison**:
@@ -326,7 +354,7 @@ State safety configuration for each operator:
 | `sem_window_event_buffer_descriptor` | `ListState` | Window event buffer |
 | `sem_window_meta_descriptor` | `ValueState` | Window metadata |
 | `sem_groupby_profiles_descriptor` | `MapState` | Group profiles |
-| `sem_groupby_pending_events_descriptor` | `ListState` | Pending async groupby event chunk |
+| `sem_groupby_pending_events_descriptor` | `ListState` | Pending synchronous assignment batch buffer for `sem_groupby` |
 | `sem_search_cache_descriptor` | `MapState` | Retrieval cache |
 | `sem_agg_buffer_descriptor` | `ListState` | Aggregation event buffer |
 | `sem_agg_value_descriptor` | `ValueState` | Aggregation accumulated value |
@@ -405,7 +433,7 @@ keyed_stream.process(StatefulOp)
 | Field | Meaning |
 |------|---------|
 | `key` | Must match the upstream keying |
-| `task_type` | Work type: the current V0.2 workflow uses `"classify"` / `"summarize"` / `"retrieve"` |
+| `task_type` | Work type: the current V0.2 workflow uses `"summarize"` / `"retrieve"` |
 | `payload` | Operator-defined payload |
 | `request_id` | UUID used for deduplication / correlation |
 
@@ -454,7 +482,7 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
 
 ### 4.1 `sem_window` — Semantic Window
 
-**File**: `operators/stateful/sem_window.py`
+**File**: `operators/stateful/sem_window_kernel.py`
 **Class**: `SemWindowFunction(KeyedProcessFunction)`
 
 **Purpose**: split an event stream into windows based on semantic boundaries rather than fixed time/count only.
@@ -473,28 +501,58 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
 | `max_window_events` | 50 | Count trigger threshold |
 | `window_timeout_ms` | 30,000 | Time trigger in milliseconds |
 | `boundary_flag` | `"topic_shift"` | Semantic boundary flag name |
+| `continuity_variant` | `"boundary_flag"` | Internal continuity implementation: `"boundary_flag"` / `"pairwise"` / `"embedding"` / `"summary"` / `"all_history"` |
+| `continuity_threshold` | `0.35` | Local similarity threshold used by the embedding continuity path |
 | `overflow_policy` | `DROP_OLDEST` | Overflow eviction strategy |
 
-**Three trigger types**:
+**Supported continuity variants**:
+
+| Variant | Current status | Meaning |
+|--------|----------------|---------|
+| `boundary_flag` | Implemented | Close the current window when the incoming event carries the configured semantic boundary flag |
+| `pairwise` | Implemented | Compare the current event with the previous event using internal `sem_continuity`; if continuity fails, close the old window and start a new window with the current event |
+| `embedding` | Implemented | Compare the current event with the previous event using a local hashing encoder similarity threshold |
+| `summary` | Implemented | Compare the current event against an internal current-window summary; if continuity fails, close the old window and start a new window |
+| `all_history` | Implemented | Compare the current event against the full active window history using internal semantic membership judgement; if the active window is already full, roll the window before any LLM call |
+
+**Trigger types**:
 
 | Trigger Type | Condition | Source |
 |-------------|-----------|--------|
 | **Count** | Event count ≥ `max_window_events` | Local counter |
 | **Time** | Time since opening ≥ `window_timeout_ms` | Processing-time timer |
-| **Semantic** | Event `boundary_flags` contains `boundary_flag` | Upstream pre-classifier |
+| **Semantic boundary flag** | Event `boundary_flags` contains `boundary_flag` | Upstream pre-classifier; only used by `continuity_variant="boundary_flag"` |
+| **Pairwise continuity failure** | Internal `sem_continuity` says the current event does not continue the previous window | Internal LLM continuity judgement |
+| **Embedding continuity failure** | Local embedding similarity falls below `continuity_threshold` | Internal local continuity scorer |
+| **Summary continuity failure** | Internal `sem_continuity` says the current event does not continue the current window summary | Internal LLM continuity judgement |
+| **All-history continuity failure** | Internal `sem_continuity` says the current event does not belong to the active window history | Internal LLM membership judgement |
+| **All-history hard size cut** | Active window size already reached `max_window_events` before continuity judgement | Local hard limit; window rolls before any LLM call |
 
 **Processing flow**:
-1. Receive an event → append it to the `ListState` event buffer
-2. If it is the first event → initialize `window_meta` (`window_id`, `open_time_ms`), register a `FLUSH` timer
-3. Check trigger conditions → `_check_triggers()` returns a trigger reason or `None`
-4. If triggered → build and yield a `WindowSnapshot` → clear the buffer and metadata
-5. On overflow (full buffer) → apply `overflow_policy` to evict old events
+1. Receive an event
+2. If there is no open window → create one and register its `FLUSH` timer
+3. If the chosen continuity variant says the current event does **not** continue the active window:
+   - emit the old `WindowSnapshot`
+   - open a new window
+   - place the current event into the new window
+4. Otherwise append the current event to the active buffer
+5. Evaluate count / timeout / boundary triggers
+6. If a trigger fires → build and yield a `WindowSnapshot` → clear the buffer and metadata
+7. On overflow (full buffer) → apply `overflow_policy` to evict old events
+
+**Important boundary note**:
+- `pairwise` and `embedding` use a **between-events** boundary contract:
+- `pairwise`, `embedding`, `summary`, and `all_history` use a **between-events** boundary contract:
+  - if the current event does not continue the previous window, the old window closes **before** the current event is appended,
+  - the current event becomes the first event of the next window.
+- `all_history` uses the full active window history by default. Future truncation or representative-subset execution is allowed only as an explicit internal execution option, not as a silent default.
+- `embedding` now uses an internal embedding runtime layer; the current concrete local backend is hashing-based, while API / local-model backends remain explicit future backends.
 
 ### 4.2 `sem_groupby` — Dynamic Semantic Grouping
 
 **Files**:
-- `operators/stateful/sem_groupby.py`
-- `operators/stateful/sem_groupby_window.py`
+- `operators/stateful/sem_groupby_kernel.py`
+- `operators/stateful/sem_groupby_bounded.py`
 - `operators/stateful/sem_groupby_pipeline.py`
 
 **Classes**:
@@ -507,7 +565,7 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
 |------|-------------|
 | **Input** | `SemEvent` dict or `WindowSnapshot` dict (automatically expanded) |
 | **Output** | Main-path assignment envelope: `{key, group_id, confidence, source, event_seq_id, payload, event_time_ms, metadata, boundary_flags}` |
-| **Side Output** | `AsyncWorkItem(task_type="classify")` — emitted only when the internal assignment backend is async |
+| **Side Output** | none — `sem_groupby` now owns assignment/refinement synchronously in the canonical state owner |
 | **State** | `MapState[group_id → group_profile]` + `ValueState[meta]` |
 
 **Query-spec integration** (`GroupbyQuerySpec`):
@@ -519,65 +577,72 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
   - `session_gap_ms`
   - `boundary_flag`
 - `trigger_policy` is part of the spec, but the current runtime support is intentionally narrow:
-  - `operator_owned`: only `on_event`
-  - `window_owned`: bounded/window snapshot grouping
+  - `internal_scope`: currently only `on_event`
+  - `external_window`: bounded/window snapshot grouping
 - physical path selection is internal:
-  - default: `window_owned` when the input is already a bounded `WindowSnapshot`
-  - otherwise: `operator_owned`
+  - default: `external_window` when the input is already a bounded `WindowSnapshot`
+  - otherwise: `internal_scope`
 
 **Current maintenance support**:
-- `operator_owned`: supports two local maintenance/refinement modes:
+- `internal_scope + persistent_across_scopes`: supports two maintenance/refinement modes:
   - `maintenance_trigger_policy.mode="periodic"`:
     - periodic `RECOMPUTE` timer
-    - greedy merge of highly-similar groups using the current local scoring method
-    - optional local label refresh when enabled in internal kernel config
-    - metadata heartbeat (`last_refine_ms`, `refine_count`, `last_merge_count`)
+    - `rule` / `embedding`: local split + greedy merge + optional local label refresh
+    - `llm_refine`: synchronous semantic refine pass (rename / merge / split)
+    - metadata heartbeat (`last_refine_ms`, `refine_count`, `last_split_count`, `last_merge_count`, `last_rename_count`)
   - `maintenance_trigger_policy.mode="on_scope_close"` on close-capable scopes:
     - supported for `session`, `tumbling`, and `semantic`
-    - runs one local refine pass at close
-    - then resets operator-owned group state for the next scope epoch
-- `window_owned`: supports `maintenance_trigger_policy.mode="on_scope_close"`:
-  - run one bounded local refine pass at snapshot close
-  - remap assignment rows after local greedy merge
-  - optional local label refresh before final emission when enabled in internal kernel config
+    - `persistent_across_scopes`: runs maintenance without resetting surviving groups
+    - `reset_per_scope`: finalizes the current scope and clears group state for the next scope epoch
+- `external_window + persistent_across_scopes`: the default external-window path:
+  - consumes cumulative `WindowSnapshot` buckets as scope updates for one continuous operator
+  - aligns with Flink `FIRE` semantics by ingesting only scope-local unseen events from repeated fires of the same `window_id`
+  - runs assignment on snapshot arrival; `maintenance_trigger_policy.mode="on_scope_close"` runs one refine pass per snapshot fire
+- `external_window + reset_per_scope`: supports `maintenance_trigger_policy.mode="on_scope_close"`:
+  - run one bounded refine pass at snapshot close
+  - local variants use local split/merge/relabel
+  - `llm_refine` uses one synchronous semantic refinement pass
   - no cross-scope group persistence
-- `sliding` / pure TTL do not have a natural operator-owned close event and therefore remain unsupported for `maintenance_trigger_policy.mode="on_scope_close"`
+- `sliding` / pure TTL do not have a natural internal-scope close event and therefore remain unsupported for `maintenance_trigger_policy.mode="on_scope_close"`
 
 **Current internal path support**:
 
-| Path | Input kind | Status | Notes |
+| Scope source | Persistence | Input kind | Status | Notes |
 |------|------------|--------|-------|
-| `operator_owned` | flat event stream | Implemented | Continuous keyed-state grouping over active groups; assignment trigger is `on_event` |
-| `window_owned` | `WindowSnapshot` | Implemented | Bounded grouping within one snapshot; no cross-scope group state |
+| `internal_scope` | `persistent_across_scopes` | flat event stream | Implemented | Continuous keyed-state grouping; default process-style path |
+| `internal_scope` | `reset_per_scope` | flat event stream | Implemented | Close-capable internal scopes finalize and clear group state |
+| `external_window` | `persistent_across_scopes` | `WindowSnapshot` | Implemented | Default window path; repeated fires for the same `window_id` ingest only newly visible events |
+| `external_window` | `reset_per_scope` | `WindowSnapshot` | Implemented | Explicit bounded specialization over one snapshot; no cross-scope group state |
 
 **Configuration** (`SemGroupbyConfig`):
 
 | Parameter | Default | Meaning |
 |----------|---------|---------|
 | `max_groups_per_key` | 50 | Maximum number of groups for one key |
-| `assignment_method` | `rule` | Internal assignment backend used by planner/runtime |
-| `scope_chunk_size` | `1` | Internal assignment granularity for semantic grouping (`1` = per-event, `N` = chunked, `len(scope)` = full-scope) |
+| `variant` | `llm_basic` | Internal assignment backend used by planner/runtime |
+| `assignment_batch_size` | `1` | Internal assignment granularity for semantic grouping (`1` = per-event, `N` = chunked assignment batch) |
 | `confidence_threshold` | 0.7 | Internal reuse threshold for local assignment methods |
 | `new_group_creation_threshold` | 0.3 | Internal maintenance merge threshold seed |
 | `refresh_labels_during_maintenance` | `False` | Whether maintenance locally refreshes survivor labels |
 | `overflow_policy` | `DROP_OLDEST` | Eviction policy when the number of groups overflows |
 
 **Assignment flow**:
-1. Path resolution:
-   - `window_owned` runs bounded grouping on one snapshot
-   - `operator_owned` maintains keyed group state across events
+1. Scope resolution:
+   - `external_window + persistent_across_scopes` treats each snapshot fire as a scope update for one continuous grouping operator
+   - `external_window + reset_per_scope` runs bounded grouping on one snapshot
+   - `internal_scope` maintains keyed group state across raw events
 2. The operator evaluates the current `existing_groups`
 3. Final outcome is always one of:
    - assign to one existing group
    - create one new group
 4. Local methods (`rule`, `embedding`) decide synchronously using internal thresholds
-5. Async semantic methods (`llm`) emit `AsyncWorkItem("classify")` and only output the final assignment after async merge-back
-6. Internal chunking is planner-controlled through `scope_chunk_size`
+5. Semantic LLM variants keep one canonical group-state owner
+   - `llm_basic`: assignment results are committed into canonical group state in the state owner
+   - `llm_refine`: one semantic maintenance pass applies rename / merge / split in that same owner
+6. Internal chunking is planner-controlled through `assignment_batch_size`
    - `1` = event-by-event assignment
-   - `N` = chunked assignment
-   - `len(scope)` = one full-scope assignment
-7. `window_owned + llm` currently emits one scope-level async request and lets the async worker apply the internal chunk size within that scope
-8. `operator_owned + llm` buffers pending events until one chunk is ready, then emits one async request for that chunk; scope-close flushes any remainder
+   - `N` = chunked assignment batch
+   - when one scope update contains multiple chunks, chunk-level LLM calls are dispatched concurrently against one pre-dispatch `existing_groups` snapshot, then committed back in chunk order
 
 **Group Profile structure**:
 ```json
@@ -587,8 +652,8 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
 ### 4.3 `sem_agg` — Semantic Aggregation
 
 **Files**:
-- `operators/stateful/sem_agg.py`
-- `operators/stateful/sem_agg_window.py`
+- `operators/stateful/sem_agg_kernel.py`
+- `operators/stateful/sem_agg_bounded.py`
 - `operators/stateful/sem_agg_pipeline.py`
 
 **Classes**:
@@ -601,8 +666,8 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
 |------|-------------|
 | **Input** | `SemEvent` dict; the bounded/window-owned path also accepts `WindowSnapshot` dict |
 | **Output** | Aggregation result dict: `{key, aggregate, event_count, version, mode, timestamp_ms}` |
-| **Side Output** | `AsyncWorkItem(task_type="summarize")` — emitted in summarize / compressive modes |
-| **State** | `ListState[buffer]` + `ValueState[aggregate]` + `ValueState[meta]` |
+| **Side Output** | none for the native continuous summarize/compressive path; bounded reset-per-scope specialization may still emit async summarize work |
+| **State** | `ListState[buffer]` + `ValueState[aggregate]` + `ValueState[meta]` + `MapState[scope_contributions/scope_progress]` |
 
 **Query-spec integration** (`AggQuerySpec`):
 - `agg_method = algebraic | summarize | compressive`
@@ -613,8 +678,8 @@ All V0.2 operators inherit from `KeyedProcessFunction` and share the same lifecy
   - `session_gap_ms`
   - `boundary_flag`
 - physical path selection is internal:
-  - default: `window_owned` when the input is already a bounded `WindowSnapshot`
-  - otherwise: `operator_owned`
+  - default: `external_window` when the input is already a bounded `WindowSnapshot`
+  - otherwise: `internal_scope`
 
 **Configuration** (`SemAggConfig`):
 
@@ -630,23 +695,31 @@ When `SemAggFunction` is constructed without an explicit `AggQuerySpec`, the
 config is normalized into one canonical internal query spec before execution.
 The operator core does not keep a separate legacy trigger branch.
 
+**Backend note (current V0.4 scope)**:
+- `sem_agg` summarize/compressive currently uses internal LLM summarization only.
+- embedding-based aggregation backend is deferred; no public API change is required for that future extension.
+
 **Current internal path support**:
 
-| Path | Input kind | Status | Notes |
-|------|------------|--------|-------|
-| `operator_owned` | flat event stream | Implemented | Continuous keyed-state aggregation |
-| `window_owned` | `WindowSnapshot` | Implemented | Bounded aggregation within one snapshot; no cross-scope aggregate state |
+| Scope source | Persistence | Input kind | Status | Notes |
+|------|------------|------------|--------|-------|
+| `internal_scope` | `persistent_across_scopes` | flat event stream | Implemented | Continuous keyed-state aggregation |
+| `external_window` | `persistent_across_scopes` | `WindowSnapshot` | Implemented | Continuous cross-scope aggregation over repeated fires of the same `window_id` |
+| `external_window` | `reset_per_scope` | `WindowSnapshot` | Implemented | Bounded aggregation within one snapshot; no cross-scope aggregate state |
 
 **Current trigger support**:
 
-| Path | Trigger | Status | Notes |
+| Scope source | Trigger | Status | Notes |
 |------|---------|--------|-------|
-| `window_owned` | upstream-owned (`on_scope_close` / `on_event`) | Implemented | The runtime consumes one bounded `WindowSnapshot`; trigger semantics are owned by the upstream window/snapshot layer |
-| `operator_owned` | `on_event` | Implemented | `algebraic` emits running aggregates; `summarize` / `compressive` emit summarize work per accepted event |
-| `operator_owned` | `periodic` | Implemented | Timer-driven aggregate emit / summarize flush |
-| `operator_owned` | `idle_flush` | Implemented | Idle timer drives aggregate emit / summarize flush |
-| `operator_owned` | `count_threshold` | Implemented | Emit / summarize after every N accepted events |
-| `operator_owned` | `on_scope_close` | Implemented on close-capable scopes | Supports `session`, `tumbling`, and `semantic`; rejects `sliding` / pure TTL |
+| `internal_scope` | `on_event` | Implemented | `algebraic` emits running aggregates; `summarize` / `compressive` dispatch async summary updates |
+| `internal_scope` | `periodic` | Implemented | Timer-driven aggregate emit / summarize flush |
+| `internal_scope` | `idle_flush` | Implemented | Idle timer drives aggregate emit / summarize flush |
+| `internal_scope` | `count_threshold` | Implemented | Emit / summarize after every N accepted events |
+| `internal_scope` | `on_scope_close` | Implemented on close-capable scopes | Supports `session`, `tumbling`, and `semantic`; rejects `sliding` / pure TTL |
+| `external_window` (`persistent_across_scopes`) | `on_event` / `on_scope_close` | Implemented | Snapshot fire appends scope-local unseen events and can dispatch async summary updates |
+| `external_window` (`persistent_across_scopes`) | `count_threshold` | Implemented | Dispatches summarize updates when buffered unseen events reach threshold |
+| `external_window` (`persistent_across_scopes`) | `periodic` / `idle_flush` | Not implemented (explicit error) | External-window path does not own internal timers for summarize/compressive |
+| `external_window` (`reset_per_scope`) | upstream-owned snapshot fire | Implemented | Bounded specialization; trigger semantics are owned by upstream window/snapshot layer |
 
 **Mode 1 — Algebraic**:
 - The user provides `reduce_fn(accumulator, new_event) → updated_accumulator`
@@ -662,6 +735,11 @@ The operator core does not keep a separate legacy trigger branch.
   - `idle_flush`
   - `count_threshold`
   - `on_scope_close` on close-capable scopes
+- For `external_window + persistent_across_scopes`, summarize/compressive currently support:
+  - `on_event`
+  - `count_threshold`
+  - `on_scope_close`
+  - `periodic` / `idle_flush` are rejected explicitly
 - `max_buffer_events` remains a **hard buffer cap**; when the live buffer hits
   that bound and no summarize request is already in flight, the runtime emits
   summarize work immediately
@@ -674,16 +752,16 @@ The operator core does not keep a separate legacy trigger branch.
 - Before emitting the summarize request, the buffered event set is locally compressed to a smaller suffix budget
 - This is currently a local bounded compaction heuristic, not a separate async compressive worker
 
-**`window_owned` handling**:
+**`external_window + reset_per_scope` handling**:
 - `algebraic` → reduce the bounded snapshot directly and emit one final aggregate row
 - `summarize` / `compressive` → emit one bounded summarize work item for the snapshot
 
-**Current `operator_owned` runtime note**:
+**Current `internal_scope` runtime note**:
 - `AggQuerySpec` now overrides runtime mode / TTL / buffer / flush settings
-- `trigger_policy` now drives operator-owned runtime for:
+- `trigger_policy` now drives internal-scope runtime for:
   - `algebraic`: `on_event`, `periodic`, `idle_flush`, `count_threshold`
   - `summarize` / `compressive`: `on_event`, `periodic`, `idle_flush`, `count_threshold`
-- `operator_owned + on_scope_close` is now supported for close-capable scopes:
+- `internal_scope + on_scope_close` is now supported for close-capable scopes:
   - `session`: idle gap closes the current scope
   - `tumbling`: bucket rollover closes the current scope
   - `semantic`: boundary flag closes the current scope after the boundary event is ingested
@@ -736,7 +814,7 @@ The operator core does not keep a separate legacy trigger branch.
 
 ### 4.5 `sem_topk` — Continuous Top-K
 
-**File**: `operators/stateful/sem_topk.py`
+**File**: `operators/stateful/sem_topk_kernel.py`
 **Class**: `SemTopKFunction(KeyedProcessFunction)`
 
 **Purpose**: maintain a per-key candidate pool, continuously update top-k ranking, and emit updates only when the ranking changes.
@@ -779,6 +857,7 @@ The operator core does not keep a separate legacy trigger branch.
 > Note:
 > - `k` now lives in `TopKQuerySpec`, not `SemTopKConfig`
 > - `retrieve_to_topk_items()` only expands `candidates` and guarantees `candidate_id`; it does not rename the score field. If upstream retrieval uses `_score` or another field name, `SemTopKConfig.score_field` must be set accordingly.
+> - `query` in internal top-k envelopes is treated as an optional ranking-text override. If absent, the semantic intent remains the ranking text.
 
 **Two emission policies**:
 
@@ -847,7 +926,7 @@ input events → key_by → sem_window → sem_groupby → sem_agg → memory si
 | Grouping | `SemGroupbyFunction` | `WindowSnapshot` (auto-expanded) | Grouping result |
 | Aggregation | `SemAggFunction` | Grouping result | Aggregated memory entry |
 
-**Async Bridge integration**: the classify side output of `sem_groupby` is connected through `build_async_bridge` to an LLM classifier.
+**Groupby runtime note**: `sem_groupby` owns canonical grouping state in the keyed state owner. `llm_basic`/`llm_refine` use async dispatch + owner-serialized apply (single-flight + stale guard), so remote calls do not block the keyed owner path.
 
 ### 5.3 Subflow B — Query Retrieval
 
@@ -876,8 +955,6 @@ query requests → key_by → sem_search → sem_topk → retrieved context
 
 | Class | Role |
 |------|------|
-| `_ClassifyAsyncMergeFunction` | Normalizes classify results into grouping assignment envelopes |
-| `_SummarizeAsyncMergeFunction` | Normalizes summarize results into `sem_agg`-style outputs |
 | `_RetrieveAsyncMergeFunction` | Normalizes retrieve results into retrieval envelopes |
 
 ---
@@ -981,7 +1058,7 @@ These tags are embedded into output records and metric labels for auditing and r
 | Operator | Main Metrics Used |
 |---------|-------------------|
 | `sem_window` | `events_processed`, `timer_fires`, `stale_windows`, `boundary_triggers`, `evictions` |
-| `sem_groupby` | `events_processed`, `async_emits` (`classify`), `overflows`, `evictions` |
+| `sem_groupby` | `events_processed`, `recomputes`, `overflows`, `evictions` |
 | `sem_agg` | `events_processed`, `timer_fires` (`flush`), `async_emits` (`summarize`), `overflows` |
 | `sem_search` | `events_processed`, `async_emits` (`retrieve`), `evictions`, `state_size` |
 | `sem_topk` | `events_processed`, `recomputes`, `evictions`, `state_size` |
@@ -1010,6 +1087,7 @@ from pyflink.semantic_runtime import (
     sem_agg,
     sem_filter,
     sem_groupby,
+    sem_join,
     sem_local_topk,
     sem_lookup_join,
     sem_map,
@@ -1068,11 +1146,11 @@ Internal planning then decides:
 
 - trigger and path decisions are internal.
 - The current implementation realizes:
-  - bounded-pool final rerank (`window_owned + on_scope_close`)
-  - bounded-pool early-snapshot rerank (`window_owned + on_event`)
-  - operator-owned continuous pointwise top-k (`operator_owned + on_event`)
-  - operator-owned timer-driven pointwise top-k (`operator_owned + periodic`)
-  - operator-owned contextual rerank over scope snapshots
+  - bounded-pool final rerank (`external_window + on_scope_close`)
+  - bounded-pool early-snapshot rerank (`external_window + on_event`)
+  - continuous pointwise top-k over raw candidate streams (`internal_scope + on_event`)
+  - timer-driven pointwise top-k over raw candidate streams (`internal_scope + periodic`)
+  - contextual rerank over internal scope snapshots
     - `periodic`
     - `idle_flush`
     - `count_threshold`
@@ -1088,14 +1166,104 @@ Internal planning then decides:
   - `context_chunk_size`
   - `merge_strategy`
   - `close_surrogate`
-- current defaults:
-  - `pairwise` -> `context_chunk_size=2`, `merge_strategy="tournament"`
-  - `listwise` -> full-pool context, `merge_strategy="global_rank"`
+- current execution contract:
+  - `pairwise` / `listwise` both require explicit `SemTopKConfig.rerank_chunk_size`
+  - `merge_strategy` is derived internally (`pairwise -> tournament`, `listwise -> global_rank`)
 - current surrogate choices for operator-owned contextual rerank:
   - `sliding + on_scope_close` -> internal `epoch_close`
   - pure `TTL + on_scope_close` -> internal `periodic_snapshot`
 
-### 8.4 `SemSpec` — Unified Semantic Criterion
+### 8.4 `sem_join` And Shared Window Materialization
+
+The public `sem_join` contract is now expressed as:
+
+- `sem_join(intent=..., context=..., right_input=..., join_type="inner")`
+
+The user sees only:
+
+1. semantic join intent,
+2. business boundary (`context("stream")` or `context("window")`),
+3. logical binding of the right side,
+4. semantic join form (`inner | left | right | full | semi | anti`).
+
+The user does not see:
+
+- backend,
+- pair block size,
+- prefilter strategy,
+- timeout / retry,
+- trigger policy.
+
+**Current execution paths**:
+
+1. `context("stream")`
+   - true two-input native runtime,
+   - dual-side buffered keyed state,
+   - candidate generation under bounded retention,
+   - semantic verification through internal matcher (default LLM, optional embedding),
+   - async semantic evaluation so keyed owner does not block on remote LLM calls.
+2. `context("window")`
+   - both sides first lower through the shared window materialization layer,
+   - standard windows (`tumbling`, `sliding`, `session`) reuse native Flink window APIs,
+   - then `sem_join` ingests per-fire delta events from `WindowSnapshot` into the same continuous keyed stateful runtime.
+
+**Shared window materialization layer**:
+
+- internal file: `runtime/window_materialization.py`
+- role: `stream -> WindowSnapshot`
+- it is a transform/materialization layer only; it does not define join identity
+
+**Internal window specification**:
+
+- `window_kind = tumbling | sliding | session | semantic | None`
+- `window_size_ms`
+- `slide_ms` for `sliding`
+- `session_gap_ms` for `session`
+- `time_basis = processing | event`
+- `boundary_flag` for `semantic`
+
+**Canonical join rule**:
+
+- `sem_join` is always continuous stateful join over two unbounded keyed inputs.
+- scope/window is ingress and pruning policy, not join object identity.
+- no window-owned pairing contract is used in the canonical runtime path.
+
+**Implemented join semantics**:
+
+- `join_type` supports: `inner`, `left`, `right`, `full`, `semi`, `anti`.
+- join output emission follows Flink-style continuous probe semantics:
+  - matched rows emit on successful semantic predicate,
+  - outer/unmatched rows emit on finalize boundary (not on immediate arrival).
+
+**Scope mixing and dedupe contract**:
+
+- left/right may use different scope sourcing styles in one query:
+  - row stream + row stream,
+  - snapshot stream + snapshot stream,
+  - snapshot stream + row stream.
+- external scope ingestion is delta-based and side-local deduped by `seq_id`
+  across scope/window fires, so repeated overlapping scopes do not duplicate
+  semantic join matches.
+
+**Trigger and time-bound constraints**:
+
+- current `sem_join` trigger support is intentionally strict:
+  - `trigger_policy.mode="on_event"` or
+  - `trigger_policy.mode="on_scope_close"`.
+- other trigger modes are rejected fail-fast.
+- `time_basis="event"` requires event-time fields in payload
+  (`event_time_ms` / `timestamp_ms` / `proc_time_ms`) and uses watermark-based
+  finalize cutoff.
+- `time_basis="processing"` uses processing-time retention cutoff.
+
+**Async execution contract**:
+
+- default internal matcher backend is LLM.
+- optional internal matcher backend is embedding similarity.
+- LLM/hybrid matching runs asynchronously so the keyed owner thread does not
+  block on remote semantic calls; embedding path is synchronous local scoring.
+
+### 8.5 `SemSpec` — Unified Semantic Criterion
 
 **File**: `sem_spec.py`
 **Class**: `SemSpec` (dataclass)
@@ -1129,7 +1297,7 @@ spec = SemSpec.for_sem_topk(
 
 Supports `to_dict()` / `from_dict()` for JSON/YAML serialisation.
 
-### 8.5 `RuntimeConfig` — Internal Typed Configuration Entry
+### 8.6 `RuntimeConfig` — Internal Typed Configuration Entry
 
 **File**: `runtime_config.py`
 **Class**: `RuntimeConfig` (dataclass)
@@ -1210,7 +1378,7 @@ streams = build_continuous_rag_workflow_from_runtime_config(input_ds, cfg)
 This keeps workflow assembly on the same `QuerySpec + kernel + lowering`
 contract already used by the per-operator builders.
 
-### 8.6 External Search Backend Interface
+### 8.7 External Search Backend Interface
 
 **File**: `runtime/external_search_backend.py`
 **Status**: Abstract contract with demo implementations.
