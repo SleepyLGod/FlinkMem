@@ -45,6 +45,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators.row._common import attach_metrics
+from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
 from pyflink.semantic_runtime.runtime.simple_text_encoder import HashingTextEncoder
 from pyflink.semantic_runtime.runtime.external_search_backend import (
     ExternalSearchBackend,
@@ -401,12 +402,12 @@ class SemLookupJoinFunction(AsyncFunction):
             )
 
         try:
-            parsed = json.loads(text)
-        except (json.JSONDecodeError, TypeError) as exc:
+            parsed = parse_llm_json_object(text, operator_name="sem_lookup_join")
+        except ValueError as exc:
             logger.warning("sem_lookup_join JSON parse failed: %s", exc)
             if metrics_sink:
                 metrics_sink.record_invalid_output()
-            raise ValueError(f"sem_lookup_join expected valid JSON output: {exc}") from exc
+            raise ValueError(str(exc)) from exc
 
         return self._validate_block_result(parsed)
 

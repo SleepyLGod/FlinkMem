@@ -45,11 +45,18 @@ DEFAULT_EVERMEMOS_EPISODE_INTENT = (
 )
 DEFAULT_EVERMEMOS_SUBJECT_INTENT = "What is the central subject of this conversation?"
 DEFAULT_EVERMEMOS_FORESIGHT_INTENT = (
-    "Extract time-bounded future predictions or planned actions as structured items"
+    "Extract time-bounded future predictions or planned actions and return exactly one "
+    "JSON object with field foresights as a list. Each foresights item must include a "
+    "non-empty string field content, and may include optional fields evidence (string), "
+    "start_time (string), end_time (string), duration_days (integer). "
+    "Do not use alternative keys such as action/timeframe."
 )
 DEFAULT_EVERMEMOS_EVENT_LOG_INTENT = (
-    "Extract discrete atomic factual events (who did what, when, with specific details) "
-    "as structured items"
+    "Extract discrete atomic factual events and return exactly one JSON object with "
+    "field event_logs as a list of objects. Each event_logs item must include "
+    "a non-empty string field atomic_fact, and may include optional integer "
+    "field timestamp_ms. Do not use alternative keys such as who/did_what/when/"
+    "specific_details."
 )
 DEFAULT_EVERMEMOS_PROFILE_DISTILL_INTENT = (
     "Given old profiles and distilled cluster evidence, return updated profiles."

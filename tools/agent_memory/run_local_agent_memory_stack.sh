@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.isolation/venv/py312/bin/python}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
 
 RUN_ID="$(date +%s)"
 MONGO_CONTAINER="am_mongo_${RUN_ID}"
@@ -19,6 +20,7 @@ DATASET_SOURCE="${DATASET_SOURCE:-longmemeval}"
 DATASET_PATH="${DATASET_PATH:-}"
 DATASET_SAMPLE_INDEX="${DATASET_SAMPLE_INDEX:-0}"
 DATASET_MAX_MESSAGES="${DATASET_MAX_MESSAGES:-24}"
+WORKFLOWS="${WORKFLOWS:-evermemos,mem0,zep}"
 
 MONGO_PORT="${MONGO_PORT:-27017}"
 NEO4J_HTTP_PORT="${NEO4J_HTTP_PORT:-7474}"
@@ -26,7 +28,7 @@ NEO4J_BOLT_PORT="${NEO4J_BOLT_PORT:-7687}"
 ES_PORT="${ES_PORT:-9200}"
 
 NEO4J_USERNAME="${NEO4J_USERNAME:-neo4j}"
-NEO4J_PASSWORD="${NEO4J_PASSWORD:-secret}"
+NEO4J_PASSWORD="${NEO4J_PASSWORD:-secret123}"
 NEO4J_DATABASE="${NEO4J_DATABASE:-neo4j}"
 
 WAIT_MAX_ATTEMPTS=60
@@ -66,10 +68,44 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "PYTHON_BIN is not executable: ${PYTHON_BIN}"
   exit 1
 fi
+if ! command -v "${DOCKER_BIN}" >/dev/null 2>&1; then
+  echo "Container runtime command not found: ${DOCKER_BIN}"
+  echo "Set DOCKER_BIN to your docker binary path, e.g.:"
+  echo "  DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker ./tools/agent_memory/run_local_agent_memory_stack.sh"
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required but not found in PATH"
+  exit 1
+fi
+if [[ ${#NEO4J_PASSWORD} -lt 8 ]]; then
+  echo "NEO4J_PASSWORD must be at least 8 characters for Neo4j 5+"
+  exit 1
+fi
+
+function require_python_module() {
+  local module_name="$1"
+  if ! "${PYTHON_BIN}" -c "import ${module_name}" >/dev/null 2>&1; then
+    echo "Missing Python dependency: ${module_name}"
+    echo "Install with: ${PYTHON_BIN} -m pip install ${module_name}"
+    exit 1
+  fi
+}
+
+require_python_module "aiohttp"
+if [[ "${WORKFLOWS}" == *"evermemos"* ]]; then
+  require_python_module "pymongo"
+fi
+if [[ "${WORKFLOWS}" == *"mem0"* || "${WORKFLOWS}" == *"zep"* ]]; then
+  require_python_module "neo4j"
+fi
 
 export SEM_RUNTIME_API_KEY_ENV="${SEM_RUNTIME_API_KEY_ENV:-DEEPSEEK_API_KEY}"
 export SEM_RUNTIME_API_BASE="${SEM_RUNTIME_API_BASE:-https://api.deepseek.com/v1}"
-export SEM_RUNTIME_MODEL="${SEM_RUNTIME_MODEL:-deepseek-chat}"
+export SEM_RUNTIME_MODEL="${SEM_RUNTIME_MODEL:-deepseek-reasoner}"
+export SEM_RUNTIME_TIMEOUT_S="${SEM_RUNTIME_TIMEOUT_S:-120}"
+export SEM_RUNTIME_MAX_RETRIES="${SEM_RUNTIME_MAX_RETRIES:-4}"
+export SEM_RUNTIME_RETRY_BASE_DELAY_S="${SEM_RUNTIME_RETRY_BASE_DELAY_S:-0.5}"
 if [[ -z "${!SEM_RUNTIME_API_KEY_ENV:-}" ]]; then
   echo "Missing LLM API key env: ${SEM_RUNTIME_API_KEY_ENV}"
   exit 1
@@ -80,10 +116,10 @@ mkdir -p "${ARTIFACT_DIR}"
 
 function collect_artifacts() {
   set +e
-  docker logs "${MONGO_CONTAINER}" >"${ARTIFACT_DIR}/mongo.log" 2>&1
-  docker logs "${NEO4J_CONTAINER}" >"${ARTIFACT_DIR}/neo4j.log" 2>&1
+  "${DOCKER_BIN}" logs "${MONGO_CONTAINER}" >"${ARTIFACT_DIR}/mongo.log" 2>&1
+  "${DOCKER_BIN}" logs "${NEO4J_CONTAINER}" >"${ARTIFACT_DIR}/neo4j.log" 2>&1
   if [[ "${WITH_ES}" == "true" ]]; then
-    docker logs "${ES_CONTAINER}" >"${ARTIFACT_DIR}/elasticsearch.log" 2>&1
+    "${DOCKER_BIN}" logs "${ES_CONTAINER}" >"${ARTIFACT_DIR}/elasticsearch.log" 2>&1
   fi
 }
 
@@ -91,12 +127,12 @@ function cleanup() {
   set +e
   collect_artifacts
   if [[ -n "${MILVUS_COMPOSE_FILE}" && -f "${MILVUS_COMPOSE_FILE}" ]]; then
-    docker compose -f "${MILVUS_COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1
+    "${DOCKER_BIN}" compose -f "${MILVUS_COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1
     rm -f "${MILVUS_COMPOSE_FILE}"
   fi
-  docker rm -f "${ES_CONTAINER}" >/dev/null 2>&1
-  docker rm -f "${NEO4J_CONTAINER}" >/dev/null 2>&1
-  docker rm -f "${MONGO_CONTAINER}" >/dev/null 2>&1
+  "${DOCKER_BIN}" rm -f "${ES_CONTAINER}" >/dev/null 2>&1
+  "${DOCKER_BIN}" rm -f "${NEO4J_CONTAINER}" >/dev/null 2>&1
+  "${DOCKER_BIN}" rm -f "${MONGO_CONTAINER}" >/dev/null 2>&1
   if [[ "${KEEP_ARTIFACTS}" != "true" ]]; then
     rm -rf "${ARTIFACT_DIR}"
   fi
@@ -106,7 +142,7 @@ trap cleanup EXIT INT TERM
 
 function wait_mongo() {
   local attempt=1
-  until docker exec "${MONGO_CONTAINER}" mongosh --quiet --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; do
+  until "${DOCKER_BIN}" exec "${MONGO_CONTAINER}" mongosh --quiet --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; do
     if (( attempt >= WAIT_MAX_ATTEMPTS )); then
       echo "MongoDB did not become ready in time"
       exit 1
@@ -118,7 +154,7 @@ function wait_mongo() {
 
 function wait_neo4j() {
   local attempt=1
-  until docker exec "${NEO4J_CONTAINER}" cypher-shell -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" "RETURN 1;" >/dev/null 2>&1; do
+  until "${DOCKER_BIN}" exec "${NEO4J_CONTAINER}" cypher-shell -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" "RETURN 1;" >/dev/null 2>&1; do
     if (( attempt >= WAIT_MAX_ATTEMPTS )); then
       echo "Neo4j did not become ready in time"
       exit 1
@@ -140,12 +176,72 @@ function wait_es() {
   done
 }
 
+function wait_ollama() {
+  local ollama_base_url="$1"
+  local attempt=1
+  until curl -sf "${ollama_base_url%/}/api/tags" >/dev/null 2>&1; do
+    if (( attempt >= WAIT_MAX_ATTEMPTS )); then
+      echo "Ollama did not become ready in time: ${ollama_base_url}"
+      exit 1
+    fi
+    sleep "${WAIT_INTERVAL_SECONDS}"
+    attempt=$((attempt + 1))
+  done
+}
+
+function ensure_ollama_model_exists() {
+  local ollama_base_url="$1"
+  local model_name="$2"
+  if ! curl -sf "${ollama_base_url%/}/api/tags" | "${PYTHON_BIN}" -c '
+import json
+import os
+import sys
+
+model_name = os.environ["MEM0_EMBEDDER_MODEL"].strip()
+payload = json.load(sys.stdin)
+models = payload.get("models", [])
+names = []
+if isinstance(models, list):
+    for row in models:
+        if isinstance(row, dict):
+            name = row.get("name")
+            if isinstance(name, str):
+                names.append(name)
+target_names = {model_name, f"{model_name}:latest"}
+sys.exit(0 if any(name in target_names for name in names) else 1)
+'; then
+    echo "Ollama model not found: ${model_name}"
+    echo "Run: ollama pull ${model_name}"
+    exit 1
+  fi
+}
+
+function probe_ollama_embedding() {
+  local ollama_base_url="$1"
+  local model_name="$2"
+  if ! curl -sf "${ollama_base_url%/}/api/embeddings" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${model_name}\",\"prompt\":\"embedding health check\"}" \
+    | "${PYTHON_BIN}" -c '
+import json
+import sys
+payload = json.load(sys.stdin)
+embedding = payload.get("embedding")
+if not isinstance(embedding, list) or len(embedding) == 0:
+    sys.exit(1)
+sys.exit(0)
+'; then
+    echo "Ollama embedding probe failed at ${ollama_base_url} for model ${model_name}"
+    exit 1
+  fi
+}
+
 echo "[stack] starting MongoDB container: ${MONGO_CONTAINER}"
-docker run -d --name "${MONGO_CONTAINER}" -p "${MONGO_PORT}:27017" mongo:7 >/dev/null
+"${DOCKER_BIN}" run -d --name "${MONGO_CONTAINER}" -p "${MONGO_PORT}:27017" mongo:7 >/dev/null
 wait_mongo
 
 echo "[stack] starting Neo4j container: ${NEO4J_CONTAINER}"
-docker run -d \
+"${DOCKER_BIN}" run -d \
   --name "${NEO4J_CONTAINER}" \
   -p "${NEO4J_HTTP_PORT}:7474" \
   -p "${NEO4J_BOLT_PORT}:7687" \
@@ -155,7 +251,7 @@ wait_neo4j
 
 if [[ "${WITH_ES}" == "true" ]]; then
   echo "[stack] starting Elasticsearch container: ${ES_CONTAINER}"
-  docker run -d \
+  "${DOCKER_BIN}" run -d \
     --name "${ES_CONTAINER}" \
     -p "${ES_PORT}:9200" \
     -e "discovery.type=single-node" \
@@ -169,7 +265,7 @@ if [[ "${WITH_MILVUS}" == "true" ]]; then
   echo "[stack] downloading Milvus compose file: ${MILVUS_COMPOSE_FILE}"
   curl -L "https://github.com/milvus-io/milvus/releases/download/v2.5.14/milvus-standalone-docker-compose.yml" -o "${MILVUS_COMPOSE_FILE}" >/dev/null
   echo "[stack] starting Milvus compose stack"
-  docker compose -f "${MILVUS_COMPOSE_FILE}" up -d >/dev/null
+  "${DOCKER_BIN}" compose -f "${MILVUS_COMPOSE_FILE}" up -d >/dev/null
 fi
 
 export EVERMEMOS_MONGO_URI="mongodb://localhost:${MONGO_PORT}"
@@ -212,12 +308,18 @@ export ZEP_EMBEDDER_MODEL="${ZEP_EMBEDDER_MODEL:-${MEM0_EMBEDDER_MODEL}}"
 export ZEP_EMBEDDER_OLLAMA_BASE_URL="${ZEP_EMBEDDER_OLLAMA_BASE_URL:-${MEM0_EMBEDDER_OLLAMA_BASE_URL}}"
 export ZEP_EMBEDDER_EMBEDDING_DIM="${ZEP_EMBEDDER_EMBEDDING_DIM:-${MEM0_EMBEDDER_EMBEDDING_DIM}}"
 
+if [[ "${MEM0_EMBEDDER_PROVIDER}" == "ollama" ]]; then
+  wait_ollama "${MEM0_EMBEDDER_OLLAMA_BASE_URL}"
+  ensure_ollama_model_exists "${MEM0_EMBEDDER_OLLAMA_BASE_URL}" "${MEM0_EMBEDDER_MODEL}"
+  probe_ollama_embedding "${MEM0_EMBEDDER_OLLAMA_BASE_URL}" "${MEM0_EMBEDDER_MODEL}"
+fi
+
 echo "[stack] running real-backend smoke script"
 SMOKE_CMD=(
   "${PYTHON_BIN}"
   "${ROOT_DIR}/tools/agent_memory/agent_memory_real_smoke.py"
   --workflows
-  "evermemos,mem0,zep"
+  "${WORKFLOWS}"
   --dataset-source
   "${DATASET_SOURCE}"
   --dataset-path
@@ -229,7 +331,9 @@ SMOKE_CMD=(
   --artifact-dir
   "${ARTIFACT_DIR}"
 )
-"${SMOKE_CMD[@]}" | tee "${ARTIFACT_DIR}/smoke_stdout.log"
+echo "[stack] workflows=${WORKFLOWS} dataset_source=${DATASET_SOURCE} sample_index=${DATASET_SAMPLE_INDEX} max_messages=${DATASET_MAX_MESSAGES}"
+echo "[stack] llm_model=${SEM_RUNTIME_MODEL} timeout_s=${SEM_RUNTIME_TIMEOUT_S} max_retries=${SEM_RUNTIME_MAX_RETRIES}"
+"${SMOKE_CMD[@]}" 2>&1 | tee "${ARTIFACT_DIR}/smoke_stdout.log"
 
 echo "[stack] smoke run completed; cleanup will run automatically"
 if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then

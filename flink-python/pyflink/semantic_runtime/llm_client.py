@@ -27,12 +27,11 @@ operator layer.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +150,7 @@ class OpenAILLMClient(LLMClient):
             self._session = aiohttp.ClientSession()
 
     async def call(self, prompt: str) -> tuple[str, LLMCallMetrics]:
+        import aiohttp
         import os  # noqa: E401
         await self._ensure_session()
         assert self._session is not None
@@ -174,24 +174,24 @@ class OpenAILLMClient(LLMClient):
         t0 = time.monotonic()
         attempts = 0
         last_err: Optional[str] = None
+        retryable_statuses = {429, 500, 502, 503, 504}
 
         for attempt in range(1, self._config.max_retries + 1):
             attempts = attempt
+            delay = self._config.retry_base_delay_s * (2 ** (attempt - 1))
             try:
                 async with self._session.post(
                     url, headers=headers, json=body,
-                    timeout=__import__("aiohttp").ClientTimeout(
-                        total=self._config.timeout_s),
+                    timeout=aiohttp.ClientTimeout(total=self._config.timeout_s),
                 ) as resp:
-                    if resp.status in (429, 503):
+                    if resp.status in retryable_statuses:
                         last_err = f"HTTP {resp.status}"
-                        delay = self._config.retry_base_delay_s * (2 ** (attempt - 1))
                         logger.warning("LLM API %s, retry %d after %.1fs",
                                        last_err, attempt, delay)
                         await asyncio.sleep(delay)
                         continue
                     resp.raise_for_status()
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
 
                 choice = data["choices"][0]["message"]["content"]
                 usage = data.get("usage", {})
@@ -203,19 +203,33 @@ class OpenAILLMClient(LLMClient):
                 )
             except asyncio.TimeoutError:
                 last_err = "timeout"
-                delay = self._config.retry_base_delay_s * (2 ** (attempt - 1))
                 logger.warning("LLM call timeout, retry %d after %.1fs",
                                attempt, delay)
                 await asyncio.sleep(delay)
-            except Exception as e:
-                # Connection errors etc. — retryable at this layer
-                if "Cannot connect" in str(e) or "ConnectionError" in type(e).__name__:
+            except aiohttp.ClientResponseError as e:
+                if e.status in retryable_statuses:
                     last_err = str(e)
-                    delay = self._config.retry_base_delay_s * (2 ** (attempt - 1))
-                    logger.warning("LLM connection error, retry %d: %s", attempt, e)
+                    logger.warning("LLM response error, retry %d after %.1fs: %s",
+                                   attempt, delay, e)
                     await asyncio.sleep(delay)
-                else:
-                    raise  # non-transient → surface immediately
+                    continue
+                raise
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientOSError,
+            ) as e:
+                last_err = str(e)
+                logger.warning("LLM connection/payload error, retry %d after %.1fs: %s",
+                               attempt, delay, e)
+                await asyncio.sleep(delay)
+            except aiohttp.ClientError as e:
+                # Other aiohttp transport errors are treated as transient.
+                last_err = str(e)
+                logger.warning("LLM client error, retry %d after %.1fs: %s",
+                               attempt, delay, e)
+                await asyncio.sleep(delay)
 
         # all retries exhausted
         elapsed = (time.monotonic() - t0) * 1000

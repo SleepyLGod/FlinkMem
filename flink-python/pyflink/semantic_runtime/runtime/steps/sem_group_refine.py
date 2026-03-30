@@ -8,6 +8,7 @@ import threading
 from typing import Any, Dict, List
 
 from pyflink.semantic_runtime.llm_client import LLMClient
+from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
 from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_group_refine_prompt
 
 _THREAD_LOCAL = threading.local()
@@ -25,13 +26,7 @@ def _run_sync(coro):
 async def _call_json(client: LLMClient, prompt: str) -> Dict[str, Any]:
     """Run one async LLM call and parse one JSON object."""
     text, _metrics = await client.call(prompt)
-    try:
-        payload = json.loads(text)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"sem_group_refine expected valid JSON output: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("sem_group_refine expected one JSON object payload")
-    return payload
+    return parse_llm_json_object(text, operator_name="sem_group_refine")
 
 
 def _call_json_sync(client: LLMClient, prompt: str) -> Dict[str, Any]:

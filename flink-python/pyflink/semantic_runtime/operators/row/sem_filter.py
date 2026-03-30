@@ -40,6 +40,7 @@ from pyflink.datastream.functions import AsyncFunction, RuntimeContext
 from pyflink.semantic_runtime.llm_client import LLMClient, LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.metrics import OperatorMetrics
 from pyflink.semantic_runtime.operators.row._common import attach_metrics, validate_generic_sem_spec
+from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
 from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_filter_prompt
 from pyflink.semantic_runtime.sem_spec import SemSpec
 
@@ -108,12 +109,12 @@ class SemFilterFunction(AsyncFunction):
 
         # Parse JSON
         try:
-            parsed = json.loads(text)
-        except (json.JSONDecodeError, TypeError) as e:
+            parsed = parse_llm_json_object(text, operator_name="sem_filter")
+        except ValueError as e:
             logger.warning("sem_filter JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            raise ValueError(f"sem_filter expected valid JSON output: {e}") from e
+            raise ValueError(str(e)) from e
 
         # Validate required keys
         if not isinstance(parsed, dict) or not _FILTER_SCHEMA_KEYS.issubset(parsed):

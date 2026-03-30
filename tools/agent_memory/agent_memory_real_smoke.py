@@ -72,7 +72,7 @@ from tools.agent_memory.llm_semantic_runtimes import (  # noqa: E402
 
 
 DEFAULT_LLM_BACKEND = "openai"
-DEFAULT_LLM_MODEL = "deepseek-chat"
+DEFAULT_LLM_MODEL = "deepseek-reasoner"
 DEFAULT_LLM_API_BASE = "https://api.deepseek.com/v1"
 DEFAULT_LLM_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEFAULT_LLM_TIMEOUT_S = 60.0

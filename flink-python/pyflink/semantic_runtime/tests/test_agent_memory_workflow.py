@@ -231,7 +231,7 @@ class _PromptRoutingClient(LLMClient):
             return ('{"episode": "episode_from_sem_map"}', LLMCallMetrics())
         if "What is the central subject of this conversation?" in prompt:
             return ('{"subject": "subject_from_sem_map"}', LLMCallMetrics())
-        if "Extract time-bounded future predictions or planned actions as structured items" in prompt:
+        if "Extract time-bounded future predictions or planned actions" in prompt:
             return (
                 '{"foresights": [{"content": "foresight_from_sem_map"}]}',
                 LLMCallMetrics(),
@@ -1267,7 +1267,10 @@ def test_operator_runtime_executes_evermemos_predicates_via_sem_ops() -> None:
         for item in factory.prompts
     )
     assert any("What is the central subject of this conversation?" in item for item in factory.prompts)
-    assert any("Extract time-bounded future predictions or planned actions as structured items" in item for item in factory.prompts)
+    assert any(
+        "Extract time-bounded future predictions or planned actions" in item
+        for item in factory.prompts
+    )
     assert any("Extract discrete atomic factual events" in item for item in factory.prompts)
     assert any("Update the running compressed memory" in item for item in factory.prompts)
     assert any("Given old profiles and distilled cluster evidence, return updated profiles." in item for item in factory.prompts)

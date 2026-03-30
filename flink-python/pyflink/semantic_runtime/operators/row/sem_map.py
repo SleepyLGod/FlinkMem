@@ -55,6 +55,7 @@ from pyflink.semantic_runtime.operators.row._common import (
     validate_schema,
 )
 from pyflink.semantic_runtime.runtime.prompt_templates import build_sem_map_prompt
+from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
 from pyflink.semantic_runtime.sem_spec import SemSpec
 
 if TYPE_CHECKING:
@@ -149,12 +150,12 @@ class SemMapFunction(AsyncFunction):
         # ── Structured JSON mode ───────────────────────────────────────
         # Parse JSON response
         try:
-            parsed = json.loads(text)
-        except (json.JSONDecodeError, TypeError) as e:
+            parsed = parse_llm_json_object(text, operator_name="sem_map")
+        except ValueError as e:
             logger.warning("sem_map JSON parse failed: %s", e)
             if om:
                 om.record_invalid_output()
-            raise ValueError(f"sem_map expected valid JSON output: {e}") from e
+            raise ValueError(str(e)) from e
 
         # Validate schema
         if not validate_schema(parsed, self._output_schema):
