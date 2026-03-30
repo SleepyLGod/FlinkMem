@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -60,6 +61,7 @@ DEFAULT_EVERMEMOS_RERANK_BLOCK_SIZE = 1
 
 VALID_BOUNDARY_STRATEGIES = {"sem_filter", "all_history"}
 VALID_PROFILE_AGG_MODES = {"summarize", "compressive"}
+EVERMEMOS_BOUNDARY_STRATEGY_ENV = "EVERMEMOS_BOUNDARY_STRATEGY"
 
 
 class _NoopRuntimeContext:
@@ -90,6 +92,15 @@ class EverMemOSOperatorRuntimeConfig:
                 f"Invalid profile_agg_mode={self.profile_agg_mode!r}; "
                 f"must be one of {VALID_PROFILE_AGG_MODES!r}"
             )
+
+    @classmethod
+    def from_env(cls) -> "EverMemOSOperatorRuntimeConfig":
+        """Build runtime config from environment variables."""
+        boundary_strategy = os.getenv(
+            EVERMEMOS_BOUNDARY_STRATEGY_ENV,
+            "sem_filter",
+        ).strip()
+        return cls(boundary_strategy=boundary_strategy)
 
 
 class EverMemOSOperatorRuntime:

@@ -1310,3 +1310,14 @@ def test_sem_topk_reranker_uses_sem_score_path() -> None:
 
     assert [item.memory_id for item in reranked] == ["m1", "m2"]
     assert any("Item to score:" in item for item in factory.prompts)
+
+
+def test_operator_runtime_config_from_env_boundary_strategy() -> None:
+    previous = dict(os.environ)
+    try:
+        os.environ["EVERMEMOS_BOUNDARY_STRATEGY"] = "all_history"
+        config = EverMemOSOperatorRuntimeConfig.from_env()
+        assert config.boundary_strategy == "all_history"
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
