@@ -33,6 +33,16 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.external_confi
     Mem0RuntimeConfig,
     Mem0VectorStoreConfig,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.external_runtime import (
+    Mem0ExternalBundle,
+    Mem0ExternalClients,
+    Mem0FaissFactBackend,
+    Mem0GraphEmbeddingEntitySearcher,
+    Mem0GraphEmbeddingRelationSearcher,
+    Neo4jMem0GraphStore,
+    build_mem0_external_bundle,
+    create_mem0_external_clients,
+)
 
 __all__ = [
     "Mem0BasicWorkflow",
@@ -58,4 +68,12 @@ __all__ = [
     "Mem0VectorStoreConfig",
     "Mem0GraphStoreConfig",
     "Mem0RuntimeConfig",
+    "Mem0FaissFactBackend",
+    "Neo4jMem0GraphStore",
+    "Mem0GraphEmbeddingEntitySearcher",
+    "Mem0GraphEmbeddingRelationSearcher",
+    "Mem0ExternalBundle",
+    "Mem0ExternalClients",
+    "create_mem0_external_clients",
+    "build_mem0_external_bundle",
 ]

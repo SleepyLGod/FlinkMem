@@ -1,0 +1,296 @@
+# Agent Memory Workflows (Flink Semantic Runtime)
+
+This directory contains end-to-end workflow reconstructions for agent-memory systems on top of `semantic_runtime` operators.
+
+## Current Status (Important)
+
+1. EverMemOS:
+- Workflow + external config + external runtime adapters are implemented.
+- Real backend wiring path exists (`MongoDB`, optional `Elasticsearch`, optional `Milvus`).
+
+2. Zep / Graphiti:
+- Workflow + external config + external runtime adapters are implemented.
+- Real backend wiring path exists (`Neo4j`).
+
+3. Mem0 / Mem0-Graph:
+- Workflow + source-aligned external config + external runtime adapters are implemented.
+- Basic path uses local FAISS embedding backend (in-process, lightweight).
+- Graph path uses Neo4j store + embedding recall over graph rows.
+
+## Implemented Workflows
+
+1. `evermemos/`
+- EverMemOS insertion/retrieval reconstruction.
+- Supports boundary strategy switch (`sem_filter` or `all_history`) through operator runtime config.
+- Keeps external runtime/config contracts for DB/LLM/embedding backends.
+
+2. `mem0/`
+- Mem0 Basic workflow (`add`, `search`).
+- Mem0 Graph workflow (`add`, `search`) including entity and relation updates.
+- Recall backend supports `embedding` and `llm` (default `embedding`) for both Basic and Graph paths.
+
+3. `common/`
+- Shared contracts and protocol interfaces used by memory workflows.
+
+4. `zep/`
+- Zep/Graphiti `add_episode` workflow skeleton.
+- Includes source-aligned backend config object (`LLM + Embedder + Neo4j`).
+- Includes Neo4j external runtime adapter and bundle/client factory.
+
+## Semantic Query Coverage (Current)
+
+Reference query spec:
+`flink-python/pyflink/semantic_runtime/docs/tools/sem_queries_agentmem.md`
+
+### Zep / Graphiti
+
+1. Q1 `sem_map` entity extraction: implemented (`extract_entities`)
+2. Q2 `sem_join` entity resolution: implemented as `search_entity_candidates + resolve_entity`
+3. Q3 `sem_map` entity summary update: implemented (`summarize_entity`)
+4. Q4 `sem_map` edge extraction: implemented (`extract_edges`)
+5. Q5 duplicate fact detection: implemented in `resolve_edge(action=DUPLICATE)`
+6. Q6 contradiction fact detection: implemented in `resolve_edge(action=CONTRADICTS)`
+7. Q7 community summary fusion: TODO
+8. Q8 community naming: TODO
+
+### Mem0 / Mem0-Graph
+
+1. Basic Q1-Q4: implemented (`sem_map` + `sem_lookup_join` style recall + resolution actions)
+2. Graph Q5-Q9: implemented (entity extraction/recall/identity + relation extraction/resolution)
+
+### EverMemOS
+
+1. Core insertion/retrieval path implemented.
+2. Boundary strategy supports `sem_filter` and `all_history`.
+
+## Local Dependency Matrix
+
+| Workflow | Required DB/Index | Optional DB/Index | Semantic Backend |
+|---|---|---|---|
+| EverMemOS | MongoDB | Elasticsearch, Milvus | LLM + Embedding |
+| Mem0 Basic | FAISS (in-process) | Qdrant/other vector DB via future adapters | LLM + Embedding |
+| Mem0 Graph | Neo4j + Embedding | - | LLM + Embedding |
+| Zep / Graphiti | Neo4j | - | LLM + Embedding |
+
+## Isolated Python Environment Setup
+
+```bash
+cd /Users/von/Projects/FlinkMem
+PY=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python
+
+$PY -m pip install -U pip
+$PY -m pip install \
+  pymongo \
+  elasticsearch \
+  pymilvus \
+  neo4j
+```
+
+Optional (if you want additional Mem0 vector DB SDKs locally):
+
+```bash
+$PY -m pip install \
+  qdrant-client \
+  chromadb
+```
+
+## CPU-Only Local Bring-up (Mac Apple Silicon)
+
+1. Start Ollama and pull a lightweight embedding model:
+```bash
+ollama pull all-minilm
+```
+
+2. Start databases (Docker examples):
+```bash
+# MongoDB
+docker run -d --name am-mongo -p 27017:27017 mongo:7
+
+# Neo4j (for Zep / Mem0-Graph)
+docker run -d --name am-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/secret \
+  -e NEO4J_PLUGINS='["apoc"]' \
+  neo4j:5.26-community
+
+# Qdrant (optional vector backend for Mem0 Basic)
+docker run -d --name am-qdrant -p 6333:6333 qdrant/qdrant:latest
+
+# Elasticsearch (optional for EverMemOS keyword retrieval)
+docker run -d --name am-es \
+  -p 9200:9200 \
+  -e discovery.type=single-node \
+  -e xpack.security.enabled=false \
+  docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+```
+
+3. Milvus (optional for EverMemOS vector retrieval):
+```bash
+wget https://github.com/milvus-io/milvus/releases/download/v2.5.14/milvus-standalone-docker-compose.yml -O docker-compose.milvus.yml
+docker compose -f docker-compose.milvus.yml up -d
+```
+
+4. Minimal env examples:
+```bash
+# EverMemOS
+export EVERMEMOS_MONGO_URI="mongodb://localhost:27017"
+export EVERMEMOS_ES_ENABLED="false"
+export EVERMEMOS_MILVUS_ENABLED="false"
+
+# Mem0 Basic (local FAISS + Ollama embedding)
+export MEM0_EMBEDDER_PROVIDER="ollama"
+export MEM0_EMBEDDER_MODEL="all-minilm"
+export MEM0_EMBEDDER_OLLAMA_BASE_URL="http://localhost:11434"
+export MEM0_VECTOR_PROVIDER="faiss"
+export MEM0_VECTOR_PATH="/tmp/mem0-faiss"
+
+# Mem0 Graph
+export MEM0_GRAPH_ENABLED="true"
+export MEM0_GRAPH_PROVIDER="neo4j"
+export MEM0_GRAPH_URL="bolt://localhost:7687"
+export MEM0_GRAPH_USERNAME="neo4j"
+export MEM0_GRAPH_PASSWORD="secret"
+
+# Zep
+export ZEP_GRAPH_URI="bolt://localhost:7687"
+export ZEP_GRAPH_USERNAME="neo4j"
+export ZEP_GRAPH_PASSWORD="secret"
+```
+
+5. Workflow-specific minimums:
+- EverMemOS minimal path: `MongoDB` + `EVERMEMOS_ES_ENABLED=false` + `EVERMEMOS_MILVUS_ENABLED=false`.
+- Zep minimal path: `Neo4j`.
+- Mem0 Basic minimal path: local FAISS + embedding function.
+- Mem0-Graph minimal path: `Neo4j` + embedding function.
+
+6. Prepare `.env` (DeepSeek + dataset path):
+```bash
+# required for LLM calls
+export DEEPSEEK_API_KEY="your_deepseek_key"
+
+# optional overrides (defaults already match DeepSeek OpenAI-compatible API)
+export SEM_RUNTIME_API_KEY_ENV="DEEPSEEK_API_KEY"
+export SEM_RUNTIME_API_BASE="https://api.deepseek.com/v1"
+export SEM_RUNTIME_MODEL="deepseek-chat"
+
+# required dataset path (choose one)
+export LONGMEMEVAL_DATASET_PATH="/absolute/path/longmemeval_s_cleaned.json"
+# or
+export LOCOMO_DATASET_PATH="/absolute/path/locomo.json"
+```
+
+Quick start from template:
+```bash
+cd /Users/von/Projects/FlinkMem
+cp tools/agent_memory/.env.example .env
+# then edit .env with real key + dataset path
+```
+
+`.env` behavior:
+- `tools/agent_memory/run_local_agent_memory_stack.sh` will auto-load `repo/.env` and `repo/tools/agent_memory/.env`.
+- `tools/agent_memory/agent_memory_real_smoke.py` also auto-loads the same two paths when run directly.
+- If both shell env and `.env` define the same key, shell env takes precedence.
+
+7. One-shot lightweight stack run with auto-cleanup:
+```bash
+cd /Users/von/Projects/FlinkMem
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+By default this starts `MongoDB + Neo4j`, runs real workflow calls for EverMemOS/Mem0/Zep, then always removes containers.
+
+8. Choose dataset source:
+```bash
+cd /Users/von/Projects/FlinkMem
+DATASET_SOURCE=longmemeval \
+DATASET_PATH=/absolute/path/longmemeval_s_cleaned.json \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+
+cd /Users/von/Projects/FlinkMem
+DATASET_SOURCE=locomo \
+DATASET_PATH=/absolute/path/locomo.json \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+9. Keep run artifacts (logs + JSON result) after cleanup:
+```bash
+cd /Users/von/Projects/FlinkMem
+KEEP_ARTIFACTS=true bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+Containers are still cleaned; only files under `/tmp/agent_memory_stack_artifacts/run_<timestamp>/` are kept.
+
+10. Select dataset sample and message budget:
+```bash
+cd /Users/von/Projects/FlinkMem
+DATASET_SAMPLE_INDEX=0 \
+DATASET_MAX_MESSAGES=24 \
+KEEP_ARTIFACTS=true \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+11. Data source notes:
+- Input messages are read from LongMemEval/LoCoMo dataset files (not synthetic inline messages).
+- Loader entrypoint: `tools/agent_memory/dataset_loader.py`.
+- The runner selects one conversation sample by `DATASET_SAMPLE_INDEX`, then trims to `DATASET_MAX_MESSAGES`.
+
+12. DeepSeek + Ollama status:
+- LLM calls now use `LLMClientConfig(backend=openai)` with DeepSeek-compatible endpoint.
+- Embedding now uses Ollama (`/api/embeddings`) via `MEM0_EMBEDDER_OLLAMA_BASE_URL` + `MEM0_EMBEDDER_MODEL`.
+
+## Design Rules
+
+1. Workflow orchestration lives here; generic semantic logic stays in semantic operators.
+2. Storage-specific logic stays in adapters/protocol implementations, not in operator kernels.
+3. Default path remains explicit and deterministic; no silent fallback.
+
+## Tests
+
+Run from repository root:
+
+```bash
+cd /Users/von/Projects/FlinkMem
+```
+
+Use isolated Python (recommended):
+
+```bash
+/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python
+```
+
+Run memory workflow tests:
+
+```bash
+/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python -m pytest -q \
+  flink-python/pyflink/semantic_runtime/tests/test_agent_memory_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_agent_memory_external_config.py \
+  flink-python/pyflink/semantic_runtime/tests/test_agent_memory_external_runtime.py \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_basic_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_graph_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_external_config.py \
+  flink-python/pyflink/semantic_runtime/tests/test_zep_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_zep_external_config.py \
+  flink-python/pyflink/semantic_runtime/tests/test_zep_external_runtime.py
+```
+
+Run workflow-specific tests:
+
+```bash
+/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python -m pytest -q \
+  flink-python/pyflink/semantic_runtime/tests/test_zep_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_zep_external_config.py \
+  flink-python/pyflink/semantic_runtime/tests/test_zep_external_runtime.py
+
+/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python -m pytest -q \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_basic_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_graph_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_external_config.py \
+  flink-python/pyflink/semantic_runtime/tests/test_mem0_external_runtime.py
+
+/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python -m pytest -q \
+  flink-python/pyflink/semantic_runtime/tests/test_agent_memory_workflow.py \
+  flink-python/pyflink/semantic_runtime/tests/test_agent_memory_external_config.py \
+  flink-python/pyflink/semantic_runtime/tests/test_agent_memory_external_runtime.py
+```
+
+## Notes for Next Work
+
+1. Zep Q7/Q8 (community-level fusion + naming) is still TODO.
+2. Prompt/predicate parity should be tracked by tests to avoid drift from upstream workflow specs.

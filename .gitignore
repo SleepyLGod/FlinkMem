@@ -81,3 +81,4 @@ tools/japicmp-output
 .isolation/
 .env
 flink-python/pyflink/semantic_runtime/docs/history/
+data/benchmarks/

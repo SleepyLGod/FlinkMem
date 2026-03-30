@@ -20,6 +20,13 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.external_config
     ZepLLMBackendConfig,
     ZepNeo4jConfig,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.external_runtime import (
+    Neo4jZepGraphStore,
+    ZepExternalBundle,
+    ZepExternalClients,
+    build_zep_external_bundle,
+    create_zep_external_clients,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.workflow import (
     ZepAddEpisodeWorkflow,
 )
@@ -39,5 +46,10 @@ __all__ = [
     "ZepEmbedderBackendConfig",
     "ZepNeo4jConfig",
     "ZepBackendConfig",
+    "Neo4jZepGraphStore",
+    "ZepExternalBundle",
+    "ZepExternalClients",
+    "create_zep_external_clients",
+    "build_zep_external_bundle",
     "ZepAddEpisodeWorkflow",
 ]
