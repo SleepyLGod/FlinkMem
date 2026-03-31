@@ -30,7 +30,13 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.external_runtim
 
 
 class _FakeTx:
+    def __init__(self, *, query_log: List[str]) -> None:
+        self._query_log = query_log
+
     def run(self, query: str, **params: Any) -> Sequence[Dict[str, Any]]:
+        self._query_log.append(str(query))
+        if "CREATE FULLTEXT INDEX" in query:
+            return []
         if "MATCH (e:Episodic" in query and "ORDER BY created_at_ms DESC" in query:
             return [
                 {
@@ -73,6 +79,9 @@ class _FakeTx:
 
 
 class _FakeSession:
+    def __init__(self, *, query_log: List[str]) -> None:
+        self._query_log = query_log
+
     def __enter__(self) -> "_FakeSession":
         return self
 
@@ -80,19 +89,20 @@ class _FakeSession:
         return None
 
     def execute_read(self, fn):  # type: ignore[no-untyped-def]
-        return fn(_FakeTx())
+        return fn(_FakeTx(query_log=self._query_log))
 
     def execute_write(self, fn):  # type: ignore[no-untyped-def]
-        return fn(_FakeTx())
+        return fn(_FakeTx(query_log=self._query_log))
 
 
 class _FakeDriver:
     def __init__(self) -> None:
         self.closed = False
+        self.query_log: List[str] = []
 
     def session(self, *, database: str) -> _FakeSession:
         _ = database
-        return _FakeSession()
+        return _FakeSession(query_log=self.query_log)
 
     def close(self) -> None:
         self.closed = True
@@ -116,6 +126,14 @@ def test_zep_external_bundle_graph_store_methods() -> None:
     bundle = build_zep_external_bundle(
         backend_config=_backend_config(),
         neo4j_driver=driver,
+    )
+    assert any(
+        "CREATE FULLTEXT INDEX `node_name_and_summary` IF NOT EXISTS" in query
+        for query in driver.query_log
+    )
+    assert any(
+        "CREATE FULLTEXT INDEX `edge_name_and_fact` IF NOT EXISTS" in query
+        for query in driver.query_log
     )
 
     recent = asyncio.run(bundle.graph_store.get_recent_episodes(group_id="g1", limit=3))

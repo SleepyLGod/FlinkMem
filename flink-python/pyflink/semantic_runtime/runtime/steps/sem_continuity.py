@@ -44,6 +44,20 @@ class SemContinuityFunction(SemMapFunction):
         self._client = client
 
 
+async def _call_sem_continuity(
+    continuity_fn: SemContinuityFunction,
+    value: Any,
+) -> Dict[str, Any]:
+    """Run one semantic continuity call asynchronously and parse payload."""
+    outputs = await continuity_fn.async_invoke(value)
+    if len(outputs) != 1:
+        raise RuntimeError("sem_continuity expected exactly one output payload")
+    parsed = json.loads(outputs[0])
+    if not isinstance(parsed, dict):
+        raise ValueError("sem_continuity expected one JSON object payload")
+    return parsed
+
+
 def _call_sem_continuity_sync(
     continuity_fn: SemContinuityFunction,
     value: Any,
@@ -120,6 +134,29 @@ def evaluate_summary_sem_continuity_sync(
         continuity_fn,
         {
             "current_summary": current_summary,
+            "current_event": current_event,
+        },
+    )
+    return parse_sem_continuity(payload)
+
+
+async def evaluate_all_history_sem_continuity(
+    *,
+    client: LLMClient,
+    llm_config: LLMClientConfig,
+    active_window_events: list[Dict[str, Any]],
+    current_event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Evaluate all-history semantic continuity asynchronously."""
+    continuity_fn = SemContinuityFunction(
+        build_sem_window_all_history_prompt(),
+        llm_config,
+    )
+    continuity_fn.attach_client(client)
+    payload = await _call_sem_continuity(
+        continuity_fn,
+        {
+            "active_window_events": active_window_events,
             "current_event": current_event,
         },
     )

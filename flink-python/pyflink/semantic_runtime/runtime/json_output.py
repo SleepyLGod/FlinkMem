@@ -31,6 +31,24 @@ def _extract_first_json_object_text(text: str) -> str:
     return text
 
 
+def _decode_first_json_object(text: str) -> Dict[str, Any] | None:
+    """Decode the first JSON object found in text, ignoring trailing garbage."""
+    decoder = json.JSONDecoder()
+    search_index = 0
+    while True:
+        object_start = text.find("{", search_index)
+        if object_start < 0:
+            return None
+        try:
+            payload, _ = decoder.raw_decode(text[object_start:])
+        except json.JSONDecodeError:
+            search_index = object_start + 1
+            continue
+        if isinstance(payload, dict):
+            return payload
+        search_index = object_start + 1
+
+
 def parse_llm_json_object(text: Any, *, operator_name: str) -> Dict[str, Any]:
     """Parse one JSON object payload from an LLM text response.
 
@@ -62,6 +80,9 @@ def parse_llm_json_object(text: Any, *, operator_name: str) -> Dict[str, Any]:
             raise ValueError(f"{operator_name} expected one JSON object payload")
         return payload
 
+    fallback_payload = _decode_first_json_object(normalized)
+    if fallback_payload is not None:
+        return fallback_payload
+
     assert last_error is not None
     raise ValueError(f"{operator_name} expected valid JSON output: {last_error}") from last_error
-

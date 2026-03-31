@@ -8,6 +8,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 from pyflink.semantic_runtime.llm_client import LLMClient
+from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     RetrievedMemory,
 )
@@ -66,7 +67,10 @@ class _JSONLLMHelper:
 
     async def call_json(self, *, prompt: str) -> Any:
         response_text, _ = await self._client.call(prompt)
-        return json.loads(response_text)
+        return parse_llm_json_object(
+            response_text,
+            operator_name="agent_memory_llm_runtime",
+        )
 
 
 class Mem0BasicLLMSemanticRuntime:
@@ -291,8 +295,63 @@ class Mem0GraphLLMSemanticRuntime:
 class ZepLLMSemanticRuntime:
     """LLM-backed Zep semantic runtime."""
 
-    def __init__(self, *, client: LLMClient) -> None:
+    def __init__(
+        self,
+        *,
+        client: LLMClient,
+        max_message_chars: int | None = None,
+        max_recent_episodes: int | None = None,
+        max_recent_episode_chars: int | None = None,
+        max_edge_entities: int | None = None,
+    ) -> None:
+        if max_message_chars is not None and int(max_message_chars) <= 0:
+            raise ValueError("max_message_chars must be > 0 when provided")
+        if max_recent_episodes is not None and int(max_recent_episodes) <= 0:
+            raise ValueError("max_recent_episodes must be > 0 when provided")
+        if max_recent_episode_chars is not None and int(max_recent_episode_chars) <= 0:
+            raise ValueError("max_recent_episode_chars must be > 0 when provided")
+        if max_edge_entities is not None and int(max_edge_entities) <= 0:
+            raise ValueError("max_edge_entities must be > 0 when provided")
         self._helper = _JSONLLMHelper(client=client)
+        self._max_message_chars = (
+            int(max_message_chars) if max_message_chars is not None else None
+        )
+        self._max_recent_episodes = (
+            int(max_recent_episodes) if max_recent_episodes is not None else None
+        )
+        self._max_recent_episode_chars = (
+            int(max_recent_episode_chars)
+            if max_recent_episode_chars is not None
+            else None
+        )
+        self._max_edge_entities = (
+            int(max_edge_entities) if max_edge_entities is not None else None
+        )
+
+    def _bounded_text(self, text: str, *, max_chars: int | None) -> str:
+        normalized = _as_text(text, field_name="text")
+        if max_chars is None or len(normalized) <= max_chars:
+            return normalized
+        return normalized[:max_chars]
+
+    def _recent_episodes_payload(
+        self,
+        recent_episodes: Sequence[ZepEpisodeCandidate],
+    ) -> Sequence[Mapping[str, str]]:
+        episodes = list(recent_episodes)
+        if self._max_recent_episodes is not None:
+            episodes = episodes[: self._max_recent_episodes]
+        payload: list[Mapping[str, str]] = []
+        for episode in episodes:
+            payload.append(
+                {
+                    "content": self._bounded_text(
+                        episode.content,
+                        max_chars=self._max_recent_episode_chars,
+                    )
+                }
+            )
+        return payload
 
     async def extract_entities(
         self,
@@ -301,12 +360,17 @@ class ZepLLMSemanticRuntime:
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> Sequence[ZepExtractedEntity]:
+        bounded_message = self._bounded_text(
+            message,
+            max_chars=self._max_message_chars,
+        )
+        recent_payload = self._recent_episodes_payload(recent_episodes)
         request_prompt = (
             f"{prompt}\n"
             "Return ONLY JSON schema:\n"
             '{"entities":[{"entity_name":"...","type_id":"..."}]}\n'
-            f"message={_format_json(message)}\n"
-            f"recent_episodes={_format_json([{'content': e.content} for e in recent_episodes])}"
+            f"message={_format_json(bounded_message)}\n"
+            f"recent_episodes={_format_json(recent_payload)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
@@ -335,6 +399,11 @@ class ZepLLMSemanticRuntime:
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> ZepEntityResolution:
+        bounded_message = self._bounded_text(
+            message,
+            max_chars=self._max_message_chars,
+        )
+        recent_payload = self._recent_episodes_payload(recent_episodes)
         candidates_payload = [
             {
                 "entity_id": candidate.entity_id,
@@ -349,8 +418,8 @@ class ZepLLMSemanticRuntime:
             "Return ONLY JSON schema:\n"
             '{"decision":"EXISTING|NEW","entity_name":"...","target_entity_id":"...|null"}\n'
             f"entity={_format_json({'entity_name': extracted_entity.entity_name, 'type_id': extracted_entity.type_id})}\n"
-            f"message={_format_json(message)}\n"
-            f"recent_episodes={_format_json([{'content': e.content} for e in recent_episodes])}\n"
+            f"message={_format_json(bounded_message)}\n"
+            f"recent_episodes={_format_json(recent_payload)}\n"
             f"candidates={_format_json(candidates_payload)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
@@ -370,13 +439,18 @@ class ZepLLMSemanticRuntime:
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> str:
+        bounded_message = self._bounded_text(
+            message,
+            max_chars=self._max_message_chars,
+        )
+        recent_payload = self._recent_episodes_payload(recent_episodes)
         request_prompt = (
             f"{prompt}\n"
             "Return ONLY JSON schema:\n"
             '{"summary":"..."}\n'
             f"entity={_format_json({'entity_name': extracted_entity.entity_name, 'type_id': extracted_entity.type_id})}\n"
-            f"message={_format_json(message)}\n"
-            f"recent_episodes={_format_json([{'content': e.content} for e in recent_episodes])}"
+            f"message={_format_json(bounded_message)}\n"
+            f"recent_episodes={_format_json(recent_payload)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
@@ -391,22 +465,28 @@ class ZepLLMSemanticRuntime:
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> Sequence[ZepExtractedEdge]:
+        bounded_message = self._bounded_text(
+            message,
+            max_chars=self._max_message_chars,
+        )
+        recent_payload = self._recent_episodes_payload(recent_episodes)
+        entities = list(resolved_entities)
+        if self._max_edge_entities is not None:
+            entities = entities[: self._max_edge_entities]
         entities_payload = [
             {
-                "entity_id": entity.entity_id,
                 "entity_name": entity.entity_name,
                 "type_id": entity.type_id,
-                "summary": entity.summary,
             }
-            for entity in resolved_entities
+            for entity in entities
         ]
         request_prompt = (
             f"{prompt}\n"
             "Return ONLY JSON schema:\n"
             '{"edges":[{"source_entity_name":"...","destination_entity_name":"...","relation":"...","fact":"..."}]}\n'
-            f"message={_format_json(message)}\n"
+            f"message={_format_json(bounded_message)}\n"
             f"entities={_format_json(entities_payload)}\n"
-            f"recent_episodes={_format_json([{'content': e.content} for e in recent_episodes])}"
+            f"recent_episodes={_format_json(recent_payload)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
@@ -443,6 +523,11 @@ class ZepLLMSemanticRuntime:
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> ZepEdgeResolution:
+        bounded_message = self._bounded_text(
+            message,
+            max_chars=self._max_message_chars,
+        )
+        recent_payload = self._recent_episodes_payload(recent_episodes)
         candidates_payload = [
             {
                 "edge_id": candidate.edge_id,
@@ -458,8 +543,8 @@ class ZepLLMSemanticRuntime:
             '{"action":"ADD|DUPLICATE|CONTRADICTS","source_entity_name":"...","destination_entity_name":"...",'
             '"relation":"...","fact":"...","target_edge_id":"...|null"}\n'
             f"edge={_format_json({'source_entity_name': extracted_edge.source_entity_name, 'destination_entity_name': extracted_edge.destination_entity_name, 'relation': extracted_edge.relation, 'fact': extracted_edge.fact})}\n"
-            f"message={_format_json(message)}\n"
-            f"recent_episodes={_format_json([{'content': e.content} for e in recent_episodes])}\n"
+            f"message={_format_json(bounded_message)}\n"
+            f"recent_episodes={_format_json(recent_payload)}\n"
             f"candidates={_format_json(candidates_payload)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)

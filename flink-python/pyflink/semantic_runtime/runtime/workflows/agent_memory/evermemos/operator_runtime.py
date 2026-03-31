@@ -20,8 +20,8 @@ from pyflink.semantic_runtime.runtime.prompt_templates import (
     build_sem_map_prompt,
 )
 from pyflink.semantic_runtime.runtime.steps import (
-    evaluate_all_history_sem_continuity_sync,
-    evaluate_sem_agg_summary_update_sync,
+    evaluate_all_history_sem_continuity,
+    evaluate_sem_agg_summary_update,
     evaluate_sem_score,
 )
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
@@ -171,6 +171,19 @@ class EverMemOSOperatorRuntime:
         self._profile_map.close()
         self._profile_agg_client.close()
 
+    async def aclose(self) -> None:
+        """Asynchronously release runtime-owned resources when supported."""
+        await self._close_optional_operator(self._boundary_filter)
+        self._boundary_filter = None
+        await self._close_optional_client(self._all_history_client)
+        self._all_history_client = None
+        await self._close_optional_operator(self._episode_map)
+        await self._close_optional_operator(self._subject_map)
+        await self._close_optional_operator(self._foresight_map)
+        await self._close_optional_operator(self._event_log_map)
+        await self._close_optional_operator(self._profile_map)
+        await self._close_optional_client(self._profile_agg_client)
+
     async def detect_boundary(
         self,
         *,
@@ -186,8 +199,7 @@ class EverMemOSOperatorRuntime:
 
         if self._config.boundary_strategy == "all_history":
             assert self._all_history_client is not None
-            result = await asyncio.to_thread(
-                evaluate_all_history_sem_continuity_sync,
+            result = await evaluate_all_history_sem_continuity(
                 client=self._all_history_client,
                 llm_config=self._llm_config,
                 active_window_events=[self._to_sem_window_event(item) for item in history_messages],
@@ -272,8 +284,7 @@ class EverMemOSOperatorRuntime:
         """Distill profile updates using sem_agg summarization + sem_map structuring."""
         self.distill_calls += 1
         added_events = [self._to_cluster_event(item) for item in cluster_memcells]
-        agg_row = await asyncio.to_thread(
-            evaluate_sem_agg_summary_update_sync,
+        agg_row = await evaluate_sem_agg_summary_update(
             client=self._profile_agg_client,
             mode=self._config.profile_agg_mode,
             current_summary=json.dumps(old_profiles, ensure_ascii=False),
@@ -440,6 +451,26 @@ class EverMemOSOperatorRuntime:
         if not isinstance(value, int):
             raise ValueError("expected optional int field")
         return value
+
+    async def _close_optional_operator(
+        self,
+        operator: Optional[SemMapFunction | SemFilterFunction],
+    ) -> None:
+        if operator is None:
+            return
+        client = getattr(operator, "_client", None)
+        if client is not None:
+            await self._close_optional_client(client)
+            operator._client = None  # type: ignore[attr-defined]
+
+    async def _close_optional_client(self, client: Optional[LLMClient]) -> None:
+        if client is None:
+            return
+        async_close = getattr(client, "aclose", None)
+        if callable(async_close):
+            await async_close()
+            return
+        client.close()
 
 
 @dataclass(frozen=True)

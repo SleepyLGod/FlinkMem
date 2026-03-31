@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Dataset loaders for LongMemEval and LoCoMo conversational samples."""
 
 from __future__ import annotations
@@ -111,7 +110,10 @@ def _load_longmemeval_sample(
                 break
             content = _extract_turn_text(turn=turn)
             role = _extract_turn_role(turn=turn, default_role="user")
-            speaker = _extract_turn_speaker(turn=turn, fallback=f"session_{session_idx}_{role}")
+            speaker = _extract_turn_speaker(
+                turn=turn,
+                fallback=f"session_{session_idx}_{role}",
+            )
             normalized_messages.append(
                 {
                     "message_id": f"{sample_id}_m_{message_idx}",

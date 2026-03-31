@@ -2,12 +2,14 @@
 
 from pyflink.semantic_runtime.runtime.steps.sem_continuity import (
     SemContinuityFunction,
+    evaluate_all_history_sem_continuity,
     evaluate_all_history_sem_continuity_sync,
     evaluate_pairwise_sem_continuity_sync,
     evaluate_summary_sem_continuity_sync,
     parse_sem_continuity,
 )
 from pyflink.semantic_runtime.runtime.steps.sem_agg_summary import (
+    evaluate_sem_agg_summary_update,
     evaluate_sem_agg_summary_update_from_config_sync,
     evaluate_sem_agg_summary_update_sync,
     parse_sem_agg_summary_payload,
@@ -58,7 +60,9 @@ __all__ = [
     "SemRerankFunction",
     "SemSearchConfig",
     "SemSearchFunction",
+    "evaluate_all_history_sem_continuity",
     "evaluate_all_history_sem_continuity_sync",
+    "evaluate_sem_agg_summary_update",
     "evaluate_sem_agg_summary_update_from_config_sync",
     "evaluate_sem_agg_summary_update_sync",
     "evaluate_pairwise_sem_continuity_sync",

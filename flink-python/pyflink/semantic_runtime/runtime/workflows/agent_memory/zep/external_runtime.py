@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 from uuid import uuid4
@@ -50,8 +51,42 @@ class Neo4jZepGraphStore:
     ) -> None:
         self._driver = driver
         self._database = database
-        self._entity_name_index = entity_name_index
-        self._edge_fact_index = edge_fact_index
+        self._entity_name_index = self._normalize_index_name(
+            entity_name_index,
+            field_name="entity_name_index",
+        )
+        self._edge_fact_index = self._normalize_index_name(
+            edge_fact_index,
+            field_name="edge_fact_index",
+        )
+        self._ensure_fulltext_indexes()
+
+    def _normalize_index_name(self, value: str, *, field_name: str) -> str:
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError(f"{field_name} must be non-empty")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
+            raise ValueError(
+                f"{field_name} must match identifier pattern [A-Za-z_][A-Za-z0-9_]*"
+            )
+        return normalized
+
+    def _ensure_fulltext_indexes(self) -> None:
+        create_entity_index = (
+            f"CREATE FULLTEXT INDEX `{self._entity_name_index}` IF NOT EXISTS "
+            "FOR (n:Entity) ON EACH [n.name, n.summary]"
+        )
+        create_edge_index = (
+            f"CREATE FULLTEXT INDEX `{self._edge_fact_index}` IF NOT EXISTS "
+            "FOR ()-[r:RELATES_TO]-() ON EACH [r.fact, r.relation]"
+        )
+        with self._driver.session(database=self._database) as session:
+            session.execute_write(
+                lambda tx: list(tx.run(create_entity_index))
+            )
+            session.execute_write(
+                lambda tx: list(tx.run(create_edge_index))
+            )
 
     async def get_recent_episodes(
         self,

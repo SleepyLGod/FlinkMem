@@ -31,7 +31,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -142,18 +142,54 @@ class OpenAILLMClient(LLMClient):
 
     def __init__(self, config: LLMClientConfig) -> None:
         self._config = config
-        self._session = None  # lazily created
+        self._sessions_by_loop_id: Dict[int, Any] = {}
+        self._loops_by_id: Dict[int, asyncio.AbstractEventLoop] = {}
 
-    async def _ensure_session(self):
-        if self._session is None:
-            import aiohttp
-            self._session = aiohttp.ClientSession()
+    async def _get_or_create_session(self):
+        import aiohttp
+
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        session = self._sessions_by_loop_id.get(loop_id)
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self._config.timeout_s),
+            )
+            self._sessions_by_loop_id[loop_id] = session
+            self._loops_by_id[loop_id] = loop
+        return session
+
+    async def _invalidate_current_loop_session(self) -> None:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        session = self._sessions_by_loop_id.pop(loop_id, None)
+        self._loops_by_id.pop(loop_id, None)
+        if session is not None and not session.closed:
+            await session.close()
+
+    async def aclose(self) -> None:
+        """Asynchronously close all loop-local sessions."""
+        current_loop = asyncio.get_running_loop()
+        loop_ids = list(self._sessions_by_loop_id.keys())
+        for loop_id in loop_ids:
+            session = self._sessions_by_loop_id.pop(loop_id, None)
+            owner_loop = self._loops_by_id.pop(loop_id, None)
+            if session is None or session.closed:
+                continue
+            if owner_loop is None or owner_loop.is_closed():
+                continue
+            if owner_loop is current_loop:
+                await session.close()
+                continue
+            if owner_loop.is_running():
+                close_future = asyncio.run_coroutine_threadsafe(session.close(), owner_loop)
+                await asyncio.wrap_future(close_future)
+                continue
+            owner_loop.run_until_complete(session.close())
 
     async def call(self, prompt: str) -> tuple[str, LLMCallMetrics]:
         import aiohttp
         import os  # noqa: E401
-        await self._ensure_session()
-        assert self._session is not None
 
         api_key = os.environ.get(self._config.api_key_env, "")
         if not api_key:
@@ -180,9 +216,11 @@ class OpenAILLMClient(LLMClient):
             attempts = attempt
             delay = self._config.retry_base_delay_s * (2 ** (attempt - 1))
             try:
-                async with self._session.post(
-                    url, headers=headers, json=body,
-                    timeout=aiohttp.ClientTimeout(total=self._config.timeout_s),
+                session = await self._get_or_create_session()
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=body,
                 ) as resp:
                     if resp.status in retryable_statuses:
                         last_err = f"HTTP {resp.status}"
@@ -223,12 +261,14 @@ class OpenAILLMClient(LLMClient):
                 last_err = str(e)
                 logger.warning("LLM connection/payload error, retry %d after %.1fs: %s",
                                attempt, delay, e)
+                await self._invalidate_current_loop_session()
                 await asyncio.sleep(delay)
             except aiohttp.ClientError as e:
                 # Other aiohttp transport errors are treated as transient.
                 last_err = str(e)
                 logger.warning("LLM client error, retry %d after %.1fs: %s",
                                attempt, delay, e)
+                await self._invalidate_current_loop_session()
                 await asyncio.sleep(delay)
 
         # all retries exhausted
@@ -238,17 +278,26 @@ class OpenAILLMClient(LLMClient):
         )
 
     def close(self) -> None:
-        if self._session is not None:
-            # aiohttp session close is async; best-effort sync close
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._session.close())
-                else:
-                    loop.run_until_complete(self._session.close())
-            except Exception:
-                pass
-            self._session = None
+        if not self._sessions_by_loop_id:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop_ids = list(self._sessions_by_loop_id.keys())
+            for loop_id in loop_ids:
+                session = self._sessions_by_loop_id.pop(loop_id, None)
+                owner_loop = self._loops_by_id.pop(loop_id, None)
+                if session is None or session.closed:
+                    continue
+                if owner_loop is None or owner_loop.is_closed():
+                    continue
+                if owner_loop.is_running():
+                    owner_loop.call_soon_threadsafe(asyncio.create_task, session.close())
+                    continue
+                owner_loop.run_until_complete(session.close())
+            return None
+        loop.create_task(self.aclose())
+        return None
 
 
 # ---------------------------------------------------------------------------

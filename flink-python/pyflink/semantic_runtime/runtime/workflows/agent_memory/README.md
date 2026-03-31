@@ -205,6 +205,9 @@ cp tools/agent_memory/.env.example .env
 - `tools/agent_memory/run_local_agent_memory_stack.sh` will auto-load `repo/.env` and `repo/tools/agent_memory/.env`.
 - `tools/agent_memory/agent_memory_real_smoke.py` also auto-loads the same two paths when run directly.
 - If both shell env and `.env` define the same key, shell env takes precedence.
+- Runtime implementation lives under
+  `flink-python/pyflink/semantic_runtime/runtime/workflows/agent_memory/runtime/`.
+  `tools/agent_memory/agent_memory_real_smoke.py` is a thin wrapper entrypoint.
 
 7. One-shot lightweight stack run with auto-cleanup:
 
@@ -214,6 +217,45 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
 By default this starts `MongoDB + Neo4j`, runs real workflow calls for EverMemOS/Mem0/Zep, then always removes containers.
+
+7.1 Isolated-env one-liners (copy/paste):
+
+```bash
+cd /Users/von/Projects/FlinkMem
+PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+NEO4J_PASSWORD=secret123 \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+Run one workflow only:
+
+```bash
+cd /Users/von/Projects/FlinkMem
+PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+NEO4J_PASSWORD=secret123 \
+WORKFLOWS=evermemos \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+```bash
+cd /Users/von/Projects/FlinkMem
+PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+NEO4J_PASSWORD=secret123 \
+WORKFLOWS=mem0 \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+```bash
+cd /Users/von/Projects/FlinkMem
+PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+NEO4J_PASSWORD=secret123 \
+WORKFLOWS=zep \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
 
 8. Choose dataset source:
 
@@ -252,13 +294,25 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 11. Data source notes:
 
 - Input messages are read from LongMemEval/LoCoMo dataset files (not synthetic inline messages).
-- Loader entrypoint: `tools/agent_memory/dataset_loader.py`.
+- Loader entrypoint: `flink-python/pyflink/semantic_runtime/runtime/workflows/agent_memory/runtime/dataset_loader.py`.
 - The runner selects one conversation sample by `DATASET_SAMPLE_INDEX`, then trims to `DATASET_MAX_MESSAGES`.
+- Replay semantics are message-by-message in event-time order; workflows are triggered per message.
+- Optional replay input scope policy for Mem0/Zep:
+  - `MEMORY_INPUT_SCOPE_POLICY=none|sliding|session` (default `none`)
+  - `MEMORY_INPUT_SCOPE_SLIDING_SIZE` (used when `sliding`)
+  - `MEMORY_INPUT_SCOPE_SESSION_GAP_MS` (used when `session`)
 
 12. DeepSeek + Ollama status:
 
 - LLM calls now use `LLMClientConfig(backend=openai)` with DeepSeek-compatible endpoint.
 - Embedding now uses Ollama (`/api/embeddings`) via `MEM0_EMBEDDER_OLLAMA_BASE_URL` + `MEM0_EMBEDDER_MODEL`.
+- Mem0 smoke retrieval query uses benchmark question (`metadata.question`) to align with retrieval semantics and avoid passing long raw messages directly into embedding recall.
+- Zep Neo4j fulltext indexes are bootstrapped by runtime on startup (`node_name_and_summary`, `edge_name_and_fact`), so explicit manual index creation is not required.
+- Zep LLM prompt budget is bounded by environment knobs to avoid oversized `extract_edges` calls:
+  - `ZEP_PROMPT_MESSAGE_MAX_CHARS`
+  - `ZEP_PROMPT_MAX_RECENT_EPISODES`
+  - `ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS`
+  - `ZEP_PROMPT_MAX_EDGE_ENTITIES`
 
 Troubleshooting (`docker: command not found`):
 
@@ -278,8 +332,15 @@ ollama pull all-minilm
 
 # 3) Re-run stack
 DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+OLLAMA_MAX_RETRIES=6 \
+OLLAMA_RETRY_BASE_DELAY_S=0.5 \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
+
+Notes:
+
+- `OLLAMA_MAX_RETRIES` and `OLLAMA_RETRY_BASE_DELAY_S` control embedding retry for transient Ollama 429/5xx.
+- Keep these low-to-moderate (for example `4~8`) to avoid overloading local CPU inference.
 
 Troubleshooting (`sem_map LLM call failed ... timeout`):
 

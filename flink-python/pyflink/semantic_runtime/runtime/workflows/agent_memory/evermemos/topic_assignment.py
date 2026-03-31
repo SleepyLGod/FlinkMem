@@ -76,6 +76,14 @@ class EverMemOSTopicAssigner:
         """Release assigner-owned resources."""
         self._client.close()
 
+    async def aclose(self) -> None:
+        """Asynchronously release assigner-owned resources when supported."""
+        async_close = getattr(self._client, "aclose", None)
+        if callable(async_close):
+            await async_close()
+            return
+        self._client.close()
+
     async def assign_memcell(
         self,
         *,
