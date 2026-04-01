@@ -44,10 +44,10 @@ DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT = (
     "Establish relationships among extracted entities based on the input text. "
     "Return exactly one JSON object following mem0 graph relation tool schema "
     "(`establish_relationships`/`establish_relations`): "
-    "{'entities': [{'source_index': <index_into_allowed_entity_names>, "
+    "{'entities': [{'source': '<entity_name>', "
     "'relationship': '<relationship>', "
-    "'destination_index': <index_into_allowed_entity_names>}]}. "
-    "Use only indexes that reference the provided allowed_entity_names list."
+    "'destination': '<entity_name>'}]}. "
+    "Use only entities that reference the provided allowed_entity_names list."
 )
 DEFAULT_MEM0_GRAPH_ENTITY_IDENTITY_PROMPT = (
     "Given one extracted entity and one candidate graph entity, decide whether they refer "

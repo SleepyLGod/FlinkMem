@@ -554,8 +554,8 @@ def test_mem0_graph_default_prompts_align_with_mem0_tool_schema() -> None:
     assert "extract_entities" in DEFAULT_MEM0_GRAPH_ENTITY_EXTRACTION_PROMPT
     assert "entity_type" in DEFAULT_MEM0_GRAPH_ENTITY_EXTRACTION_PROMPT
     assert "establish_relationships" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
-    assert "source_index" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
-    assert "destination_index" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
+    assert "'source':" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
+    assert "'destination':" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
     assert "SAME|DIFFERENT" in DEFAULT_MEM0_GRAPH_ENTITY_IDENTITY_PROMPT
     assert "add_graph_memory" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT
     assert "update_graph_memory" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT

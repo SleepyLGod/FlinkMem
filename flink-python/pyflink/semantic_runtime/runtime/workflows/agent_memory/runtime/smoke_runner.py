@@ -77,6 +77,8 @@ DEFAULT_ZEP_PROMPT_MESSAGE_MAX_CHARS = 1_200
 DEFAULT_ZEP_PROMPT_MAX_RECENT_EPISODES = 3
 DEFAULT_ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS = 400
 DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES = 16
+DEFAULT_ZEP_EDGE_ENTITY_REFERENCE_MODE = "name"
+DEFAULT_MEM0_RELATION_ENTITY_REFERENCE_MODE = "name"
 DEFAULT_INPUT_SCOPE_POLICY = "none"
 VALID_INPUT_SCOPE_POLICIES = frozenset({"none", "sliding", "session"})
 DEFAULT_INPUT_SCOPE_SLIDING_SIZE = 8
@@ -604,6 +606,10 @@ async def _run_mem0_workflow(
             str(Mem0GraphConfig().relation_write_group_concurrency),
         )
     )
+    mem0_relation_entity_reference_mode = os.getenv(
+        "MEM0_RELATION_ENTITY_REFERENCE_MODE",
+        DEFAULT_MEM0_RELATION_ENTITY_REFERENCE_MODE,
+    ).strip()
     try:
         bundle = build_mem0_external_bundle(
             backend_config=backend_config,
@@ -651,7 +657,10 @@ async def _run_mem0_workflow(
         if bundle.graph_relation_searcher is None:
             raise ValueError("mem0 graph_relation_searcher must be enabled")
 
-        graph_runtime = Mem0GraphLLMSemanticRuntime(client=llm_client)
+        graph_runtime = Mem0GraphLLMSemanticRuntime(
+            client=llm_client,
+            relation_entity_reference_mode=mem0_relation_entity_reference_mode,
+        )
         graph_workflow = Mem0GraphWorkflow(
             config=Mem0GraphConfig(
                 entity_recall_backend="embedding",
@@ -773,6 +782,10 @@ async def _run_zep_workflow(
             str(DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES),
         )
     )
+    zep_edge_entity_reference_mode = os.getenv(
+        "ZEP_EDGE_ENTITY_REFERENCE_MODE",
+        DEFAULT_ZEP_EDGE_ENTITY_REFERENCE_MODE,
+    ).strip()
     zep_entity_resolve_concurrency = int(
         os.getenv(
             "ZEP_ENTITY_RESOLVE_CONCURRENCY",
@@ -815,6 +828,7 @@ async def _run_zep_workflow(
             max_recent_episodes=zep_prompt_max_recent_episodes,
             max_recent_episode_chars=zep_prompt_recent_episode_max_chars,
             max_edge_entities=zep_prompt_max_edge_entities,
+            edge_entity_reference_mode=zep_edge_entity_reference_mode,
         )
         workflow = ZepAddEpisodeWorkflow(
             config=ZepWorkflowConfig(

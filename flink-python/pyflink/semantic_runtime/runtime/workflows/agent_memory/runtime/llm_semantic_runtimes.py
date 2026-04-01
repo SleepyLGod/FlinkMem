@@ -204,8 +204,18 @@ class Mem0BasicLLMSemanticRuntime:
 class Mem0GraphLLMSemanticRuntime:
     """LLM-backed Mem0 Graph semantic runtime."""
 
-    def __init__(self, *, client: LLMClient) -> None:
+    def __init__(
+        self,
+        *,
+        client: LLMClient,
+        relation_entity_reference_mode: str = "name",
+    ) -> None:
+        if relation_entity_reference_mode not in {"name", "index"}:
+            raise ValueError(
+                "relation_entity_reference_mode must be one of {'name', 'index'}"
+            )
         self._helper = _JSONLLMHelper(client=client)
+        self._relation_entity_reference_mode = str(relation_entity_reference_mode)
 
     async def extract_entities(
         self,
@@ -255,15 +265,26 @@ class Mem0GraphLLMSemanticRuntime:
         ]
         if not allowed_names:
             raise ValueError("extract_relations requires non-empty allowed_entity_names")
-        request_prompt = (
-            f"{prompt}\n"
-            "Return ONLY JSON schema:\n"
-            '{"entities":[{"source_index":0,"relationship":"...","destination_index":1}]}\n'
-            "source_index and destination_index MUST be valid indexes into allowed_entity_names.\n"
-            f"messages={_format_json(list(messages))}\n"
-            f"entities={_format_json(entities_payload)}\n"
-            f"allowed_entity_names={_format_json(allowed_names)}"
-        )
+        if self._relation_entity_reference_mode == "index":
+            request_prompt = (
+                f"{prompt}\n"
+                "Return ONLY JSON schema:\n"
+                '{"entities":[{"source_index":0,"relationship":"...","destination_index":1}]}\n'
+                "source_index and destination_index MUST be valid indexes into allowed_entity_names.\n"
+                f"messages={_format_json(list(messages))}\n"
+                f"entities={_format_json(entities_payload)}\n"
+                f"allowed_entity_names={_format_json(allowed_names)}"
+            )
+        else:
+            request_prompt = (
+                f"{prompt}\n"
+                "Return ONLY JSON schema:\n"
+                '{"entities":[{"source":"...","relationship":"...","destination":"..."}]}\n'
+                "source and destination MUST be exact members of allowed_entity_names.\n"
+                f"messages={_format_json(list(messages))}\n"
+                f"entities={_format_json(entities_payload)}\n"
+                f"allowed_entity_names={_format_json(allowed_names)}"
+            )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
             raise ValueError("extract_relations payload must be object")
@@ -271,26 +292,47 @@ class Mem0GraphLLMSemanticRuntime:
         if not isinstance(relations, list):
             raise ValueError("extract_relations payload.entities must be list")
         output: list[Mem0GraphExtractedRelation] = []
+        allowed_name_set = set(allowed_names)
         for item in relations:
             if not isinstance(item, Mapping):
                 raise ValueError("relation row must be object")
-            source_index = _as_int(item.get("source_index"), field_name="source_index")
-            destination_index = _as_int(
-                item.get("destination_index"),
-                field_name="destination_index",
-            )
-            if source_index < 0 or source_index >= len(allowed_names):
-                raise ValueError(
-                    "extract_relations returned source_index out of range: "
-                    f"{source_index}"
+            if self._relation_entity_reference_mode == "index":
+                source_index = _as_int(item.get("source_index"), field_name="source_index")
+                destination_index = _as_int(
+                    item.get("destination_index"),
+                    field_name="destination_index",
                 )
-            if destination_index < 0 or destination_index >= len(allowed_names):
-                raise ValueError(
-                    "extract_relations returned destination_index out of range: "
-                    f"{destination_index}"
+                if source_index < 0 or source_index >= len(allowed_names):
+                    raise ValueError(
+                        "extract_relations returned source_index out of range: "
+                        f"{source_index}"
+                    )
+                if destination_index < 0 or destination_index >= len(allowed_names):
+                    raise ValueError(
+                        "extract_relations returned destination_index out of range: "
+                        f"{destination_index}"
+                    )
+                source_canonical = allowed_names[source_index]
+                destination_canonical = allowed_names[destination_index]
+            else:
+                source_canonical = _as_text(
+                    item.get("source"),
+                    field_name="source",
                 )
-            source_canonical = allowed_names[source_index]
-            destination_canonical = allowed_names[destination_index]
+                destination_canonical = _as_text(
+                    item.get("destination"),
+                    field_name="destination",
+                )
+                if source_canonical not in allowed_name_set:
+                    raise ValueError(
+                        "extract_relations produced source not in allowed_entity_names: "
+                        f"{source_canonical!r}"
+                    )
+                if destination_canonical not in allowed_name_set:
+                    raise ValueError(
+                        "extract_relations produced destination not in allowed_entity_names: "
+                        f"{destination_canonical!r}"
+                    )
             output.append(
                 Mem0GraphExtractedRelation(
                     source_entity_name=source_canonical,
@@ -390,6 +432,7 @@ class ZepLLMSemanticRuntime:
         max_recent_episodes: int | None = None,
         max_recent_episode_chars: int | None = None,
         max_edge_entities: int | None = None,
+        edge_entity_reference_mode: str = "name",
     ) -> None:
         if max_message_chars is not None and int(max_message_chars) <= 0:
             raise ValueError("max_message_chars must be > 0 when provided")
@@ -399,6 +442,10 @@ class ZepLLMSemanticRuntime:
             raise ValueError("max_recent_episode_chars must be > 0 when provided")
         if max_edge_entities is not None and int(max_edge_entities) <= 0:
             raise ValueError("max_edge_entities must be > 0 when provided")
+        if edge_entity_reference_mode not in {"name", "index"}:
+            raise ValueError(
+                "edge_entity_reference_mode must be one of {'name', 'index'}"
+            )
         self._helper = _JSONLLMHelper(client=client)
         self._summary_helper = (
             _JSONLLMHelper(client=summary_client)
@@ -419,6 +466,7 @@ class ZepLLMSemanticRuntime:
         self._max_edge_entities = (
             int(max_edge_entities) if max_edge_entities is not None else None
         )
+        self._edge_entity_reference_mode = str(edge_entity_reference_mode)
 
     def _bounded_text(self, text: str, *, max_chars: int | None) -> str:
         normalized = _as_text(text, field_name="text")
@@ -597,16 +645,28 @@ class ZepLLMSemanticRuntime:
         allowed_name_set = set(allowed_names)
         if not allowed_name_set:
             raise ValueError("extract_edges requires non-empty allowed_entity_names")
-        request_prompt = (
-            f"{prompt}\n"
-            "Return ONLY JSON schema:\n"
-            '{"edges":[{"source_entity_name":"...","destination_entity_name":"...","relation":"...","fact":"..."}]}\n'
-            "source_entity_name and destination_entity_name MUST be exact members of allowed_entity_names.\n"
-            f"message={_format_json(bounded_message)}\n"
-            f"entities={_format_json(entities_payload)}\n"
-            f"allowed_entity_names={_format_json(allowed_names)}\n"
-            f"recent_episodes={_format_json(recent_payload)}"
-        )
+        if self._edge_entity_reference_mode == "index":
+            request_prompt = (
+                f"{prompt}\n"
+                "Return ONLY JSON schema:\n"
+                '{"edges":[{"source_index":0,"destination_index":1,"relation":"...","fact":"..."}]}\n'
+                "source_index and destination_index MUST be valid indexes into allowed_entity_names.\n"
+                f"message={_format_json(bounded_message)}\n"
+                f"entities={_format_json(entities_payload)}\n"
+                f"allowed_entity_names={_format_json(allowed_names)}\n"
+                f"recent_episodes={_format_json(recent_payload)}"
+            )
+        else:
+            request_prompt = (
+                f"{prompt}\n"
+                "Return ONLY JSON schema:\n"
+                '{"edges":[{"source_entity_name":"...","destination_entity_name":"...","relation":"...","fact":"..."}]}\n'
+                "source_entity_name and destination_entity_name MUST be exact members of allowed_entity_names.\n"
+                f"message={_format_json(bounded_message)}\n"
+                f"entities={_format_json(entities_payload)}\n"
+                f"allowed_entity_names={_format_json(allowed_names)}\n"
+                f"recent_episodes={_format_json(recent_payload)}"
+            )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
             raise ValueError("extract_edges payload must be object")
@@ -617,24 +677,43 @@ class ZepLLMSemanticRuntime:
         for item in edges:
             if not isinstance(item, Mapping):
                 raise ValueError("edge row must be object")
-            source_entity_name = _as_text(
-                item.get("source_entity_name"),
-                field_name="source_entity_name",
-            )
-            destination_entity_name = _as_text(
-                item.get("destination_entity_name"),
-                field_name="destination_entity_name",
-            )
-            if source_entity_name not in allowed_name_set:
-                raise ValueError(
-                    "extract_edges produced source_entity_name not in allowed_entity_names: "
-                    f"{source_entity_name!r}"
+            if self._edge_entity_reference_mode == "index":
+                source_index = _as_int(item.get("source_index"), field_name="source_index")
+                destination_index = _as_int(
+                    item.get("destination_index"),
+                    field_name="destination_index",
                 )
-            if destination_entity_name not in allowed_name_set:
-                raise ValueError(
-                    "extract_edges produced destination_entity_name not in allowed_entity_names: "
-                    f"{destination_entity_name!r}"
+                if source_index < 0 or source_index >= len(allowed_names):
+                    raise ValueError(
+                        "extract_edges produced source_index out of range: "
+                        f"{source_index}"
+                    )
+                if destination_index < 0 or destination_index >= len(allowed_names):
+                    raise ValueError(
+                        "extract_edges produced destination_index out of range: "
+                        f"{destination_index}"
+                    )
+                source_entity_name = allowed_names[source_index]
+                destination_entity_name = allowed_names[destination_index]
+            else:
+                source_entity_name = _as_text(
+                    item.get("source_entity_name"),
+                    field_name="source_entity_name",
                 )
+                destination_entity_name = _as_text(
+                    item.get("destination_entity_name"),
+                    field_name="destination_entity_name",
+                )
+                if source_entity_name not in allowed_name_set:
+                    raise ValueError(
+                        "extract_edges produced source_entity_name not in allowed_entity_names: "
+                        f"{source_entity_name!r}"
+                    )
+                if destination_entity_name not in allowed_name_set:
+                    raise ValueError(
+                        "extract_edges produced destination_entity_name not in allowed_entity_names: "
+                        f"{destination_entity_name!r}"
+                    )
             output.append(
                 ZepExtractedEdge(
                     source_entity_name=source_entity_name,

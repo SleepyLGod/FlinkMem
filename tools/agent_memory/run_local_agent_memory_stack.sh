@@ -308,6 +308,7 @@ export MEM0_GRAPH_URL="bolt://localhost:${NEO4J_BOLT_PORT}"
 export MEM0_GRAPH_USERNAME="${NEO4J_USERNAME}"
 export MEM0_GRAPH_PASSWORD="${NEO4J_PASSWORD}"
 export MEM0_GRAPH_DATABASE="${NEO4J_DATABASE}"
+export MEM0_RELATION_ENTITY_REFERENCE_MODE="${MEM0_RELATION_ENTITY_REFERENCE_MODE:-name}"
 
 export ZEP_GRAPH_URI="bolt://localhost:${NEO4J_BOLT_PORT}"
 export ZEP_GRAPH_USERNAME="${NEO4J_USERNAME}"
@@ -322,6 +323,7 @@ export ZEP_EMBEDDER_PROVIDER="${ZEP_EMBEDDER_PROVIDER:-ollama}"
 export ZEP_EMBEDDER_MODEL="${ZEP_EMBEDDER_MODEL:-${MEM0_EMBEDDER_MODEL}}"
 export ZEP_EMBEDDER_OLLAMA_BASE_URL="${ZEP_EMBEDDER_OLLAMA_BASE_URL:-${MEM0_EMBEDDER_OLLAMA_BASE_URL}}"
 export ZEP_EMBEDDER_EMBEDDING_DIM="${ZEP_EMBEDDER_EMBEDDING_DIM:-${MEM0_EMBEDDER_EMBEDDING_DIM}}"
+export ZEP_EDGE_ENTITY_REFERENCE_MODE="${ZEP_EDGE_ENTITY_REFERENCE_MODE:-name}"
 
 if [[ "${MEM0_EMBEDDER_PROVIDER}" == "ollama" ]]; then
   wait_ollama "${MEM0_EMBEDDER_OLLAMA_BASE_URL}"
@@ -349,6 +351,7 @@ SMOKE_CMD=(
 echo "[stack] workflows=${WORKFLOWS} dataset_source=${DATASET_SOURCE} sample_index=${DATASET_SAMPLE_INDEX} max_messages=${DATASET_MAX_MESSAGES}"
 echo "[stack] llm_model=${SEM_RUNTIME_MODEL} timeout_s=${SEM_RUNTIME_TIMEOUT_S} max_retries=${SEM_RUNTIME_MAX_RETRIES}"
 echo "[stack] mem0_llm_model=${MEM0_LLM_MODEL} zep_llm_model=${ZEP_LLM_MODEL} zep_summary_llm_model=${ZEP_SUMMARY_LLM_MODEL}"
+echo "[stack] mem0_relation_entity_reference_mode=${MEM0_RELATION_ENTITY_REFERENCE_MODE} zep_edge_entity_reference_mode=${ZEP_EDGE_ENTITY_REFERENCE_MODE}"
 echo "[stack] embed_model=${MEM0_EMBEDDER_MODEL} embed_max_input_chars=${OLLAMA_EMBED_MAX_INPUT_CHARS}"
 "${SMOKE_CMD[@]}" 2>&1 | tee "${ARTIFACT_DIR}/smoke_stdout.log"
 

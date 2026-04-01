@@ -27,7 +27,9 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.llm_semanti
     ZepLLMSemanticRuntime,
 )
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.contracts import (
+    ZepEpisodeCandidate,
     ZepExtractedEntity,
+    ZepResolvedEntity,
 )
 
 
@@ -47,6 +49,77 @@ class _ScriptedLLMClient(LLMClient):
         return response, LLMCallMetrics(latency_ms=1.0, attempts=1)
 
 
+def test_mem0_extract_relations_uses_allowed_entity_names_by_default() -> None:
+    runtime = Mem0GraphLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "entities": [
+                            {
+                                "source": "Alice",
+                                "relationship": "knows",
+                                "destination": "Bob",
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+    )
+    result = asyncio.run(
+        runtime.extract_relations(
+            messages=["Alice knows Bob"],
+            entities=[
+                Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+                Mem0GraphExtractedEntity(entity_name="Bob", entity_type="person"),
+            ],
+            allowed_entity_names=["Alice", "Bob"],
+            prompt="extract relations",
+        )
+    )
+    assert len(result) == 1
+    assert result[0].source_entity_name == "Alice"
+    assert result[0].destination_entity_name == "Bob"
+    assert result[0].relationship == "knows"
+
+
+def test_mem0_extract_relations_rejects_unknown_name_by_default() -> None:
+    runtime = Mem0GraphLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "entities": [
+                            {
+                                "source": "Carol",
+                                "relationship": "knows",
+                                "destination": "Bob",
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+    )
+    try:
+        asyncio.run(
+            runtime.extract_relations(
+                messages=["Alice knows Bob"],
+                entities=[
+                    Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+                    Mem0GraphExtractedEntity(entity_name="Bob", entity_type="person"),
+                ],
+                allowed_entity_names=["Alice", "Bob"],
+                prompt="extract relations",
+            )
+        )
+    except ValueError as exc:
+        assert "source not in allowed_entity_names" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for unknown source entity name")
+
+
 def test_mem0_extract_relations_uses_allowed_entity_indexes() -> None:
     runtime = Mem0GraphLLMSemanticRuntime(
         client=_ScriptedLLMClient(
@@ -63,7 +136,8 @@ def test_mem0_extract_relations_uses_allowed_entity_indexes() -> None:
                     }
                 )
             ]
-        )
+        ),
+        relation_entity_reference_mode="index",
     )
     result = asyncio.run(
         runtime.extract_relations(
@@ -98,7 +172,8 @@ def test_mem0_extract_relations_rejects_out_of_range_index() -> None:
                     }
                 )
             ]
-        )
+        ),
+        relation_entity_reference_mode="index",
     )
     try:
         asyncio.run(
@@ -176,3 +251,106 @@ def test_zep_resolve_entity_rejects_target_for_new() -> None:
         assert "decision=NEW requires null target_entity_id" in str(exc)
         return
     raise AssertionError("Expected ValueError for NEW with non-null target_entity_id")
+
+
+def test_zep_extract_edges_uses_allowed_entity_indexes() -> None:
+    runtime = ZepLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "edges": [
+                            {
+                                "source_index": 0,
+                                "destination_index": 1,
+                                "relation": "knows",
+                                "fact": "Alice knows Bob",
+                            }
+                        ]
+                    }
+                )
+            ]
+        ),
+        edge_entity_reference_mode="index",
+    )
+    result = asyncio.run(
+        runtime.extract_edges(
+            message="Alice knows Bob",
+            resolved_entities=[
+                ZepResolvedEntity(
+                    entity_id="e1",
+                    entity_name="Alice",
+                    type_id="person",
+                    summary="Alice summary",
+                ),
+                ZepResolvedEntity(
+                    entity_id="e2",
+                    entity_name="Bob",
+                    type_id="person",
+                    summary="Bob summary",
+                ),
+            ],
+            allowed_entity_names=["Alice", "Bob"],
+            recent_episodes=[
+                ZepEpisodeCandidate(
+                    episode_id="ep1",
+                    content="Earlier Alice and Bob met",
+                    created_at_ms=1,
+                )
+            ],
+            prompt="extract edges",
+        )
+    )
+    assert len(result) == 1
+    assert result[0].source_entity_name == "Alice"
+    assert result[0].destination_entity_name == "Bob"
+    assert result[0].relation == "knows"
+
+
+def test_zep_extract_edges_rejects_out_of_range_index() -> None:
+    runtime = ZepLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "edges": [
+                            {
+                                "source_index": 3,
+                                "destination_index": 0,
+                                "relation": "knows",
+                                "fact": "Alice knows Bob",
+                            }
+                        ]
+                    }
+                )
+            ]
+        ),
+        edge_entity_reference_mode="index",
+    )
+    try:
+        asyncio.run(
+            runtime.extract_edges(
+                message="Alice knows Bob",
+                resolved_entities=[
+                    ZepResolvedEntity(
+                        entity_id="e1",
+                        entity_name="Alice",
+                        type_id="person",
+                        summary="Alice summary",
+                    ),
+                    ZepResolvedEntity(
+                        entity_id="e2",
+                        entity_name="Bob",
+                        type_id="person",
+                        summary="Bob summary",
+                    ),
+                ],
+                allowed_entity_names=["Alice", "Bob"],
+                recent_episodes=[],
+                prompt="extract edges",
+            )
+        )
+    except ValueError as exc:
+        assert "source_index out of range" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for out-of-range source_index")

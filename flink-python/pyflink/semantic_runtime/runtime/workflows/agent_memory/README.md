@@ -217,16 +217,20 @@ cp tools/agent_memory/.env.example .env
   `flink-python/pyflink/semantic_runtime/runtime/workflows/agent_memory/runtime/`.
   `tools/agent_memory/agent_memory_real_smoke.py` is a thin wrapper entrypoint.
 
-7. One-shot lightweight stack run with auto-cleanup:
+7. Quick run commands (copy/paste):
 
 ```bash
 cd /Users/von/Projects/FlinkMem
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
-By default this starts `MongoDB + Neo4j`, runs real workflow calls for EverMemOS/Mem0/Zep, then always removes containers.
+Default behavior:
 
-7.1 Isolated-env one-liners (copy/paste):
+- Starts `MongoDB + Neo4j`.
+- Runs real workflow calls for EverMemOS/Mem0/Zep.
+- Always removes containers after run.
+
+7.1 Isolated-env command variants:
 
 ```bash
 cd /Users/von/Projects/FlinkMem
@@ -262,6 +266,17 @@ PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
 DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
 NEO4J_PASSWORD=secret123 \
 WORKFLOWS=zep \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+```bash
+# Zep robust edge extraction mode (index-based edge endpoints)
+cd /Users/von/Projects/FlinkMem
+PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+NEO4J_PASSWORD=secret123 \
+WORKFLOWS=zep \
+ZEP_EDGE_ENTITY_REFERENCE_MODE=index \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
@@ -315,6 +330,9 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
   - `ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY` (DB write stage)
   - `ZEP_EDGE_RESOLVE_CONCURRENCY`
   - `ZEP_EDGE_WRITE_GROUP_CONCURRENCY`
+  - `ZEP_EDGE_ENTITY_REFERENCE_MODE=name|index` (default `name`)
+- Mem0 graph relation reference mode:
+  - `MEM0_RELATION_ENTITY_REFERENCE_MODE=name|index` (default `name`)
 
 12. DeepSeek + Ollama status:
 
@@ -326,6 +344,12 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 - `OLLAMA_EMBED_MAX_INPUT_CHARS` is applied at smoke-runner embedding-call boundary (default follows `MEM0_EMBEDDER_MAX_INPUT_CHARS` in stack script).
 - For Zep throughput tuning, start with `ZEP_ENTITY_SUMMARY_CONCURRENCY=8` and keep
   `ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY` lower when Neo4j write pressure becomes the bottleneck.
+- `ZEP_EDGE_ENTITY_REFERENCE_MODE` controls edge extraction contract:
+  - `name`: source/destination entity names (source-aligned behavior)
+  - `index`: source/destination indexes into `allowed_entity_names` (more robust against LLM name drift)
+- `MEM0_RELATION_ENTITY_REFERENCE_MODE` controls mem0 graph relation extraction contract:
+  - `name` (default): `source`/`destination` entity names (aligned with mem0 upstream relation tool shape)
+  - `index`: `source_index`/`destination_index` into `allowed_entity_names`
 - Mem0 smoke retrieval query uses benchmark question (`metadata.question`) to align with retrieval semantics and avoid passing long raw messages directly into embedding recall.
 - Zep Neo4j fulltext indexes are bootstrapped by runtime on startup (`node_name_and_summary`, `edge_name_and_fact`), so explicit manual index creation is not required.
 - Zep LLM prompt budget is bounded by environment knobs to avoid oversized `extract_edges` calls:
@@ -334,6 +358,35 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
   - `ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS`
   - `ZEP_PROMPT_MAX_EDGE_ENTITIES`
   - smoke defaults: `1200 / 3 / 400 / 16`
+
+13. Real-run failure patterns (from recent logs):
+
+- Mem0 graph, `name` mode can fail hard when extracted relation endpoints are not exact members of `allowed_entity_names`.
+  - Example failure shape: relation destination like `"stress relief"` while extracted entity list does not contain that exact surface form.
+  - This is not a DB outage; it is an entity-reference contract mismatch at relation extraction.
+- Zep `name` mode can fail similarly when edge endpoints drift from extracted entity names.
+- Full combined run (`evermemos,mem0,zep`) can fail even when isolated runs pass, due to aggregate LLM + embedding load causing more retries/timeouts and more lexical drift in `name` mode.
+- Neo4j startup warnings such as "label/property does not exist" are expected on empty graph startup and are not fatal by themselves.
+
+14. Upstream alignment notes (mem0 / zep):
+
+- Mem0 upstream graph extraction is name-oriented (`source`, `relationship`, `destination`) and relies on prompt/schema constraints plus normalization.
+  - Our default remains `MEM0_RELATION_ENTITY_REFERENCE_MODE=name` to stay source-aligned.
+- Zep/Graphiti upstream extraction is also name-oriented, but invalid edge endpoints are typically skipped with warnings in parts of upstream flow.
+  - We intentionally keep strict failure by default in this repo ("let it crash") to expose drift during reconstruction/evaluation.
+- Optional robust mode is provided for experiments and high-variance remote LLM outputs:
+  - `MEM0_RELATION_ENTITY_REFERENCE_MODE=index`
+  - `ZEP_EDGE_ENTITY_REFERENCE_MODE=index`
+- Practical recommendation:
+  - Use `name` mode for strict source-parity experiments.
+  - Use `index` mode for throughput/stability experiments where lexical endpoint drift is frequent.
+- Upstream references checked for this behavior:
+  - mem0 relation extraction schema and graph flow:
+    - `https://github.com/mem0ai/mem0/blob/main/mem0/graphs/tools.py`
+    - `https://github.com/mem0ai/mem0/blob/main/mem0/memory/graph_memory.py`
+  - zep/graphiti edge extraction prompt + runtime validation path:
+    - `https://github.com/getzep/graphiti/blob/main/graphiti_core/prompts/extract_edges.py`
+    - `https://github.com/getzep/graphiti/blob/main/graphiti_core/utils/maintenance/edge_operations.py`
 
 Troubleshooting (`docker: command not found`):
 
@@ -381,6 +434,27 @@ Notes:
 
 - This first isolates EverMemOS and reduces prompt size to validate end-to-end connectivity.
 - Then raise `DATASET_MAX_MESSAGES` and add back `mem0,zep`.
+
+Troubleshooting (`name mode passes sometimes, full run fails with KeyError/ValueError on entity endpoints`):
+
+```bash
+# strict source-parity mode (default)
+MEM0_RELATION_ENTITY_REFERENCE_MODE=name \
+ZEP_EDGE_ENTITY_REFERENCE_MODE=name \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+
+# robust endpoint mode for unstable lexical outputs
+MEM0_RELATION_ENTITY_REFERENCE_MODE=index \
+ZEP_EDGE_ENTITY_REFERENCE_MODE=index \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+Notes:
+
+- If isolated runs pass but full run fails, first reduce `DATASET_MAX_MESSAGES` and split workflows (`WORKFLOWS=...`) to identify load-sensitive step(s).
+- Then decide mode by experiment goal:
+  - strict parity: keep `name`
+  - robust execution baseline: use `index`
 
 ## Design Rules
 
@@ -466,6 +540,7 @@ WORKFLOWS=mem0 \
 SEM_RUNTIME_MODEL=deepseek-chat \
 SEM_RUNTIME_TIMEOUT_S=60 \
 SEM_RUNTIME_MAX_RETRIES=3 \
+MEM0_RELATION_ENTITY_REFERENCE_MODE=name \
 MEM0_EMBEDDER_MODEL=nomic-embed-text \
 MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
 OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
@@ -496,6 +571,27 @@ WORKFLOWS=evermemos,mem0,zep \
 SEM_RUNTIME_MODEL=deepseek-chat \
 SEM_RUNTIME_TIMEOUT_S=90 \
 SEM_RUNTIME_MAX_RETRIES=4 \
+MEM0_RELATION_ENTITY_REFERENCE_MODE=name \
+ZEP_EDGE_ENTITY_REFERENCE_MODE=name \
+MEM0_EMBEDDER_MODEL=nomic-embed-text \
+MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
+OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
+DATASET_SAMPLE_INDEX=0 \
+DATASET_MAX_MESSAGES=24 \
+KEEP_ARTIFACTS=true \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+4.1 Full workflows run (robust endpoint mode):
+
+```bash
+WORKFLOWS=evermemos,mem0,zep \
+SEM_RUNTIME_MODEL=deepseek-chat \
+SEM_RUNTIME_TIMEOUT_S=90 \
+SEM_RUNTIME_MAX_RETRIES=4 \
+MEM0_RELATION_ENTITY_REFERENCE_MODE=index \
+ZEP_EDGE_ENTITY_REFERENCE_MODE=index \
 MEM0_EMBEDDER_MODEL=nomic-embed-text \
 MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
 OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
