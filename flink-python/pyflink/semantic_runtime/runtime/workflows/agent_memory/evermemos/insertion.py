@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Callable, Sequence
 
@@ -130,18 +131,20 @@ class EverMemOSInsertionWorkflow:
         self._validate_scene_artifacts(scene=scene, artifacts=artifacts)
         memcell.episode = artifacts.episode
         memcell.subject = artifacts.subject
-        await self._memcell_store.update_memcell_fields(
-            memcell.memcell_id,
-            summary=memcell.summary,
-            subject=memcell.subject,
-            episode=memcell.episode,
-            topic_id=None,
-        )
-        await self._memory_artifact_store.persist_decomposition(
-            group_id=group_id,
-            memcell_id=memcell.memcell_id,
-            scene=scene,
-            artifacts=artifacts,
+        await asyncio.gather(
+            self._memcell_store.update_memcell_fields(
+                memcell.memcell_id,
+                summary=memcell.summary,
+                subject=memcell.subject,
+                episode=memcell.episode,
+                topic_id=None,
+            ),
+            self._memory_artifact_store.persist_decomposition(
+                group_id=group_id,
+                memcell_id=memcell.memcell_id,
+                scene=scene,
+                artifacts=artifacts,
+            ),
         )
 
         topic_state = await self._topic_state_store.load_state(group_id)
@@ -161,11 +164,13 @@ class EverMemOSInsertionWorkflow:
 
         profile_updated = False
         if topic_assignment.cluster_size >= self._config.profile_min_memcells:
-            cluster_memcells = await self._memcell_store.list_memcells_by_topic(
-                group_id,
-                topic_assignment.topic_id,
+            cluster_memcells, old_profiles = await asyncio.gather(
+                self._memcell_store.list_memcells_by_topic(
+                    group_id,
+                    topic_assignment.topic_id,
+                ),
+                self._profile_store.load_profiles(group_id),
             )
-            old_profiles = await self._profile_store.load_profiles(group_id)
             updated_profiles = await self._semantic_runtime.distill_profiles(
                 cluster_memcells=cluster_memcells,
                 old_profiles=old_profiles,
@@ -284,4 +289,3 @@ class EverMemOSInsertionWorkflow:
 
     def _count_extracted_artifacts(self, *, artifacts: DecompositionArtifacts) -> int:
         return 1 + len(artifacts.foresights) + len(artifacts.event_logs)
-

@@ -320,3 +320,57 @@ def test_zep_add_episode_rejects_existing_entity_id_outside_candidates() -> None
         raise AssertionError("Expected ValueError for invalid EXISTING target_entity_id")
     except ValueError as exc:
         assert "not present in candidates" in str(exc)
+
+
+def test_zep_add_episode_summarizes_after_edge_writes() -> None:
+    ordering_state: Dict[str, bool] = {"edge_written": False}
+
+    class _EdgeAwareStore(_ScriptedGraphStore):
+        async def upsert_edge(
+            self,
+            *,
+            group_id: str,
+            source_entity_id: str,
+            destination_entity_id: str,
+            relation: str,
+            fact: str,
+            invalidates_edge_id: str | None,
+        ) -> str:
+            ordering_state["edge_written"] = True
+            return await super().upsert_edge(
+                group_id=group_id,
+                source_entity_id=source_entity_id,
+                destination_entity_id=destination_entity_id,
+                relation=relation,
+                fact=fact,
+                invalidates_edge_id=invalidates_edge_id,
+            )
+
+    class _OrderRuntime(_ScriptedSemanticRuntime):
+        async def summarize_entity(
+            self,
+            *,
+            extracted_entity: ZepExtractedEntity,
+            message: str,
+            recent_episodes: Sequence[ZepEpisodeCandidate],
+            prompt: str,
+        ) -> str:
+            _ = (extracted_entity, message, recent_episodes, prompt)
+            if not ordering_state["edge_written"]:
+                raise RuntimeError("summarize_entity called before edge writes")
+            return "final summary"
+
+    workflow = ZepAddEpisodeWorkflow(
+        config=ZepWorkflowConfig(),
+        semantic_runtime=_OrderRuntime(),
+        graph_store=_EdgeAwareStore(),
+    )
+    result = asyncio.run(
+        workflow.add_episode(
+            group_id="g1",
+            message="Alice met Bob and talked about work",
+            valid_at_ms=1234,
+        )
+    )
+    assert result.added_edge_count == 1
+    assert ordering_state["edge_written"] is True

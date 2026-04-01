@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.concurrency import (
+    amap_grouped_serial_bounded,
+    amap_ordered_bounded,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     RetrievedMemory,
 )
@@ -22,6 +27,14 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.interfaces imp
     Mem0FactStore,
     Mem0LLMFactSearcher,
 )
+
+
+@dataclass(frozen=True)
+class _FactPlan:
+    """One extracted fact paired with one resolved operation decision."""
+
+    fact: str
+    resolution: Mem0FactResolution
 
 
 class Mem0BasicWorkflow:
@@ -63,30 +76,59 @@ class Mem0BasicWorkflow:
                 prompt=self._config.fact_extraction_prompt,
             )
         )
-        operations: List[Mem0BasicOperation] = []
+        if not facts:
+            return Mem0BasicAddResult(
+                extracted_fact_count=0,
+                added=0,
+                updated=0,
+                deleted=0,
+                noop=0,
+                operations=[],
+            )
+        candidates_by_fact = await amap_ordered_bounded(
+            items=facts,
+            concurrency=self._config.fact_resolve_concurrency,
+            worker=lambda index, fact: self._search_fact_candidates(
+                index=index,
+                group_id=group_id,
+                fact=fact,
+            ),
+        )
+        resolutions = list(
+            await self._semantic_runtime.resolve_facts(
+                facts=facts,
+                candidates_by_fact=candidates_by_fact,
+                prompt=self._config.fact_resolution_prompt,
+            )
+        )
+        if len(resolutions) != len(facts):
+            raise ValueError(
+                "resolve_facts must return exactly one resolution per extracted fact"
+            )
+        fact_plans: list[_FactPlan] = []
+        for index, (fact, resolution) in enumerate(zip(facts, resolutions, strict=True)):
+            if resolution.fact != fact:
+                raise ValueError(
+                    "resolve_facts returned fact mismatch at index="
+                    f"{index}: expected={fact!r} actual={resolution.fact!r}"
+                )
+            fact_plans.append(_FactPlan(fact=fact, resolution=resolution))
+        operations = await amap_grouped_serial_bounded(
+            items=fact_plans,
+            group_key=self._fact_write_group_key,
+            concurrency=self._config.fact_write_group_concurrency,
+            worker=lambda index, plan: self._apply_resolution(
+                group_id=group_id,
+                fact=plan.fact,
+                resolution=plan.resolution,
+            ),
+        )
+
         added = 0
         updated = 0
         deleted = 0
         noop = 0
-
-        for fact in facts:
-            candidates = await self._search_candidates(
-                group_id=group_id,
-                query=fact,
-                top_k=self._config.similar_top_k,
-                memory_types=sorted(self._config.memory_types),
-            )
-            resolution = await self._semantic_runtime.resolve_fact(
-                fact=fact,
-                candidates=candidates,
-                prompt=self._config.fact_resolution_prompt,
-            )
-            operation = await self._apply_resolution(
-                group_id=group_id,
-                fact=fact,
-                resolution=resolution,
-            )
-            operations.append(operation)
+        for operation in operations:
             if operation.action == "ADD":
                 added += 1
             elif operation.action == "UPDATE":
@@ -160,6 +202,35 @@ class Mem0BasicWorkflow:
             top_k=top_k,
             memory_types=memory_types,
         )
+
+    async def _search_fact_candidates(
+        self,
+        *,
+        index: int,
+        group_id: str,
+        fact: str,
+    ) -> Sequence[RetrievedMemory]:
+        _ = index
+        candidates = await self._search_candidates(
+            group_id=group_id,
+            query=fact,
+            top_k=self._config.similar_top_k,
+            memory_types=sorted(self._config.memory_types),
+        )
+        return candidates
+
+    def _fact_write_group_key(self, index: int, plan: _FactPlan) -> str:
+        action = str(plan.resolution.action)
+        if action in {"UPDATE", "DELETE"}:
+            memory_id = str(plan.resolution.target_memory_id)
+            if not memory_id:
+                raise ValueError(
+                    "target_memory_id is required for UPDATE/DELETE write grouping"
+                )
+            return f"memory:{memory_id}"
+        if action in {"ADD", "NONE"}:
+            return f"fact:{index}"
+        raise ValueError(f"unsupported resolution action for grouping: {action!r}")
 
     async def _apply_resolution(
         self,

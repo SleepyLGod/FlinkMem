@@ -13,6 +13,10 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts im
     TopicAssignmentResult,
     TopicClusterState,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.concurrency import (
+    amap_grouped_serial_bounded,
+    amap_ordered_bounded,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.interfaces import (
     ConversationBufferStore,
     ConversationStatusStore,
@@ -32,6 +36,8 @@ __all__ = [
     "ConversationBufferStore",
     "ConversationMessage",
     "ConversationStatusStore",
+    "amap_grouped_serial_bounded",
+    "amap_ordered_bounded",
     "DecompositionArtifacts",
     "EventLogArtifact",
     "ForesightArtifact",

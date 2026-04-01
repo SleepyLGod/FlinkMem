@@ -568,6 +568,42 @@ async def _run_mem0_workflow(
         fallback=llm_config,
     )
     llm_client = create_llm_client(mem0_llm_config)
+    mem0_basic_fact_resolve_concurrency = int(
+        os.getenv(
+            "MEM0_BASIC_FACT_RESOLVE_CONCURRENCY",
+            str(Mem0BasicConfig().fact_resolve_concurrency),
+        )
+    )
+    mem0_basic_fact_write_group_concurrency = int(
+        os.getenv(
+            "MEM0_BASIC_FACT_WRITE_GROUP_CONCURRENCY",
+            str(Mem0BasicConfig().fact_write_group_concurrency),
+        )
+    )
+    mem0_graph_entity_resolve_concurrency = int(
+        os.getenv(
+            "MEM0_GRAPH_ENTITY_RESOLVE_CONCURRENCY",
+            str(Mem0GraphConfig().entity_resolve_concurrency),
+        )
+    )
+    mem0_graph_entity_upsert_group_concurrency = int(
+        os.getenv(
+            "MEM0_GRAPH_ENTITY_UPSERT_GROUP_CONCURRENCY",
+            str(Mem0GraphConfig().entity_upsert_group_concurrency),
+        )
+    )
+    mem0_graph_relation_resolve_concurrency = int(
+        os.getenv(
+            "MEM0_GRAPH_RELATION_RESOLVE_CONCURRENCY",
+            str(Mem0GraphConfig().relation_resolve_concurrency),
+        )
+    )
+    mem0_graph_relation_write_group_concurrency = int(
+        os.getenv(
+            "MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY",
+            str(Mem0GraphConfig().relation_write_group_concurrency),
+        )
+    )
     try:
         bundle = build_mem0_external_bundle(
             backend_config=backend_config,
@@ -578,7 +614,11 @@ async def _run_mem0_workflow(
 
         basic_runtime = Mem0BasicLLMSemanticRuntime(client=llm_client)
         basic_workflow = Mem0BasicWorkflow(
-            config=Mem0BasicConfig(recall_backend="embedding"),
+            config=Mem0BasicConfig(
+                recall_backend="embedding",
+                fact_resolve_concurrency=mem0_basic_fact_resolve_concurrency,
+                fact_write_group_concurrency=mem0_basic_fact_write_group_concurrency,
+            ),
             semantic_runtime=basic_runtime,
             fact_store=bundle.fact_store,
             fact_searcher=bundle.fact_searcher,
@@ -616,6 +656,14 @@ async def _run_mem0_workflow(
             config=Mem0GraphConfig(
                 entity_recall_backend="embedding",
                 relation_recall_backend="embedding",
+                entity_resolve_concurrency=mem0_graph_entity_resolve_concurrency,
+                entity_upsert_group_concurrency=(
+                    mem0_graph_entity_upsert_group_concurrency
+                ),
+                relation_resolve_concurrency=mem0_graph_relation_resolve_concurrency,
+                relation_write_group_concurrency=(
+                    mem0_graph_relation_write_group_concurrency
+                ),
             ),
             semantic_runtime=graph_runtime,
             graph_store=bundle.graph_store,
@@ -725,6 +773,36 @@ async def _run_zep_workflow(
             str(DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES),
         )
     )
+    zep_entity_resolve_concurrency = int(
+        os.getenv(
+            "ZEP_ENTITY_RESOLVE_CONCURRENCY",
+            str(ZepWorkflowConfig().entity_resolve_concurrency),
+        )
+    )
+    zep_entity_upsert_group_concurrency = int(
+        os.getenv(
+            "ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY",
+            str(ZepWorkflowConfig().entity_upsert_group_concurrency),
+        )
+    )
+    zep_entity_summary_concurrency = int(
+        os.getenv(
+            "ZEP_ENTITY_SUMMARY_CONCURRENCY",
+            str(ZepWorkflowConfig().entity_summary_concurrency),
+        )
+    )
+    zep_edge_resolve_concurrency = int(
+        os.getenv(
+            "ZEP_EDGE_RESOLVE_CONCURRENCY",
+            str(ZepWorkflowConfig().edge_resolve_concurrency),
+        )
+    )
+    zep_edge_write_group_concurrency = int(
+        os.getenv(
+            "ZEP_EDGE_WRITE_GROUP_CONCURRENCY",
+            str(ZepWorkflowConfig().edge_write_group_concurrency),
+        )
+    )
     try:
         bundle = build_zep_external_bundle(
             backend_config=backend_config,
@@ -739,7 +817,13 @@ async def _run_zep_workflow(
             max_edge_entities=zep_prompt_max_edge_entities,
         )
         workflow = ZepAddEpisodeWorkflow(
-            config=ZepWorkflowConfig(),
+            config=ZepWorkflowConfig(
+                entity_resolve_concurrency=zep_entity_resolve_concurrency,
+                entity_upsert_group_concurrency=zep_entity_upsert_group_concurrency,
+                entity_summary_concurrency=zep_entity_summary_concurrency,
+                edge_resolve_concurrency=zep_edge_resolve_concurrency,
+                edge_write_group_concurrency=zep_edge_write_group_concurrency,
+            ),
             semantic_runtime=runtime,
             graph_store=bundle.graph_store,
         )

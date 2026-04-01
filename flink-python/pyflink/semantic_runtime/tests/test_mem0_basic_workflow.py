@@ -95,19 +95,22 @@ class _ScriptedSemanticRuntime:
         self.extract_prompts.append(prompt)
         return list(self._facts)
 
-    async def resolve_fact(
+    async def resolve_facts(
         self,
         *,
-        fact: str,
-        candidates: Sequence[RetrievedMemory],
+        facts: Sequence[str],
+        candidates_by_fact: Sequence[Sequence[RetrievedMemory]],
         prompt: str,
-    ) -> Mem0FactResolution:
-        _ = candidates
+    ) -> Sequence[Mem0FactResolution]:
+        _ = candidates_by_fact
         self.resolve_calls += 1
         self.resolve_prompts.append(prompt)
-        if fact not in self._resolutions:
-            raise KeyError(f"no scripted resolution for fact={fact!r}")
-        return self._resolutions[fact]
+        output: list[Mem0FactResolution] = []
+        for fact in facts:
+            if fact not in self._resolutions:
+                raise KeyError(f"no scripted resolution for fact={fact!r}")
+            output.append(self._resolutions[fact])
+        return output
 
 
 def test_mem0_basic_add_executes_all_actions() -> None:
@@ -187,9 +190,9 @@ def test_mem0_basic_add_executes_all_actions() -> None:
     assert result.deleted == 1
     assert result.noop == 1
     assert runtime.extract_calls == 1
-    assert runtime.resolve_calls == 4
+    assert runtime.resolve_calls == 1
     assert runtime.extract_prompts == [Mem0BasicConfig().fact_extraction_prompt]
-    assert runtime.resolve_prompts == [Mem0BasicConfig().fact_resolution_prompt] * 4
+    assert runtime.resolve_prompts == [Mem0BasicConfig().fact_resolution_prompt]
     assert searcher.calls == 4
 
 
@@ -220,6 +223,76 @@ def test_mem0_basic_search_uses_searcher() -> None:
     assert len(result.memories) == 1
     assert result.memories[0].memory_id == "m1"
     assert searcher.calls == 1
+
+
+def test_mem0_basic_add_no_facts_short_circuits() -> None:
+    runtime = _ScriptedSemanticRuntime(facts=[], resolutions={})
+    workflow = Mem0BasicWorkflow(
+        config=Mem0BasicConfig(),
+        semantic_runtime=runtime,
+        fact_store=_InMemoryFactStore(),
+        fact_searcher=_ScriptedSearcher({}),
+    )
+    result = asyncio.run(
+        workflow.add(
+            group_id="g1",
+            messages=["message"],
+        )
+    )
+    assert result.extracted_fact_count == 0
+    assert result.added == 0
+    assert result.updated == 0
+    assert result.deleted == 0
+    assert result.noop == 0
+    assert len(result.operations) == 0
+    assert runtime.resolve_calls == 0
+
+
+def test_mem0_basic_add_rejects_fact_mismatch_from_resolution() -> None:
+    class _MismatchedRuntime(_ScriptedSemanticRuntime):
+        async def resolve_facts(
+            self,
+            *,
+            facts: Sequence[str],
+            candidates_by_fact: Sequence[Sequence[RetrievedMemory]],
+            prompt: str,
+        ) -> Sequence[Mem0FactResolution]:
+            _ = (facts, candidates_by_fact, prompt)
+            return [
+                Mem0FactResolution(
+                    action="NONE",
+                    fact="unexpected",
+                    reason="bad",
+                    confidence=0.1,
+                )
+            ]
+
+    workflow = Mem0BasicWorkflow(
+        config=Mem0BasicConfig(),
+        semantic_runtime=_MismatchedRuntime(
+            facts=["expected"],
+            resolutions={
+                "expected": Mem0FactResolution(
+                    action="NONE",
+                    fact="expected",
+                    reason="ok",
+                    confidence=0.9,
+                )
+            },
+        ),
+        fact_store=_InMemoryFactStore(),
+        fact_searcher=_ScriptedSearcher({}),
+    )
+    try:
+        asyncio.run(
+            workflow.add(
+                group_id="g1",
+                messages=["message"],
+            )
+        )
+        raise AssertionError("Expected ValueError for fact mismatch")
+    except ValueError as exc:
+        assert "fact mismatch" in str(exc)
 
 
 def test_mem0_basic_llm_recall_backend_uses_llm_searcher() -> None:

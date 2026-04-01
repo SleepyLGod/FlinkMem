@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, Tuple
 
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.concurrency import (
+    amap_grouped_serial_bounded,
+    amap_ordered_bounded,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.config import (
     Mem0GraphConfig,
 )
@@ -11,8 +16,10 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.contracts impo
     Mem0GraphAddResult,
     Mem0GraphEntityCandidate,
     Mem0GraphExtractedEntity,
+    Mem0GraphExtractedRelation,
     Mem0GraphRelationCandidate,
     Mem0GraphRelationOperation,
+    Mem0GraphRelationResolution,
     Mem0GraphSearchResult,
 )
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.interfaces import (
@@ -23,6 +30,24 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.interfaces imp
     Mem0GraphSemanticRuntime,
     Mem0GraphStore,
 )
+
+
+@dataclass(frozen=True)
+class _EntityPlan:
+    """One extracted entity plus dedup target decided by semantic runtime."""
+
+    entity: Mem0GraphExtractedEntity
+    existing_entity_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class _RelationPlan:
+    """One extracted relation bound to concrete entity ids and action resolution."""
+
+    relation: Mem0GraphExtractedRelation
+    source_entity_id: str
+    destination_entity_id: str
+    resolution: Mem0GraphRelationResolution
 
 
 def _normalize_entity_name_key(value: str) -> str:
@@ -75,10 +100,28 @@ class Mem0GraphWorkflow:
                 prompt=self._config.entity_extraction_prompt,
             )
         )
-        entity_ids = await self._resolve_entities(
-            group_id=group_id,
-            entities=entities,
+        entity_plans = await amap_ordered_bounded(
+            items=entities,
+            concurrency=self._config.entity_resolve_concurrency,
+            worker=lambda index, entity: self._resolve_entity_plan(
+                index=index,
+                group_id=group_id,
+                entity=entity,
+            ),
         )
+        entity_rows = await amap_grouped_serial_bounded(
+            items=entity_plans,
+            group_key=self._entity_upsert_group_key,
+            concurrency=self._config.entity_upsert_group_concurrency,
+            worker=lambda index, plan: self._upsert_entity_plan(
+                index=index,
+                group_id=group_id,
+                plan=plan,
+            ),
+        )
+        entity_ids: Dict[str, str] = {}
+        for entity_name, entity_id in entity_rows:
+            entity_ids[entity_name] = entity_id
         normalized_entity_ids: Dict[str, str] = {}
         for entity_name, entity_id in entity_ids.items():
             normalized_name = _normalize_entity_name_key(entity_name)
@@ -99,80 +142,41 @@ class Mem0GraphWorkflow:
             )
         )
 
-        operations: List[Mem0GraphRelationOperation] = []
+        relation_plans = await amap_ordered_bounded(
+            items=relations,
+            concurrency=self._config.relation_resolve_concurrency,
+            worker=lambda index, relation: self._resolve_relation_plan(
+                index=index,
+                group_id=group_id,
+                relation=relation,
+                normalized_entity_ids=normalized_entity_ids,
+            ),
+        )
+        operations = await amap_grouped_serial_bounded(
+            items=relation_plans,
+            group_key=self._relation_write_group_key,
+            concurrency=self._config.relation_write_group_concurrency,
+            worker=lambda index, plan: self._apply_relation_plan(
+                index=index,
+                group_id=group_id,
+                plan=plan,
+            ),
+        )
+
         added_relations = 0
         updated_relations = 0
         deleted_relations = 0
-
-        for relation in relations:
-            normalized_source = _normalize_entity_name_key(relation.source_entity_name)
-            normalized_destination = _normalize_entity_name_key(
-                relation.destination_entity_name
-            )
-            if normalized_source not in normalized_entity_ids:
-                raise ValueError(
-                    "extract_relations returned source entity outside resolved set: "
-                    f"{relation.source_entity_name!r}"
-                )
-            if normalized_destination not in normalized_entity_ids:
-                raise ValueError(
-                    "extract_relations returned destination entity outside resolved set: "
-                    f"{relation.destination_entity_name!r}"
-                )
-            source_entity_id = normalized_entity_ids[normalized_source]
-            destination_entity_id = normalized_entity_ids[normalized_destination]
-            candidates = await self._search_relation_candidates(
-                group_id=group_id,
-                query=relation.relationship,
-                top_k=self._config.relation_recall_top_k,
-                source_entity_id=source_entity_id,
-                destination_entity_id=destination_entity_id,
-            )
-            resolution = await self._semantic_runtime.resolve_relation(
-                relation=relation,
-                candidates=candidates,
-                prompt=self._config.relation_resolution_prompt,
-            )
-
-            if resolution.action == "NEW":
-                relation_id = await self._graph_store.add_relation(
-                    group_id=group_id,
-                    source_entity_id=source_entity_id,
-                    destination_entity_id=destination_entity_id,
-                    relationship=resolution.relationship,
-                )
+        for operation in operations:
+            if operation.action == "NEW":
                 added_relations += 1
-            elif resolution.action == "AUGMENTS":
-                relation_id = str(resolution.target_relation_id)
-                await self._graph_store.update_relation(
-                    group_id=group_id,
-                    relation_id=relation_id,
-                    relationship=resolution.relationship,
-                )
+            elif operation.action == "AUGMENTS":
                 updated_relations += 1
-            elif resolution.action == "CONTRADICTS":
-                relation_id = str(resolution.target_relation_id)
-                await self._graph_store.delete_relation(
-                    group_id=group_id,
-                    relation_id=relation_id,
-                )
+            elif operation.action == "CONTRADICTS":
                 deleted_relations += 1
             else:
                 raise RuntimeError(
-                    f"unsupported relation action={resolution.action!r}"
+                    f"unsupported relation action={operation.action!r}"
                 )
-
-            operations.append(
-                Mem0GraphRelationOperation(
-                    action=resolution.action,
-                    relation_id=relation_id,
-                    source_entity_id=source_entity_id,
-                    destination_entity_id=destination_entity_id,
-                    relationship=resolution.relationship,
-                    reason=str(resolution.reason),
-                    confidence=float(resolution.confidence),
-                )
-            )
 
         return Mem0GraphAddResult(
             extracted_entity_count=len(entities),
@@ -217,43 +221,160 @@ class Mem0GraphWorkflow:
             },
         )
 
-    async def _resolve_entities(
+    async def _resolve_entity_plan(
         self,
         *,
+        index: int,
         group_id: str,
-        entities: Sequence[Mem0GraphExtractedEntity],
-    ) -> Dict[str, str]:
-        entity_ids: Dict[str, str] = {}
-        for entity in entities:
-            candidates = await self._search_entity_candidates(
+        entity: Mem0GraphExtractedEntity,
+    ) -> _EntityPlan:
+        _ = index
+        candidates = await self._search_entity_candidates(
+            group_id=group_id,
+            query=entity.entity_name,
+            top_k=self._config.entity_recall_top_k,
+        )
+        candidate_entity_ids = {candidate.entity_id for candidate in candidates}
+        resolution = await self._semantic_runtime.resolve_entity(
+            entity=entity,
+            candidates=candidates,
+            prompt=self._config.entity_identity_prompt,
+        )
+        if resolution.decision == "SAME":
+            existing_entity_id = str(resolution.target_entity_id)
+            if existing_entity_id not in candidate_entity_ids:
+                raise ValueError(
+                    "resolve_entity returned SAME target_entity_id "
+                    f"not present in candidates: entity_name={entity.entity_name!r} "
+                    f"target_entity_id={existing_entity_id!r}"
+                )
+        else:
+            existing_entity_id = None
+        return _EntityPlan(entity=entity, existing_entity_id=existing_entity_id)
+
+    def _entity_upsert_group_key(self, index: int, plan: _EntityPlan) -> str:
+        _ = index
+        return _normalize_entity_name_key(plan.entity.entity_name)
+
+    async def _upsert_entity_plan(
+        self,
+        *,
+        index: int,
+        group_id: str,
+        plan: _EntityPlan,
+    ) -> Tuple[str, str]:
+        _ = index
+        entity_id = await self._graph_store.upsert_entity(
+            group_id=group_id,
+            entity_name=plan.entity.entity_name,
+            entity_type=plan.entity.entity_type,
+            existing_entity_id=plan.existing_entity_id,
+        )
+        return (plan.entity.entity_name, entity_id)
+
+    async def _resolve_relation_plan(
+        self,
+        *,
+        index: int,
+        group_id: str,
+        relation: Mem0GraphExtractedRelation,
+        normalized_entity_ids: Dict[str, str],
+    ) -> _RelationPlan:
+        _ = index
+        normalized_source = _normalize_entity_name_key(relation.source_entity_name)
+        normalized_destination = _normalize_entity_name_key(
+            relation.destination_entity_name
+        )
+        if normalized_source not in normalized_entity_ids:
+            raise ValueError(
+                "extract_relations returned source entity outside resolved set: "
+                f"{relation.source_entity_name!r}"
+            )
+        if normalized_destination not in normalized_entity_ids:
+            raise ValueError(
+                "extract_relations returned destination entity outside resolved set: "
+                f"{relation.destination_entity_name!r}"
+            )
+        source_entity_id = normalized_entity_ids[normalized_source]
+        destination_entity_id = normalized_entity_ids[normalized_destination]
+        candidates = await self._search_relation_candidates(
+            group_id=group_id,
+            query=relation.relationship,
+            top_k=self._config.relation_recall_top_k,
+            source_entity_id=source_entity_id,
+            destination_entity_id=destination_entity_id,
+        )
+        resolution = await self._semantic_runtime.resolve_relation(
+            relation=relation,
+            candidates=candidates,
+            prompt=self._config.relation_resolution_prompt,
+        )
+        return _RelationPlan(
+            relation=relation,
+            source_entity_id=source_entity_id,
+            destination_entity_id=destination_entity_id,
+            resolution=resolution,
+        )
+
+    def _relation_write_group_key(self, index: int, plan: _RelationPlan) -> str:
+        action = str(plan.resolution.action)
+        if action in {"AUGMENTS", "CONTRADICTS"}:
+            relation_id = str(plan.resolution.target_relation_id)
+            if not relation_id:
+                raise ValueError(
+                    "target_relation_id is required for AUGMENTS/CONTRADICTS "
+                    "write grouping"
+                )
+            return f"relation:{relation_id}"
+        if action == "NEW":
+            relation_key = " ".join(str(plan.resolution.relationship).split()).casefold()
+            return (
+                f"new:{plan.source_entity_id}:"
+                f"{plan.destination_entity_id}:{relation_key}"
+            )
+        raise RuntimeError(f"unsupported relation action={action!r} at index={index}")
+
+    async def _apply_relation_plan(
+        self,
+        *,
+        index: int,
+        group_id: str,
+        plan: _RelationPlan,
+    ) -> Mem0GraphRelationOperation:
+        _ = index
+        action = str(plan.resolution.action)
+        if action == "NEW":
+            relation_id = await self._graph_store.add_relation(
                 group_id=group_id,
-                query=entity.entity_name,
-                top_k=self._config.entity_recall_top_k,
+                source_entity_id=plan.source_entity_id,
+                destination_entity_id=plan.destination_entity_id,
+                relationship=plan.resolution.relationship,
             )
-            candidate_entity_ids = {candidate.entity_id for candidate in candidates}
-            resolution = await self._semantic_runtime.resolve_entity(
-                entity=entity,
-                candidates=candidates,
-                prompt=self._config.entity_identity_prompt,
-            )
-            if resolution.decision == "SAME":
-                existing_entity_id = str(resolution.target_entity_id)
-                if existing_entity_id not in candidate_entity_ids:
-                    raise ValueError(
-                        "resolve_entity returned SAME target_entity_id "
-                        f"not present in candidates: entity_name={entity.entity_name!r} "
-                        f"target_entity_id={existing_entity_id!r}"
-                    )
-            else:
-                existing_entity_id = None
-            entity_id = await self._graph_store.upsert_entity(
+        elif action == "AUGMENTS":
+            relation_id = str(plan.resolution.target_relation_id)
+            await self._graph_store.update_relation(
                 group_id=group_id,
-                entity_name=entity.entity_name,
-                entity_type=entity.entity_type,
-                existing_entity_id=existing_entity_id,
+                relation_id=relation_id,
+                relationship=plan.resolution.relationship,
             )
-            entity_ids[entity.entity_name] = entity_id
-        return entity_ids
+        elif action == "CONTRADICTS":
+            relation_id = str(plan.resolution.target_relation_id)
+            await self._graph_store.delete_relation(
+                group_id=group_id,
+                relation_id=relation_id,
+            )
+        else:
+            raise RuntimeError(f"unsupported relation action={action!r}")
+
+        return Mem0GraphRelationOperation(
+            action=action,
+            relation_id=relation_id,
+            source_entity_id=plan.source_entity_id,
+            destination_entity_id=plan.destination_entity_id,
+            relationship=plan.resolution.relationship,
+            reason=str(plan.resolution.reason),
+            confidence=float(plan.resolution.confidence),
+        )
 
     async def _search_entity_candidates(
         self,

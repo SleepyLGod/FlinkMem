@@ -70,14 +70,14 @@ class Mem0BasicSemanticRuntime(Protocol):
     ) -> Sequence[str]:
         """Extract standalone facts from input messages."""
 
-    async def resolve_fact(
+    async def resolve_facts(
         self,
         *,
-        fact: str,
-        candidates: Sequence[RetrievedMemory],
+        facts: Sequence[str],
+        candidates_by_fact: Sequence[Sequence[RetrievedMemory]],
         prompt: str,
-    ) -> Mem0FactResolution:
-        """Resolve one fact into one memory operation."""
+    ) -> Sequence[Mem0FactResolution]:
+        """Resolve all extracted facts into one operation list in fact order."""
 
 
 class Mem0GraphStore(Protocol):

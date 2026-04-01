@@ -118,41 +118,87 @@ class Mem0BasicLLMSemanticRuntime:
             output.append(_as_text(item, field_name="fact"))
         return output
 
-    async def resolve_fact(
+    async def resolve_facts(
         self,
         *,
-        fact: str,
-        candidates: Sequence[RetrievedMemory],
+        facts: Sequence[str],
+        candidates_by_fact: Sequence[Sequence[RetrievedMemory]],
         prompt: str,
-    ) -> Mem0FactResolution:
-        candidates_payload = [
-            {
-                "memory_id": candidate.memory_id,
-                "content": candidate.content,
-                "memory_type": candidate.memory_type,
-                "score": candidate.score,
-            }
-            for candidate in candidates
-        ]
+    ) -> Sequence[Mem0FactResolution]:
+        if len(facts) != len(candidates_by_fact):
+            raise ValueError(
+                "resolve_facts requires facts and candidates_by_fact with equal lengths"
+            )
+        fact_rows = []
+        for index, (fact, candidates) in enumerate(
+            zip(facts, candidates_by_fact, strict=True)
+        ):
+            fact_rows.append(
+                {
+                    "fact_index": index,
+                    "fact": fact,
+                    "candidates": [
+                        {
+                            "memory_id": candidate.memory_id,
+                            "content": candidate.content,
+                            "memory_type": candidate.memory_type,
+                            "score": candidate.score,
+                        }
+                        for candidate in candidates
+                    ],
+                }
+            )
         request_prompt = (
             f"{prompt}\n"
             "Return ONLY JSON schema:\n"
-            '{"action":"ADD|UPDATE|DELETE|NONE","fact":"...","target_memory_id":"...|null",'
-            '"content":"...|null","reason":"...","confidence":0.0}\n'
-            f"fact={_format_json(fact)}\n"
-            f"candidates={_format_json(candidates_payload)}"
+            '{"decisions":[{"fact_index":0,"action":"ADD|UPDATE|DELETE|NONE",'
+            '"target_memory_id":"...|null","content":"...|null","reason":"...",'
+            '"confidence":0.0}]}\n'
+            f"facts={_format_json(fact_rows)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
-            raise ValueError("resolve_fact payload must be object")
-        return Mem0FactResolution(
-            action=_as_text(payload.get("action"), field_name="action"),
-            fact=_as_text(payload.get("fact"), field_name="fact"),
-            target_memory_id=_as_str_or_none(payload.get("target_memory_id")),
-            content=_as_str_or_none(payload.get("content")),
-            reason=str(payload.get("reason", "")),
-            confidence=_as_float(payload.get("confidence", 0.0), field_name="confidence"),
-        )
+            raise ValueError("resolve_facts payload must be object")
+        decisions = payload.get("decisions")
+        if not isinstance(decisions, list):
+            raise ValueError("resolve_facts payload.decisions must be list")
+
+        resolutions: list[Mem0FactResolution | None] = [None] * len(facts)
+        seen_indexes: set[int] = set()
+        for item in decisions:
+            if not isinstance(item, Mapping):
+                raise ValueError("resolve_facts decision row must be object")
+            fact_index = _as_int(item.get("fact_index"), field_name="fact_index")
+            if fact_index < 0 or fact_index >= len(facts):
+                raise ValueError(
+                    f"resolve_facts returned out-of-range fact_index={fact_index}"
+                )
+            if fact_index in seen_indexes:
+                raise ValueError(
+                    f"resolve_facts returned duplicate fact_index={fact_index}"
+                )
+            seen_indexes.add(fact_index)
+            expected_fact = _as_text(facts[fact_index], field_name="facts[]")
+            resolutions[fact_index] = Mem0FactResolution(
+                action=_as_text(item.get("action"), field_name="action"),
+                fact=expected_fact,
+                target_memory_id=_as_str_or_none(item.get("target_memory_id")),
+                content=_as_str_or_none(item.get("content")),
+                reason=str(item.get("reason", "")),
+                confidence=_as_float(item.get("confidence", 0.0), field_name="confidence"),
+            )
+        if len(seen_indexes) != len(facts):
+            raise ValueError(
+                "resolve_facts must return exactly one decision per input fact"
+            )
+        output: list[Mem0FactResolution] = []
+        for index, resolution in enumerate(resolutions):
+            if resolution is None:
+                raise RuntimeError(
+                    f"resolve_facts produced no resolution for fact_index={index}"
+                )
+            output.append(resolution)
+        return output
 
 
 class Mem0GraphLLMSemanticRuntime:

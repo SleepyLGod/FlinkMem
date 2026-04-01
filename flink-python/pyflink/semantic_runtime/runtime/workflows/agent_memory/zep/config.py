@@ -9,6 +9,11 @@ DEFAULT_ZEP_RECENT_EPISODE_LIMIT = 10
 DEFAULT_ZEP_ENTITY_CANDIDATE_TOP_K = 4
 DEFAULT_ZEP_EDGE_CANDIDATE_TOP_K = 4
 DEFAULT_ZEP_DEDUP_SCORE_THRESHOLD = 0.6
+DEFAULT_ZEP_ENTITY_RESOLVE_CONCURRENCY = 8
+DEFAULT_ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY = 8
+DEFAULT_ZEP_ENTITY_SUMMARY_CONCURRENCY = 8
+DEFAULT_ZEP_EDGE_RESOLVE_CONCURRENCY = 8
+DEFAULT_ZEP_EDGE_WRITE_GROUP_CONCURRENCY = 8
 
 DEFAULT_ZEP_ENTITY_EXTRACTION_PROMPT = (
     "Extract entity nodes mentioned explicitly or implicitly in CURRENT MESSAGE. "
@@ -40,6 +45,13 @@ class ZepWorkflowConfig:
     entity_candidate_top_k: int = DEFAULT_ZEP_ENTITY_CANDIDATE_TOP_K
     edge_candidate_top_k: int = DEFAULT_ZEP_EDGE_CANDIDATE_TOP_K
     dedup_score_threshold: float = DEFAULT_ZEP_DEDUP_SCORE_THRESHOLD
+    entity_resolve_concurrency: int = DEFAULT_ZEP_ENTITY_RESOLVE_CONCURRENCY
+    entity_upsert_group_concurrency: int = (
+        DEFAULT_ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY
+    )
+    entity_summary_concurrency: int = DEFAULT_ZEP_ENTITY_SUMMARY_CONCURRENCY
+    edge_resolve_concurrency: int = DEFAULT_ZEP_EDGE_RESOLVE_CONCURRENCY
+    edge_write_group_concurrency: int = DEFAULT_ZEP_EDGE_WRITE_GROUP_CONCURRENCY
 
     entity_extraction_prompt: str = DEFAULT_ZEP_ENTITY_EXTRACTION_PROMPT
     entity_dedup_prompt: str = DEFAULT_ZEP_ENTITY_DEDUP_PROMPT
@@ -56,6 +68,16 @@ class ZepWorkflowConfig:
             raise ValueError("edge_candidate_top_k must be > 0")
         if not (0.0 <= float(self.dedup_score_threshold) <= 1.0):
             raise ValueError("dedup_score_threshold must be within [0, 1]")
+        if int(self.entity_resolve_concurrency) <= 0:
+            raise ValueError("entity_resolve_concurrency must be > 0")
+        if int(self.entity_upsert_group_concurrency) <= 0:
+            raise ValueError("entity_upsert_group_concurrency must be > 0")
+        if int(self.entity_summary_concurrency) <= 0:
+            raise ValueError("entity_summary_concurrency must be > 0")
+        if int(self.edge_resolve_concurrency) <= 0:
+            raise ValueError("edge_resolve_concurrency must be > 0")
+        if int(self.edge_write_group_concurrency) <= 0:
+            raise ValueError("edge_write_group_concurrency must be > 0")
         if not self.entity_extraction_prompt.strip():
             raise ValueError("entity_extraction_prompt must be non-empty")
         if not self.entity_dedup_prompt.strip():

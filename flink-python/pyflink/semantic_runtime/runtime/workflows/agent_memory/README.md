@@ -309,6 +309,12 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
   - `MEMORY_INPUT_SCOPE_POLICY=none|sliding|session` (default `none`)
   - `MEMORY_INPUT_SCOPE_SLIDING_SIZE` (used when `sliding`)
   - `MEMORY_INPUT_SCOPE_SESSION_GAP_MS` (used when `session`)
+- Zep intra-message concurrency knobs:
+  - `ZEP_ENTITY_RESOLVE_CONCURRENCY`
+  - `ZEP_ENTITY_SUMMARY_CONCURRENCY` (LLM summary generation stage)
+  - `ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY` (DB write stage)
+  - `ZEP_EDGE_RESOLVE_CONCURRENCY`
+  - `ZEP_EDGE_WRITE_GROUP_CONCURRENCY`
 
 12. DeepSeek + Ollama status:
 
@@ -318,6 +324,8 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 - Embedding now uses Ollama (`/api/embeddings`) via `MEM0_EMBEDDER_OLLAMA_BASE_URL` + `MEM0_EMBEDDER_MODEL`.
 - For long-memory updates, set `MEM0_EMBEDDER_MAX_INPUT_CHARS` (default in smoke stack: `512`) to avoid Ollama context overflow on very long fact content.
 - `OLLAMA_EMBED_MAX_INPUT_CHARS` is applied at smoke-runner embedding-call boundary (default follows `MEM0_EMBEDDER_MAX_INPUT_CHARS` in stack script).
+- For Zep throughput tuning, start with `ZEP_ENTITY_SUMMARY_CONCURRENCY=8` and keep
+  `ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY` lower when Neo4j write pressure becomes the bottleneck.
 - Mem0 smoke retrieval query uses benchmark question (`metadata.question`) to align with retrieval semantics and avoid passing long raw messages directly into embedding recall.
 - Zep Neo4j fulltext indexes are bootstrapped by runtime on startup (`node_name_and_summary`, `edge_name_and_fact`), so explicit manual index creation is not required.
 - Zep LLM prompt budget is bounded by environment knobs to avoid oversized `extract_edges` calls:

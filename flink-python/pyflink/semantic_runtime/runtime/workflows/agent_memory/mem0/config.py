@@ -9,6 +9,8 @@ from typing import FrozenSet
 DEFAULT_MEM0_BASIC_SIMILAR_TOP_K = 5
 DEFAULT_MEM0_BASIC_SEARCH_TOP_K = 10
 DEFAULT_MEM0_BASIC_MEMORY_TYPES = frozenset({"fact"})
+DEFAULT_MEM0_BASIC_FACT_RESOLVE_CONCURRENCY = 8
+DEFAULT_MEM0_BASIC_FACT_WRITE_GROUP_CONCURRENCY = 8
 VALID_MEM0_RECALL_BACKENDS = frozenset({"embedding", "llm"})
 DEFAULT_MEM0_RECALL_BACKEND = "embedding"
 DEFAULT_MEM0_GRAPH_ENTITY_RECALL_TOP_K = 1
@@ -16,6 +18,10 @@ DEFAULT_MEM0_GRAPH_RELATION_RECALL_TOP_K = 5
 DEFAULT_MEM0_GRAPH_SEARCH_TOP_K = 10
 DEFAULT_MEM0_GRAPH_ENTITY_RECALL_BACKEND = "embedding"
 DEFAULT_MEM0_GRAPH_RELATION_RECALL_BACKEND = "embedding"
+DEFAULT_MEM0_GRAPH_ENTITY_RESOLVE_CONCURRENCY = 8
+DEFAULT_MEM0_GRAPH_ENTITY_UPSERT_GROUP_CONCURRENCY = 8
+DEFAULT_MEM0_GRAPH_RELATION_RESOLVE_CONCURRENCY = 8
+DEFAULT_MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY = 8
 
 # Source prompt references:
 # - https://raw.githubusercontent.com/mem0ai/mem0/main/mem0/configs/prompts.py
@@ -80,6 +86,10 @@ class Mem0BasicConfig:
     search_top_k: int = DEFAULT_MEM0_BASIC_SEARCH_TOP_K
     memory_types: FrozenSet[str] = DEFAULT_MEM0_BASIC_MEMORY_TYPES
     recall_backend: str = DEFAULT_MEM0_RECALL_BACKEND
+    fact_resolve_concurrency: int = DEFAULT_MEM0_BASIC_FACT_RESOLVE_CONCURRENCY
+    fact_write_group_concurrency: int = (
+        DEFAULT_MEM0_BASIC_FACT_WRITE_GROUP_CONCURRENCY
+    )
 
     def __post_init__(self) -> None:
         if not self.fact_extraction_prompt.strip():
@@ -96,6 +106,10 @@ class Mem0BasicConfig:
             raise ValueError(
                 f"recall_backend must be one of {sorted(VALID_MEM0_RECALL_BACKENDS)!r}"
             )
+        if int(self.fact_resolve_concurrency) <= 0:
+            raise ValueError("fact_resolve_concurrency must be > 0")
+        if int(self.fact_write_group_concurrency) <= 0:
+            raise ValueError("fact_write_group_concurrency must be > 0")
 
 
 @dataclass(frozen=True)
@@ -111,6 +125,14 @@ class Mem0GraphConfig:
     search_top_k: int = DEFAULT_MEM0_GRAPH_SEARCH_TOP_K
     entity_recall_backend: str = DEFAULT_MEM0_GRAPH_ENTITY_RECALL_BACKEND
     relation_recall_backend: str = DEFAULT_MEM0_GRAPH_RELATION_RECALL_BACKEND
+    entity_resolve_concurrency: int = DEFAULT_MEM0_GRAPH_ENTITY_RESOLVE_CONCURRENCY
+    entity_upsert_group_concurrency: int = (
+        DEFAULT_MEM0_GRAPH_ENTITY_UPSERT_GROUP_CONCURRENCY
+    )
+    relation_resolve_concurrency: int = DEFAULT_MEM0_GRAPH_RELATION_RESOLVE_CONCURRENCY
+    relation_write_group_concurrency: int = (
+        DEFAULT_MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY
+    )
 
     def __post_init__(self) -> None:
         if not self.entity_extraction_prompt.strip():
@@ -137,3 +159,11 @@ class Mem0GraphConfig:
                 "relation_recall_backend must be one of "
                 f"{sorted(VALID_MEM0_RECALL_BACKENDS)!r}"
             )
+        if int(self.entity_resolve_concurrency) <= 0:
+            raise ValueError("entity_resolve_concurrency must be > 0")
+        if int(self.entity_upsert_group_concurrency) <= 0:
+            raise ValueError("entity_upsert_group_concurrency must be > 0")
+        if int(self.relation_resolve_concurrency) <= 0:
+            raise ValueError("relation_resolve_concurrency must be > 0")
+        if int(self.relation_write_group_concurrency) <= 0:
+            raise ValueError("relation_write_group_concurrency must be > 0")
