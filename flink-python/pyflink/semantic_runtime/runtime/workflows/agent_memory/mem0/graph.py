@@ -25,6 +25,13 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.interfaces imp
 )
 
 
+def _normalize_entity_name_key(value: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError("entity_name must be non-empty")
+    return " ".join(text.split()).casefold()
+
+
 class Mem0GraphWorkflow:
     """Reconstruct Mem0 Graph flow with strict dependency injection."""
 
@@ -72,11 +79,22 @@ class Mem0GraphWorkflow:
             group_id=group_id,
             entities=entities,
         )
+        normalized_entity_ids: Dict[str, str] = {}
+        for entity_name, entity_id in entity_ids.items():
+            normalized_name = _normalize_entity_name_key(entity_name)
+            previous_entity_id = normalized_entity_ids.get(normalized_name)
+            if previous_entity_id is not None and previous_entity_id != entity_id:
+                raise ValueError(
+                    "ambiguous normalized entity name maps to multiple entity ids: "
+                    f"{entity_name!r}"
+                )
+            normalized_entity_ids[normalized_name] = entity_id
 
         relations = list(
             await self._semantic_runtime.extract_relations(
                 messages=list(messages),
                 entities=entities,
+                allowed_entity_names=list(entity_ids.keys()),
                 prompt=self._config.relation_extraction_prompt,
             )
         )
@@ -87,8 +105,22 @@ class Mem0GraphWorkflow:
         deleted_relations = 0
 
         for relation in relations:
-            source_entity_id = entity_ids[relation.source_entity_name]
-            destination_entity_id = entity_ids[relation.destination_entity_name]
+            normalized_source = _normalize_entity_name_key(relation.source_entity_name)
+            normalized_destination = _normalize_entity_name_key(
+                relation.destination_entity_name
+            )
+            if normalized_source not in normalized_entity_ids:
+                raise ValueError(
+                    "extract_relations returned source entity outside resolved set: "
+                    f"{relation.source_entity_name!r}"
+                )
+            if normalized_destination not in normalized_entity_ids:
+                raise ValueError(
+                    "extract_relations returned destination entity outside resolved set: "
+                    f"{relation.destination_entity_name!r}"
+                )
+            source_entity_id = normalized_entity_ids[normalized_source]
+            destination_entity_id = normalized_entity_ids[normalized_destination]
             candidates = await self._search_relation_candidates(
                 group_id=group_id,
                 query=relation.relationship,
@@ -198,16 +230,22 @@ class Mem0GraphWorkflow:
                 query=entity.entity_name,
                 top_k=self._config.entity_recall_top_k,
             )
+            candidate_entity_ids = {candidate.entity_id for candidate in candidates}
             resolution = await self._semantic_runtime.resolve_entity(
                 entity=entity,
                 candidates=candidates,
                 prompt=self._config.entity_identity_prompt,
             )
-            existing_entity_id = (
-                str(resolution.target_entity_id)
-                if resolution.decision == "SAME"
-                else None
-            )
+            if resolution.decision == "SAME":
+                existing_entity_id = str(resolution.target_entity_id)
+                if existing_entity_id not in candidate_entity_ids:
+                    raise ValueError(
+                        "resolve_entity returned SAME target_entity_id "
+                        f"not present in candidates: entity_name={entity.entity_name!r} "
+                        f"target_entity_id={existing_entity_id!r}"
+                    )
+            else:
+                existing_entity_id = None
             entity_id = await self._graph_store.upsert_entity(
                 group_id=group_id,
                 entity_name=entity.entity_name,

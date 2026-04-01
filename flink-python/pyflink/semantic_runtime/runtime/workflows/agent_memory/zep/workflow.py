@@ -74,6 +74,7 @@ class ZepAddEpisodeWorkflow:
                 query=entity.entity_name,
                 top_k=self._config.entity_candidate_top_k,
             )
+            candidate_entity_ids = {candidate.entity_id for candidate in candidates}
             resolution = await self._semantic_runtime.resolve_entity(
                 extracted_entity=entity,
                 candidates=candidates,
@@ -87,11 +88,16 @@ class ZepAddEpisodeWorkflow:
                 recent_episodes=recent_episodes,
                 prompt=self._config.entity_summary_prompt,
             )
-            existing_entity_id = (
-                str(resolution.target_entity_id)
-                if resolution.decision == "EXISTING"
-                else None
-            )
+            if resolution.decision == "EXISTING":
+                existing_entity_id = str(resolution.target_entity_id)
+                if existing_entity_id not in candidate_entity_ids:
+                    raise ValueError(
+                        "resolve_entity returned EXISTING target_entity_id "
+                        f"not present in candidates: entity_name={entity.entity_name!r} "
+                        f"target_entity_id={existing_entity_id!r}"
+                    )
+            else:
+                existing_entity_id = None
             entity_id = await self._graph_store.upsert_entity(
                 group_id=group_id,
                 entity_name=entity.entity_name,
@@ -113,6 +119,7 @@ class ZepAddEpisodeWorkflow:
             await self._semantic_runtime.extract_edges(
                 message=message,
                 resolved_entities=resolved_entities,
+                allowed_entity_names=list(entity_name_to_id.keys()),
                 recent_episodes=recent_episodes,
                 prompt=self._config.edge_extraction_prompt,
             )
@@ -123,6 +130,16 @@ class ZepAddEpisodeWorkflow:
         contradicted_edge_count = 0
 
         for edge in extracted_edges:
+            if edge.source_entity_name not in entity_name_to_id:
+                raise ValueError(
+                    "extract_edges returned source entity outside resolved set: "
+                    f"{edge.source_entity_name!r}"
+                )
+            if edge.destination_entity_name not in entity_name_to_id:
+                raise ValueError(
+                    "extract_edges returned destination entity outside resolved set: "
+                    f"{edge.destination_entity_name!r}"
+                )
             source_entity_id = entity_name_to_id[edge.source_entity_name]
             destination_entity_id = entity_name_to_id[edge.destination_entity_name]
             candidates = await self._graph_store.search_edge_candidates(

@@ -186,9 +186,10 @@ class _ScriptedGraphSemanticRuntime:
         *,
         messages: Sequence[str],
         entities: Sequence[Mem0GraphExtractedEntity],
+        allowed_entity_names: Sequence[str],
         prompt: str,
     ) -> Sequence[Mem0GraphExtractedRelation]:
-        _ = (messages, entities)
+        _ = (messages, entities, allowed_entity_names)
         self.relation_extract_prompts.append(prompt)
         return list(self._relations)
 
@@ -553,11 +554,135 @@ def test_mem0_graph_default_prompts_align_with_mem0_tool_schema() -> None:
     assert "extract_entities" in DEFAULT_MEM0_GRAPH_ENTITY_EXTRACTION_PROMPT
     assert "entity_type" in DEFAULT_MEM0_GRAPH_ENTITY_EXTRACTION_PROMPT
     assert "establish_relationships" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
-    assert "source" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
-    assert "destination" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
+    assert "source_index" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
+    assert "destination_index" in DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT
     assert "SAME|DIFFERENT" in DEFAULT_MEM0_GRAPH_ENTITY_IDENTITY_PROMPT
     assert "add_graph_memory" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT
     assert "update_graph_memory" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT
     assert "delete_graph_memory" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT
     assert "source_type" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT
     assert "destination_type" in DEFAULT_MEM0_GRAPH_RELATION_RESOLUTION_PROMPT
+
+
+def test_mem0_graph_add_rejects_same_target_entity_id_outside_candidates() -> None:
+    store = _InMemoryGraphStore()
+    runtime = _ScriptedGraphSemanticRuntime(
+        entities=[Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person")],
+        relations=[],
+        entity_resolutions={
+            "Alice": Mem0GraphEntityResolution(
+                decision="SAME",
+                entity_name="Alice",
+                target_entity_id="e_missing",
+            )
+        },
+        relation_resolutions={},
+    )
+    entity_searcher = _ScriptedEntitySearcher(
+        {
+            "Alice": [
+                Mem0GraphEntityCandidate(
+                    entity_id="e_existing",
+                    entity_name="Alice",
+                    entity_type="person",
+                    score=0.91,
+                    source="vector",
+                )
+            ]
+        }
+    )
+
+    workflow = Mem0GraphWorkflow(
+        config=Mem0GraphConfig(),
+        semantic_runtime=runtime,
+        graph_store=store,
+        entity_searcher=entity_searcher,
+        relation_searcher=_ScriptedRelationSearcher({}),
+    )
+
+    try:
+        asyncio.run(workflow.add(group_id="g1", messages=["Alice says hello"]))
+    except ValueError as exc:
+        assert "not present in candidates" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for SAME target_entity_id outside candidates")
+
+
+def test_mem0_graph_add_rejects_relation_entity_outside_resolved_set() -> None:
+    store = _InMemoryGraphStore()
+    runtime = _ScriptedGraphSemanticRuntime(
+        entities=[Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person")],
+        relations=[
+            Mem0GraphExtractedRelation(
+                source_entity_name="Alice",
+                relationship="mentions",
+                destination_entity_name="Bob",
+            )
+        ],
+        entity_resolutions={
+            "Alice": Mem0GraphEntityResolution(
+                decision="DIFFERENT",
+                entity_name="Alice",
+            )
+        },
+        relation_resolutions={},
+    )
+    workflow = Mem0GraphWorkflow(
+        config=Mem0GraphConfig(),
+        semantic_runtime=runtime,
+        graph_store=store,
+        entity_searcher=_ScriptedEntitySearcher({}),
+        relation_searcher=_ScriptedRelationSearcher({}),
+    )
+
+    try:
+        asyncio.run(workflow.add(group_id="g1", messages=["Alice mentions Bob"]))
+    except ValueError as exc:
+        assert "destination entity outside resolved set" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for relation entity outside resolved set")
+
+
+def test_mem0_graph_add_accepts_relation_entity_with_case_whitespace_variation() -> None:
+    store = _InMemoryGraphStore()
+    runtime = _ScriptedGraphSemanticRuntime(
+        entities=[
+            Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+            Mem0GraphExtractedEntity(entity_name="Bob", entity_type="person"),
+        ],
+        relations=[
+            Mem0GraphExtractedRelation(
+                source_entity_name="  alice  ",
+                relationship="mentions",
+                destination_entity_name="BOB",
+            )
+        ],
+        entity_resolutions={
+            "Alice": Mem0GraphEntityResolution(
+                decision="DIFFERENT",
+                entity_name="Alice",
+            ),
+            "Bob": Mem0GraphEntityResolution(
+                decision="DIFFERENT",
+                entity_name="Bob",
+            ),
+        },
+        relation_resolutions={
+            ("  alice  ", "mentions", "BOB"): Mem0GraphRelationResolution(
+                action="NEW",
+                source_entity_name="  alice  ",
+                destination_entity_name="BOB",
+                relationship="mentions",
+            )
+        },
+    )
+    workflow = Mem0GraphWorkflow(
+        config=Mem0GraphConfig(),
+        semantic_runtime=runtime,
+        graph_store=store,
+        entity_searcher=_ScriptedEntitySearcher({}),
+        relation_searcher=_ScriptedRelationSearcher({}),
+    )
+
+    result = asyncio.run(workflow.add(group_id="g1", messages=["Alice mentions Bob"]))
+    assert result.added_relations == 1

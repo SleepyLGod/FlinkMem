@@ -302,6 +302,31 @@ def test_mem0_faiss_fact_backend_crud_and_search(monkeypatch) -> None:
     assert len(results_final) == 0
 
 
+def test_mem0_faiss_fact_backend_applies_embedding_input_cap(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.external_runtime._ensure_faiss_module",
+        lambda: _FakeFaissModule(),
+    )
+    captured_inputs: List[str] = []
+
+    def _capturing_embedding_fn(text: str) -> Sequence[float]:
+        captured_inputs.append(text)
+        return _embedding_fn(text)
+
+    backend = Mem0FaissFactBackend(
+        embedding_fn=_capturing_embedding_fn,
+        max_embedding_input_chars=16,
+    )
+
+    asyncio.run(
+        backend.add_fact(
+            group_id="g1",
+            content="abcdefghijklmnopqrstuvwxyz",
+        )
+    )
+    assert captured_inputs[0] == "abcdefghijklmnop"
+
+
 def test_mem0_graph_store_and_embedding_searchers(monkeypatch) -> None:
     monkeypatch.setattr(
         "pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.external_runtime._ensure_faiss_module",

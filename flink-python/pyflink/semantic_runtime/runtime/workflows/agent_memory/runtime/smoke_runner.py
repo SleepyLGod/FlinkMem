@@ -56,7 +56,7 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep import (
 
 
 DEFAULT_LLM_BACKEND = "openai"
-DEFAULT_LLM_MODEL = "deepseek-reasoner"
+DEFAULT_LLM_MODEL = "deepseek-chat"
 DEFAULT_LLM_API_BASE = "https://api.deepseek.com/v1"
 DEFAULT_LLM_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEFAULT_LLM_TIMEOUT_S = 60.0
@@ -68,14 +68,15 @@ DEFAULT_OLLAMA_EMBED_MODEL = "all-minilm"
 DEFAULT_OLLAMA_TIMEOUT_S = 30
 DEFAULT_OLLAMA_MAX_RETRIES = 3
 DEFAULT_OLLAMA_RETRY_BASE_DELAY_S = 0.5
+DEFAULT_OLLAMA_EMBED_MAX_INPUT_CHARS = 512
 
 DEFAULT_DATASET_SOURCE = "longmemeval"
 DEFAULT_DATASET_SAMPLE_INDEX = 0
 DEFAULT_DATASET_MAX_MESSAGES = 24
-DEFAULT_ZEP_PROMPT_MESSAGE_MAX_CHARS = 1_600
-DEFAULT_ZEP_PROMPT_MAX_RECENT_EPISODES = 4
-DEFAULT_ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS = 600
-DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES = 24
+DEFAULT_ZEP_PROMPT_MESSAGE_MAX_CHARS = 1_200
+DEFAULT_ZEP_PROMPT_MAX_RECENT_EPISODES = 3
+DEFAULT_ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS = 400
+DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES = 16
 DEFAULT_INPUT_SCOPE_POLICY = "none"
 VALID_INPUT_SCOPE_POLICIES = frozenset({"none", "sliding", "session"})
 DEFAULT_INPUT_SCOPE_SLIDING_SIZE = 8
@@ -137,6 +138,7 @@ def _create_ollama_embedding_fn(
     timeout_s: int,
     max_retries: int,
     retry_base_delay_s: float,
+    max_input_chars: int | None,
 ):
     normalized_base_url = str(base_url).rstrip("/")
     normalized_model = str(model).strip()
@@ -148,11 +150,15 @@ def _create_ollama_embedding_fn(
         raise ValueError("ollama max_retries must be > 0")
     if float(retry_base_delay_s) <= 0.0:
         raise ValueError("ollama retry_base_delay_s must be > 0")
+    if max_input_chars is not None and int(max_input_chars) <= 0:
+        raise ValueError("ollama max_input_chars must be > 0 when provided")
 
     def _embed(text: str) -> Sequence[float]:
         normalized_text = str(text).strip()
         if not normalized_text:
             raise ValueError("embedding text must be non-empty")
+        if max_input_chars is not None and len(normalized_text) > max_input_chars:
+            normalized_text = normalized_text[:max_input_chars]
         request_data = json.dumps(
             {"model": normalized_model, "prompt": normalized_text},
             ensure_ascii=False,
@@ -285,6 +291,83 @@ def _build_llm_config() -> LLMClientConfig:
         model=model,
         api_base=api_base,
         api_key_env=api_key_env,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        retry_base_delay_s=retry_base_delay_s,
+    )
+
+
+def _build_workflow_llm_config(
+    *,
+    workflow_name: str,
+    fallback: LLMClientConfig,
+) -> LLMClientConfig:
+    """Build workflow-specific LLM config with fallback to SEM_RUNTIME_* defaults."""
+    if workflow_name == "mem0":
+        prefix = "MEM0_LLM_"
+    elif workflow_name == "zep":
+        prefix = "ZEP_LLM_"
+    else:
+        return fallback
+
+    return _build_prefixed_llm_config(prefix=prefix, fallback=fallback)
+
+
+def _build_prefixed_llm_config(
+    *,
+    prefix: str,
+    fallback: LLMClientConfig,
+) -> LLMClientConfig:
+    """Build LLM config from an env prefix, with fallback defaults."""
+
+    backend = os.getenv(f"{prefix}PROVIDER", fallback.backend).strip()
+    model = os.getenv(f"{prefix}MODEL", fallback.model).strip()
+    api_base_raw = os.getenv(f"{prefix}BASE_URL")
+    api_base = (
+        api_base_raw.strip()
+        if api_base_raw is not None and api_base_raw.strip()
+        else fallback.api_base
+    )
+    timeout_s = float(os.getenv(f"{prefix}TIMEOUT_S", str(fallback.timeout_s)))
+    max_retries = int(os.getenv(f"{prefix}MAX_RETRIES", str(fallback.max_retries)))
+    retry_base_delay_s = float(
+        os.getenv(
+            f"{prefix}RETRY_BASE_DELAY_S",
+            str(fallback.retry_base_delay_s),
+        )
+    )
+
+    api_key_env = os.getenv(f"{prefix}API_KEY_ENV", "").strip()
+    api_key_raw = os.getenv(f"{prefix}API_KEY")
+    if api_key_env:
+        resolved_api_key_env = api_key_env
+    elif api_key_raw is not None and api_key_raw.strip():
+        runtime_key_env = f"{prefix}API_KEY_RUNTIME"
+        os.environ[runtime_key_env] = api_key_raw.strip()
+        resolved_api_key_env = runtime_key_env
+    else:
+        resolved_api_key_env = fallback.api_key_env
+
+    if not backend:
+        raise ValueError(f"{prefix}PROVIDER must be non-empty when provided")
+    if not model:
+        raise ValueError(f"{prefix}MODEL must be non-empty when provided")
+    if api_base is None or not str(api_base).strip():
+        raise ValueError(f"{prefix}BASE_URL must be non-empty when provided")
+    if timeout_s <= 0:
+        raise ValueError(f"{prefix}TIMEOUT_S must be > 0")
+    if max_retries <= 0:
+        raise ValueError(f"{prefix}MAX_RETRIES must be > 0")
+    if retry_base_delay_s <= 0:
+        raise ValueError(f"{prefix}RETRY_BASE_DELAY_S must be > 0")
+    if not resolved_api_key_env:
+        raise ValueError(f"{prefix}API_KEY_ENV must be non-empty")
+
+    return LLMClientConfig(
+        backend=backend,
+        model=model,
+        api_base=api_base,
+        api_key_env=resolved_api_key_env,
         timeout_s=timeout_s,
         max_retries=max_retries,
         retry_base_delay_s=retry_base_delay_s,
@@ -480,7 +563,11 @@ async def _run_mem0_workflow(
     )
     backend_config = Mem0BackendConfig.from_env()
     clients = create_mem0_external_clients(backend_config=backend_config)
-    llm_client = create_llm_client(llm_config)
+    mem0_llm_config = _build_workflow_llm_config(
+        workflow_name="mem0",
+        fallback=llm_config,
+    )
+    llm_client = create_llm_client(mem0_llm_config)
     try:
         bundle = build_mem0_external_bundle(
             backend_config=backend_config,
@@ -601,7 +688,19 @@ async def _run_zep_workflow(
     )
     backend_config = ZepBackendConfig.from_env()
     clients = create_zep_external_clients(backend_config=backend_config)
-    llm_client = create_llm_client(llm_config)
+    zep_llm_config = _build_workflow_llm_config(
+        workflow_name="zep",
+        fallback=llm_config,
+    )
+    zep_summary_llm_config = _build_prefixed_llm_config(
+        prefix="ZEP_SUMMARY_LLM_",
+        fallback=zep_llm_config,
+    )
+    llm_client = create_llm_client(zep_llm_config)
+    if zep_summary_llm_config == zep_llm_config:
+        summary_llm_client = llm_client
+    else:
+        summary_llm_client = create_llm_client(zep_summary_llm_config)
     zep_prompt_message_max_chars = int(
         os.getenv(
             "ZEP_PROMPT_MESSAGE_MAX_CHARS",
@@ -633,6 +732,7 @@ async def _run_zep_workflow(
         )
         runtime = ZepLLMSemanticRuntime(
             client=llm_client,
+            summary_client=summary_llm_client,
             max_message_chars=zep_prompt_message_max_chars,
             max_recent_episodes=zep_prompt_max_recent_episodes,
             max_recent_episode_chars=zep_prompt_recent_episode_max_chars,
@@ -677,6 +777,8 @@ async def _run_zep_workflow(
             "max_scope_size": max(len(event.scope_messages) for event in replay_events),
         }
     finally:
+        if summary_llm_client is not llm_client:
+            await _close_component(summary_llm_client)
         await _close_component(llm_client)
         clients.close()
 
@@ -729,12 +831,19 @@ async def _main_async(args: argparse.Namespace) -> Mapping[str, Any]:
             str(DEFAULT_OLLAMA_RETRY_BASE_DELAY_S),
         )
     )
+    ollama_embed_max_input_chars = int(
+        os.getenv(
+            "OLLAMA_EMBED_MAX_INPUT_CHARS",
+            str(DEFAULT_OLLAMA_EMBED_MAX_INPUT_CHARS),
+        )
+    )
     embedding_fn = _create_ollama_embedding_fn(
         base_url=ollama_base,
         model=ollama_model,
         timeout_s=ollama_timeout_s,
         max_retries=ollama_max_retries,
         retry_base_delay_s=ollama_retry_base_delay_s,
+        max_input_chars=ollama_embed_max_input_chars,
     )
     output: Dict[str, Any] = {
         "dataset": {

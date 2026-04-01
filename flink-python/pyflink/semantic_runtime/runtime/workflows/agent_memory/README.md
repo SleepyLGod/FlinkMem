@@ -152,6 +152,8 @@ export EVERMEMOS_MILVUS_ENABLED="false"
 export MEM0_EMBEDDER_PROVIDER="ollama"
 export MEM0_EMBEDDER_MODEL="all-minilm"
 export MEM0_EMBEDDER_OLLAMA_BASE_URL="http://localhost:11434"
+export MEM0_EMBEDDER_MAX_INPUT_CHARS="512"
+export OLLAMA_EMBED_MAX_INPUT_CHARS="512"
 export MEM0_VECTOR_PROVIDER="faiss"
 export MEM0_VECTOR_PATH="/tmp/mem0-faiss"
 
@@ -184,7 +186,13 @@ export DEEPSEEK_API_KEY="your_deepseek_key"
 # optional overrides (defaults already match DeepSeek OpenAI-compatible API)
 export SEM_RUNTIME_API_KEY_ENV="DEEPSEEK_API_KEY"
 export SEM_RUNTIME_API_BASE="https://api.deepseek.com/v1"
-export SEM_RUNTIME_MODEL="deepseek-reasoner"
+export SEM_RUNTIME_MODEL="deepseek-chat"
+
+# optional per-workflow overrides
+export MEM0_LLM_MODEL="deepseek-chat"
+export ZEP_LLM_MODEL="deepseek-chat"
+# optional step-level override (defaults to ZEP_LLM_MODEL)
+export ZEP_SUMMARY_LLM_MODEL="deepseek-reasoner"
 
 # required dataset path (choose one)
 export LONGMEMEVAL_DATASET_PATH="/absolute/path/longmemeval_s_cleaned.json"
@@ -305,7 +313,11 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 12. DeepSeek + Ollama status:
 
 - LLM calls now use `LLMClientConfig(backend=openai)` with DeepSeek-compatible endpoint.
+- `MEM0_LLM_*` and `ZEP_LLM_*` now override `SEM_RUNTIME_*` for their respective workflows in smoke runs.
+- `ZEP_SUMMARY_LLM_*` can override the `summarize_entity` stage only (defaults to `ZEP_LLM_*`).
 - Embedding now uses Ollama (`/api/embeddings`) via `MEM0_EMBEDDER_OLLAMA_BASE_URL` + `MEM0_EMBEDDER_MODEL`.
+- For long-memory updates, set `MEM0_EMBEDDER_MAX_INPUT_CHARS` (default in smoke stack: `512`) to avoid Ollama context overflow on very long fact content.
+- `OLLAMA_EMBED_MAX_INPUT_CHARS` is applied at smoke-runner embedding-call boundary (default follows `MEM0_EMBEDDER_MAX_INPUT_CHARS` in stack script).
 - Mem0 smoke retrieval query uses benchmark question (`metadata.question`) to align with retrieval semantics and avoid passing long raw messages directly into embedding recall.
 - Zep Neo4j fulltext indexes are bootstrapped by runtime on startup (`node_name_and_summary`, `edge_name_and_fact`), so explicit manual index creation is not required.
 - Zep LLM prompt budget is bounded by environment knobs to avoid oversized `extract_edges` calls:
@@ -313,6 +325,7 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
   - `ZEP_PROMPT_MAX_RECENT_EPISODES`
   - `ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS`
   - `ZEP_PROMPT_MAX_EDGE_ENTITIES`
+  - smoke defaults: `1200 / 3 / 400 / 16`
 
 Troubleshooting (`docker: command not found`):
 
@@ -341,6 +354,7 @@ Notes:
 
 - `OLLAMA_MAX_RETRIES` and `OLLAMA_RETRY_BASE_DELAY_S` control embedding retry for transient Ollama 429/5xx.
 - Keep these low-to-moderate (for example `4~8`) to avoid overloading local CPU inference.
+- If you hit `input length exceeds context length`, lower `MEM0_EMBEDDER_MAX_INPUT_CHARS` and `OLLAMA_EMBED_MAX_INPUT_CHARS` (for example `256~1024`).
 
 Troubleshooting (`sem_map LLM call failed ... timeout`):
 
@@ -419,3 +433,89 @@ Run workflow-specific tests:
 
 1. Zep Q7/Q8 (community-level fusion + naming) is still TODO.
 2. Prompt/predicate parity should be tracked by tests to avoid drift from upstream workflow specs.
+
+## Recommended Run Commands
+
+Use these as the default command schemes from repository root.
+
+1. Baseline single-workflow smoke (fast fail surface, easiest to debug):
+
+```bash
+WORKFLOWS=evermemos \
+SEM_RUNTIME_MODEL=deepseek-chat \
+SEM_RUNTIME_TIMEOUT_S=60 \
+SEM_RUNTIME_MAX_RETRIES=3 \
+DATASET_MAX_MESSAGES=12 \
+KEEP_ARTIFACTS=true \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+2. Mem0 isolated run with strict embedding bounds:
+
+```bash
+WORKFLOWS=mem0 \
+SEM_RUNTIME_MODEL=deepseek-chat \
+SEM_RUNTIME_TIMEOUT_S=60 \
+SEM_RUNTIME_MAX_RETRIES=3 \
+MEM0_EMBEDDER_MODEL=nomic-embed-text \
+MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
+OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
+DATASET_MAX_MESSAGES=24 \
+KEEP_ARTIFACTS=true \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+3. Zep isolated run with separated summary model:
+
+```bash
+WORKFLOWS=zep \
+ZEP_LLM_MODEL=deepseek-chat \
+ZEP_SUMMARY_LLM_MODEL=deepseek-reasoner \
+SEM_RUNTIME_TIMEOUT_S=120 \
+SEM_RUNTIME_MAX_RETRIES=4 \
+DATASET_MAX_MESSAGES=24 \
+KEEP_ARTIFACTS=true \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+4. Full workflows run (comparison baseline):
+
+```bash
+WORKFLOWS=evermemos,mem0,zep \
+SEM_RUNTIME_MODEL=deepseek-chat \
+SEM_RUNTIME_TIMEOUT_S=90 \
+SEM_RUNTIME_MAX_RETRIES=4 \
+MEM0_EMBEDDER_MODEL=nomic-embed-text \
+MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
+OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
+DATASET_SAMPLE_INDEX=0 \
+DATASET_MAX_MESSAGES=24 \
+KEEP_ARTIFACTS=true \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+5. Replay policy experiment (same data, different input scope):
+
+```bash
+WORKFLOWS=mem0,zep \
+MEMORY_INPUT_SCOPE_POLICY=sliding \
+MEMORY_INPUT_SCOPE_SLIDING_SIZE=8 \
+SEM_RUNTIME_MODEL=deepseek-chat \
+DATASET_MAX_MESSAGES=24 \
+KEEP_ARTIFACTS=true \
+DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+6. Quick artifact inspection after any run:
+
+```bash
+LATEST_RUN_DIR="$(ls -td /tmp/agent_memory_stack_artifacts/run_* | head -n 1)"
+echo "${LATEST_RUN_DIR}"
+cat "${LATEST_RUN_DIR}/workflow_result.json"
+tail -n 120 "${LATEST_RUN_DIR}/smoke_stdout.log"
+```

@@ -38,6 +38,11 @@ ENV_CANDIDATES=(
   "${ROOT_DIR}/.env"
   "${ROOT_DIR}/tools/agent_memory/.env"
 )
+
+# Preserve command-line exported env vars over values loaded from .env files.
+ENV_BEFORE_DOTENV_FILE="$(mktemp -t am_env_before_dotenv_XXXXXX)"
+env > "${ENV_BEFORE_DOTENV_FILE}"
+
 for env_file in "${ENV_CANDIDATES[@]}"; do
   if [[ -f "${env_file}" ]]; then
     set -a
@@ -45,6 +50,13 @@ for env_file in "${ENV_CANDIDATES[@]}"; do
     set +a
   fi
 done
+
+while IFS='=' read -r key value; do
+  if [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    export "${key}=${value}"
+  fi
+done < "${ENV_BEFORE_DOTENV_FILE}"
+rm -f "${ENV_BEFORE_DOTENV_FILE}"
 
 if [[ -z "${DATASET_PATH}" ]]; then
   if [[ "${DATASET_SOURCE}" == "longmemeval" ]]; then
@@ -102,7 +114,7 @@ fi
 
 export SEM_RUNTIME_API_KEY_ENV="${SEM_RUNTIME_API_KEY_ENV:-DEEPSEEK_API_KEY}"
 export SEM_RUNTIME_API_BASE="${SEM_RUNTIME_API_BASE:-https://api.deepseek.com/v1}"
-export SEM_RUNTIME_MODEL="${SEM_RUNTIME_MODEL:-deepseek-reasoner}"
+export SEM_RUNTIME_MODEL="${SEM_RUNTIME_MODEL:-deepseek-chat}"
 export SEM_RUNTIME_TIMEOUT_S="${SEM_RUNTIME_TIMEOUT_S:-120}"
 export SEM_RUNTIME_MAX_RETRIES="${SEM_RUNTIME_MAX_RETRIES:-4}"
 export SEM_RUNTIME_RETRY_BASE_DELAY_S="${SEM_RUNTIME_RETRY_BASE_DELAY_S:-0.5}"
@@ -282,6 +294,8 @@ export MEM0_EMBEDDER_PROVIDER="${MEM0_EMBEDDER_PROVIDER:-ollama}"
 export MEM0_EMBEDDER_MODEL="${MEM0_EMBEDDER_MODEL:-all-minilm}"
 export MEM0_EMBEDDER_OLLAMA_BASE_URL="${MEM0_EMBEDDER_OLLAMA_BASE_URL:-http://localhost:11434}"
 export MEM0_EMBEDDER_EMBEDDING_DIM="${MEM0_EMBEDDER_EMBEDDING_DIM:-384}"
+export MEM0_EMBEDDER_MAX_INPUT_CHARS="${MEM0_EMBEDDER_MAX_INPUT_CHARS:-512}"
+export OLLAMA_EMBED_MAX_INPUT_CHARS="${OLLAMA_EMBED_MAX_INPUT_CHARS:-${MEM0_EMBEDDER_MAX_INPUT_CHARS}}"
 export MEM0_LLM_PROVIDER="${MEM0_LLM_PROVIDER:-openai}"
 export MEM0_LLM_MODEL="${MEM0_LLM_MODEL:-${SEM_RUNTIME_MODEL}}"
 export MEM0_LLM_BASE_URL="${MEM0_LLM_BASE_URL:-${SEM_RUNTIME_API_BASE}}"
@@ -303,6 +317,7 @@ export ZEP_LLM_PROVIDER="${ZEP_LLM_PROVIDER:-openai}"
 export ZEP_LLM_MODEL="${ZEP_LLM_MODEL:-${SEM_RUNTIME_MODEL}}"
 export ZEP_LLM_BASE_URL="${ZEP_LLM_BASE_URL:-${SEM_RUNTIME_API_BASE}}"
 export ZEP_LLM_API_KEY="${ZEP_LLM_API_KEY:-${LLM_API_KEY_VALUE}}"
+export ZEP_SUMMARY_LLM_MODEL="${ZEP_SUMMARY_LLM_MODEL:-${ZEP_LLM_MODEL}}"
 export ZEP_EMBEDDER_PROVIDER="${ZEP_EMBEDDER_PROVIDER:-ollama}"
 export ZEP_EMBEDDER_MODEL="${ZEP_EMBEDDER_MODEL:-${MEM0_EMBEDDER_MODEL}}"
 export ZEP_EMBEDDER_OLLAMA_BASE_URL="${ZEP_EMBEDDER_OLLAMA_BASE_URL:-${MEM0_EMBEDDER_OLLAMA_BASE_URL}}"
@@ -333,6 +348,8 @@ SMOKE_CMD=(
 )
 echo "[stack] workflows=${WORKFLOWS} dataset_source=${DATASET_SOURCE} sample_index=${DATASET_SAMPLE_INDEX} max_messages=${DATASET_MAX_MESSAGES}"
 echo "[stack] llm_model=${SEM_RUNTIME_MODEL} timeout_s=${SEM_RUNTIME_TIMEOUT_S} max_retries=${SEM_RUNTIME_MAX_RETRIES}"
+echo "[stack] mem0_llm_model=${MEM0_LLM_MODEL} zep_llm_model=${ZEP_LLM_MODEL} zep_summary_llm_model=${ZEP_SUMMARY_LLM_MODEL}"
+echo "[stack] embed_model=${MEM0_EMBEDDER_MODEL} embed_max_input_chars=${OLLAMA_EMBED_MAX_INPUT_CHARS}"
 "${SMOKE_CMD[@]}" 2>&1 | tee "${ARTIFACT_DIR}/smoke_stdout.log"
 
 echo "[stack] smoke run completed; cleanup will run automatically"

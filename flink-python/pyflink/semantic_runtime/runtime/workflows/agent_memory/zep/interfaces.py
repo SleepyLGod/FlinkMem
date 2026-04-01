@@ -118,6 +118,7 @@ class ZepSemanticRuntime(Protocol):
         *,
         message: str,
         resolved_entities: Sequence[ZepResolvedEntity],
+        allowed_entity_names: Sequence[str],
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> Sequence[ZepExtractedEdge]:

@@ -193,6 +193,7 @@ class Mem0GraphSemanticRuntime(Protocol):
         *,
         messages: Sequence[str],
         entities: Sequence[Mem0GraphExtractedEntity],
+        allowed_entity_names: Sequence[str],
         prompt: str,
     ) -> Sequence[Mem0GraphExtractedRelation]:
         """Extract relations from input messages and extracted entities."""

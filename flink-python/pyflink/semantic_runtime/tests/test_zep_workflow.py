@@ -206,10 +206,11 @@ class _ScriptedSemanticRuntime:
         *,
         message: str,
         resolved_entities: Sequence[ZepResolvedEntity],
+        allowed_entity_names: Sequence[str],
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> Sequence[ZepExtractedEdge]:
-        _ = (message, resolved_entities, recent_episodes)
+        _ = (message, resolved_entities, allowed_entity_names, recent_episodes)
         self.edge_prompts.append(prompt)
         return [
             ZepExtractedEdge(
@@ -277,3 +278,45 @@ def test_zep_add_episode_workflow_executes_pipeline() -> None:
     assert result.added_edge_count == 1
     assert result.duplicate_edge_count == 1
     assert result.contradicted_edge_count == 0
+
+
+def test_zep_add_episode_rejects_existing_entity_id_outside_candidates() -> None:
+    class _InvalidEntityResolutionRuntime(_ScriptedSemanticRuntime):
+        async def resolve_entity(
+            self,
+            *,
+            extracted_entity: ZepExtractedEntity,
+            candidates: Sequence[ZepEntityCandidate],
+            message: str,
+            recent_episodes: Sequence[ZepEpisodeCandidate],
+            prompt: str,
+        ) -> ZepEntityResolution:
+            _ = (candidates, message, recent_episodes, prompt)
+            if extracted_entity.entity_name == "Alice":
+                return ZepEntityResolution(
+                    decision="EXISTING",
+                    entity_name="Alice",
+                    target_entity_id="e-not-in-candidates",
+                )
+            return ZepEntityResolution(
+                decision="NEW",
+                entity_name=extracted_entity.entity_name,
+            )
+
+    workflow = ZepAddEpisodeWorkflow(
+        config=ZepWorkflowConfig(),
+        semantic_runtime=_InvalidEntityResolutionRuntime(),
+        graph_store=_ScriptedGraphStore(),
+    )
+
+    try:
+        asyncio.run(
+            workflow.add_episode(
+                group_id="g1",
+                message="Alice met Bob and talked about work",
+                valid_at_ms=1234,
+            )
+        )
+        raise AssertionError("Expected ValueError for invalid EXISTING target_entity_id")
+    except ValueError as exc:
+        assert "not present in candidates" in str(exc)

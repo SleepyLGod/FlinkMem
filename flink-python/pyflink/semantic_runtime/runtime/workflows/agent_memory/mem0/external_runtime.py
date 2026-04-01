@@ -69,10 +69,17 @@ class Mem0FaissFactBackend:
         self,
         *,
         embedding_fn: Callable[[str], Sequence[float]],
+        max_embedding_input_chars: Optional[int] = None,
     ) -> None:
         if embedding_fn is None:
             raise ValueError("embedding_fn must not be None")
+        if (
+            max_embedding_input_chars is not None
+            and int(max_embedding_input_chars) <= 0
+        ):
+            raise ValueError("max_embedding_input_chars must be > 0 when provided")
         self._embedding_fn = embedding_fn
+        self._max_embedding_input_chars = max_embedding_input_chars
         self._rows: Dict[str, Dict[str, Any]] = {}
         self._index_by_group: Dict[str, Tuple[Any, List[str]]] = {}
         self._faiss = _ensure_faiss_module()
@@ -165,7 +172,13 @@ class Mem0FaissFactBackend:
         return output
 
     async def _embed_text(self, text: str) -> np.ndarray:
-        embedding = await asyncio.to_thread(self._embedding_fn, text)
+        embedding_input = text
+        if (
+            self._max_embedding_input_chars is not None
+            and len(embedding_input) > self._max_embedding_input_chars
+        ):
+            embedding_input = embedding_input[: self._max_embedding_input_chars]
+        embedding = await asyncio.to_thread(self._embedding_fn, embedding_input)
         return _embedding_to_vector(embedding, field_name="embedding")
 
     def _rebuild_group_index(self, *, group_id: str) -> None:
@@ -752,7 +765,10 @@ def build_mem0_external_bundle(
     """Build Mem0 runtime bundle from concrete clients and embedding function."""
     if embedding_fn is None:
         raise ValueError("embedding_fn must not be None")
-    fact_backend = Mem0FaissFactBackend(embedding_fn=embedding_fn)
+    fact_backend = Mem0FaissFactBackend(
+        embedding_fn=embedding_fn,
+        max_embedding_input_chars=backend_config.embedder.max_input_chars,
+    )
 
     graph_store: Optional[Neo4jMem0GraphStore] = None
     graph_entity_searcher: Optional[Mem0GraphEmbeddingEntitySearcher] = None

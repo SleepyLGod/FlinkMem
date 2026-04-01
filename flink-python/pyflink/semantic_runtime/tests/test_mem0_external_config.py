@@ -63,6 +63,7 @@ def test_mem0_backend_config_from_env_builds_full_config() -> None:
         os.environ["MEM0_LLM_MODEL"] = "gpt-4.1-mini"
         os.environ["MEM0_EMBEDDER_PROVIDER"] = "openai"
         os.environ["MEM0_EMBEDDER_MODEL"] = "text-embedding-3-small"
+        os.environ["MEM0_EMBEDDER_MAX_INPUT_CHARS"] = "1536"
         os.environ["MEM0_VECTOR_PROVIDER"] = "faiss"
         os.environ["MEM0_VECTOR_PATH"] = "/tmp/mem0-faiss"
         os.environ["MEM0_GRAPH_ENABLED"] = "false"
@@ -70,6 +71,7 @@ def test_mem0_backend_config_from_env_builds_full_config() -> None:
         config = Mem0BackendConfig.from_env()
 
         assert config.llm.model == "gpt-4.1-mini"
+        assert config.embedder.max_input_chars == 1536
         assert config.vector_store.provider == "faiss"
         assert config.vector_store.path == "/tmp/mem0-faiss"
         assert config.graph_store.enabled is False

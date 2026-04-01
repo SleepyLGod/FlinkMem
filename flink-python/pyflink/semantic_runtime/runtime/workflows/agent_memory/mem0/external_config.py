@@ -107,6 +107,16 @@ def _parse_float_env(name: str, *, default: float) -> float:
         raise ValueError(f"{name} must be float") from exc
 
 
+def _parse_optional_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be int when provided") from exc
+
+
 @dataclass(frozen=True)
 class Mem0LLMBackendConfig:
     """LLM backend config aligned with Mem0 `llm` section semantics."""
@@ -159,6 +169,7 @@ class Mem0EmbedderBackendConfig:
     base_url: Optional[str] = None
     ollama_base_url: Optional[str] = None
     embedding_dim: int = DEFAULT_MEM0_EMBEDDING_DIM
+    max_input_chars: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_non_empty(self.provider, field_name="embedder.provider")
@@ -171,6 +182,8 @@ class Mem0EmbedderBackendConfig:
             raise ValueError("embedder.ollama_base_url must be non-empty when provided")
         if int(self.embedding_dim) <= 0:
             raise ValueError("embedder.embedding_dim must be > 0")
+        if self.max_input_chars is not None and int(self.max_input_chars) <= 0:
+            raise ValueError("embedder.max_input_chars must be > 0 when provided")
 
     @classmethod
     def from_env(
@@ -185,6 +198,7 @@ class Mem0EmbedderBackendConfig:
         base_url = os.getenv(f"{prefix}BASE_URL")
         ollama_base_url = os.getenv(f"{prefix}OLLAMA_BASE_URL")
         embedding_dim = _parse_int_env(f"{prefix}EMBEDDING_DIM", default=DEFAULT_MEM0_EMBEDDING_DIM)
+        max_input_chars = _parse_optional_int_env(f"{prefix}MAX_INPUT_CHARS")
         return cls(
             provider=provider,
             model=model,
@@ -192,6 +206,7 @@ class Mem0EmbedderBackendConfig:
             base_url=base_url.strip() if base_url is not None else None,
             ollama_base_url=ollama_base_url.strip() if ollama_base_url is not None else None,
             embedding_dim=embedding_dim,
+            max_input_chars=max_input_chars,
         )
 
 

@@ -59,6 +59,22 @@ def _as_str_or_none(value: Any) -> str | None:
     return text
 
 
+def _as_int(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{field_name} must be integer")
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{field_name} must be non-empty integer string")
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be integer") from exc
+    raise TypeError(f"{field_name} must be integer")
+
+
 class _JSONLLMHelper:
     """Shared strict JSON-calling helper."""
 
@@ -180,18 +196,27 @@ class Mem0GraphLLMSemanticRuntime:
         *,
         messages: Sequence[str],
         entities: Sequence[Mem0GraphExtractedEntity],
+        allowed_entity_names: Sequence[str],
         prompt: str,
     ) -> Sequence[Mem0GraphExtractedRelation]:
         entities_payload = [
             {"entity": entity.entity_name, "entity_type": entity.entity_type}
             for entity in entities
         ]
+        allowed_names = [
+            _as_text(name, field_name="allowed_entity_names[]")
+            for name in allowed_entity_names
+        ]
+        if not allowed_names:
+            raise ValueError("extract_relations requires non-empty allowed_entity_names")
         request_prompt = (
             f"{prompt}\n"
             "Return ONLY JSON schema:\n"
-            '{"entities":[{"source":"...","relationship":"...","destination":"..."}]}\n'
+            '{"entities":[{"source_index":0,"relationship":"...","destination_index":1}]}\n'
+            "source_index and destination_index MUST be valid indexes into allowed_entity_names.\n"
             f"messages={_format_json(list(messages))}\n"
-            f"entities={_format_json(entities_payload)}"
+            f"entities={_format_json(entities_payload)}\n"
+            f"allowed_entity_names={_format_json(allowed_names)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
@@ -203,13 +228,28 @@ class Mem0GraphLLMSemanticRuntime:
         for item in relations:
             if not isinstance(item, Mapping):
                 raise ValueError("relation row must be object")
+            source_index = _as_int(item.get("source_index"), field_name="source_index")
+            destination_index = _as_int(
+                item.get("destination_index"),
+                field_name="destination_index",
+            )
+            if source_index < 0 or source_index >= len(allowed_names):
+                raise ValueError(
+                    "extract_relations returned source_index out of range: "
+                    f"{source_index}"
+                )
+            if destination_index < 0 or destination_index >= len(allowed_names):
+                raise ValueError(
+                    "extract_relations returned destination_index out of range: "
+                    f"{destination_index}"
+                )
+            source_canonical = allowed_names[source_index]
+            destination_canonical = allowed_names[destination_index]
             output.append(
                 Mem0GraphExtractedRelation(
-                    source_entity_name=_as_text(item.get("source"), field_name="source"),
+                    source_entity_name=source_canonical,
                     relationship=_as_text(item.get("relationship"), field_name="relationship"),
-                    destination_entity_name=_as_text(
-                        item.get("destination"), field_name="destination"
-                    ),
+                    destination_entity_name=destination_canonical,
                 )
             )
         return output
@@ -299,6 +339,7 @@ class ZepLLMSemanticRuntime:
         self,
         *,
         client: LLMClient,
+        summary_client: LLMClient | None = None,
         max_message_chars: int | None = None,
         max_recent_episodes: int | None = None,
         max_recent_episode_chars: int | None = None,
@@ -313,6 +354,11 @@ class ZepLLMSemanticRuntime:
         if max_edge_entities is not None and int(max_edge_entities) <= 0:
             raise ValueError("max_edge_entities must be > 0 when provided")
         self._helper = _JSONLLMHelper(client=client)
+        self._summary_helper = (
+            _JSONLLMHelper(client=summary_client)
+            if summary_client is not None
+            else self._helper
+        )
         self._max_message_chars = (
             int(max_message_chars) if max_message_chars is not None else None
         )
@@ -425,10 +471,27 @@ class ZepLLMSemanticRuntime:
         payload = await self._helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_entity payload must be object")
+        decision = _as_text(payload.get("decision"), field_name="decision")
+        entity_name = _as_text(payload.get("entity_name"), field_name="entity_name")
+        target_entity_id = _as_str_or_none(payload.get("target_entity_id"))
+        if decision == "EXISTING":
+            if target_entity_id is None:
+                raise ValueError(
+                    "resolve_entity decision=EXISTING requires non-empty target_entity_id"
+                )
+        elif decision == "NEW":
+            if target_entity_id is not None:
+                raise ValueError(
+                    "resolve_entity decision=NEW requires null target_entity_id"
+                )
+        else:
+            raise ValueError(
+                "resolve_entity decision must be one of {'EXISTING','NEW'}"
+            )
         return ZepEntityResolution(
-            decision=_as_text(payload.get("decision"), field_name="decision"),
-            entity_name=_as_text(payload.get("entity_name"), field_name="entity_name"),
-            target_entity_id=_as_str_or_none(payload.get("target_entity_id")),
+            decision=decision,
+            entity_name=entity_name,
+            target_entity_id=target_entity_id,
         )
 
     async def summarize_entity(
@@ -452,7 +515,7 @@ class ZepLLMSemanticRuntime:
             f"message={_format_json(bounded_message)}\n"
             f"recent_episodes={_format_json(recent_payload)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._summary_helper.call_json(prompt=request_prompt)
         if not isinstance(payload, Mapping):
             raise ValueError("summarize_entity payload must be object")
         return _as_text(payload.get("summary"), field_name="summary")
@@ -462,6 +525,7 @@ class ZepLLMSemanticRuntime:
         *,
         message: str,
         resolved_entities: Sequence[ZepResolvedEntity],
+        allowed_entity_names: Sequence[str],
         recent_episodes: Sequence[ZepEpisodeCandidate],
         prompt: str,
     ) -> Sequence[ZepExtractedEdge]:
@@ -480,12 +544,21 @@ class ZepLLMSemanticRuntime:
             }
             for entity in entities
         ]
+        allowed_names = [
+            _as_text(name, field_name="allowed_entity_names[]")
+            for name in allowed_entity_names
+        ]
+        allowed_name_set = set(allowed_names)
+        if not allowed_name_set:
+            raise ValueError("extract_edges requires non-empty allowed_entity_names")
         request_prompt = (
             f"{prompt}\n"
             "Return ONLY JSON schema:\n"
             '{"edges":[{"source_entity_name":"...","destination_entity_name":"...","relation":"...","fact":"..."}]}\n'
+            "source_entity_name and destination_entity_name MUST be exact members of allowed_entity_names.\n"
             f"message={_format_json(bounded_message)}\n"
             f"entities={_format_json(entities_payload)}\n"
+            f"allowed_entity_names={_format_json(allowed_names)}\n"
             f"recent_episodes={_format_json(recent_payload)}"
         )
         payload = await self._helper.call_json(prompt=request_prompt)
@@ -498,16 +571,28 @@ class ZepLLMSemanticRuntime:
         for item in edges:
             if not isinstance(item, Mapping):
                 raise ValueError("edge row must be object")
+            source_entity_name = _as_text(
+                item.get("source_entity_name"),
+                field_name="source_entity_name",
+            )
+            destination_entity_name = _as_text(
+                item.get("destination_entity_name"),
+                field_name="destination_entity_name",
+            )
+            if source_entity_name not in allowed_name_set:
+                raise ValueError(
+                    "extract_edges produced source_entity_name not in allowed_entity_names: "
+                    f"{source_entity_name!r}"
+                )
+            if destination_entity_name not in allowed_name_set:
+                raise ValueError(
+                    "extract_edges produced destination_entity_name not in allowed_entity_names: "
+                    f"{destination_entity_name!r}"
+                )
             output.append(
                 ZepExtractedEdge(
-                    source_entity_name=_as_text(
-                        item.get("source_entity_name"),
-                        field_name="source_entity_name",
-                    ),
-                    destination_entity_name=_as_text(
-                        item.get("destination_entity_name"),
-                        field_name="destination_entity_name",
-                    ),
+                    source_entity_name=source_entity_name,
+                    destination_entity_name=destination_entity_name,
                     relation=_as_text(item.get("relation"), field_name="relation"),
                     fact=_as_text(item.get("fact"), field_name="fact"),
                 )
