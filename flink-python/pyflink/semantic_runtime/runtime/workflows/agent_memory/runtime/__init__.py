@@ -10,9 +10,15 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.llm_semanti
     Mem0GraphLLMSemanticRuntime,
     ZepLLMSemanticRuntime,
 )
-from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.smoke_runner import (
-    main,
-)
+
+
+def main() -> None:
+    """Entry point forwarding to smoke runner main with lazy import."""
+    from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.smoke_runner import (
+        main as _main,
+    )
+
+    _main()
 
 __all__ = [
     "DEFAULT_MAX_MESSAGES",

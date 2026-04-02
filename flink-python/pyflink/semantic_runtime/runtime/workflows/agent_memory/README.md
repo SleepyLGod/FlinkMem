@@ -315,6 +315,27 @@ DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
+10.1 Enable workflow profiling (stage + llm aggregate):
+
+```bash
+cd /Users/von/Projects/FlinkMem
+AGENT_MEMORY_PROFILE_ENABLED=1 \
+AGENT_MEMORY_PROFILE_OUTPUT=artifact \
+KEEP_ARTIFACTS=true \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+```
+
+Profiling knobs:
+
+- `AGENT_MEMORY_PROFILE_ENABLED=0|1` (default `0`)
+- `AGENT_MEMORY_PROFILE_OUTPUT=artifact|stdout|both` (default `artifact`)
+
+Profiling outputs when enabled:
+
+- `workflow_result.json` includes a top-level `profiling` object.
+- `profiling.json` is written under artifact dir when output mode includes `artifact`.
+- `smoke_runner` prints profiling mode banner to stderr when output mode includes `stdout`.
+
 11. Data source notes:
 
 - Input messages are read from LongMemEval/LoCoMo dataset files (not synthetic inline messages).

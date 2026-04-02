@@ -9,6 +9,9 @@ from typing import Any, Mapping, Sequence
 
 from pyflink.semantic_runtime.llm_client import LLMClient
 from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.profiling import (
+    AgentMemoryProfiler,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     RetrievedMemory,
 )
@@ -87,15 +90,61 @@ def _as_int(value: Any, *, field_name: str) -> int:
 class _JSONLLMHelper:
     """Shared strict JSON-calling helper."""
 
-    def __init__(self, *, client: LLMClient) -> None:
+    def __init__(
+        self,
+        *,
+        client: LLMClient,
+        workflow_name: str,
+        profiler: AgentMemoryProfiler | None = None,
+    ) -> None:
         self._client = client
-
-    async def call_json(self, *, prompt: str) -> Any:
-        response_text, _ = await self._client.call(prompt)
-        return parse_llm_json_object(
-            response_text,
-            operator_name="agent_memory_llm_runtime",
+        self._workflow_name = _as_text(
+            workflow_name,
+            field_name="workflow_name",
         )
+        self._profiler = profiler
+
+    @staticmethod
+    def _classify_llm_error(*, error: Exception) -> str:
+        message = str(error).casefold()
+        if "timeout" in message:
+            return "timeout"
+        if "payload" in message or "json" in message or "transferencodingerror" in message:
+            return "payload"
+        return "other"
+
+    async def call_json(self, *, prompt: str, step_name: str) -> Any:
+        normalized_step_name = _as_text(step_name, field_name="step_name")
+        try:
+            response_text, metrics = await self._client.call(prompt)
+        except Exception as error:
+            if self._profiler is not None:
+                self._profiler.record_llm_error(
+                    workflow=self._workflow_name,
+                    step=normalized_step_name,
+                    error_type=self._classify_llm_error(error=error),
+                )
+            raise
+        if self._profiler is not None:
+            self._profiler.record_llm_success(
+                workflow=self._workflow_name,
+                step=normalized_step_name,
+                latency_ms=float(metrics.latency_ms),
+                attempts=int(metrics.attempts),
+            )
+        try:
+            return parse_llm_json_object(
+                response_text,
+                operator_name="agent_memory_llm_runtime",
+            )
+        except Exception as error:
+            if self._profiler is not None:
+                self._profiler.record_llm_error(
+                    workflow=self._workflow_name,
+                    step=normalized_step_name,
+                    error_type=self._classify_llm_error(error=error),
+                )
+            raise
 
 
 class Mem0BasicLLMSemanticRuntime:
@@ -106,8 +155,13 @@ class Mem0BasicLLMSemanticRuntime:
         *,
         client: LLMClient,
         drift_policy: str = DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+        profiler: AgentMemoryProfiler | None = None,
     ) -> None:
-        self._helper = _JSONLLMHelper(client=client)
+        self._helper = _JSONLLMHelper(
+            client=client,
+            workflow_name="mem0.basic",
+            profiler=profiler,
+        )
         self._drift_policy = normalize_drift_policy(
             drift_policy,
             field_name="drift_policy",
@@ -130,7 +184,10 @@ class Mem0BasicLLMSemanticRuntime:
             '{"facts":["fact 1","fact 2"]}\n'
             f"messages={_format_json(list(messages))}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="extract_facts",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("extract_facts payload must be object")
         facts = payload.get("facts")
@@ -179,7 +236,10 @@ class Mem0BasicLLMSemanticRuntime:
             '"confidence":0.0}]}\n'
             f"facts={_format_json(fact_rows)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="resolve_facts",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_facts payload must be object")
         decisions = payload.get("decisions")
@@ -269,8 +329,13 @@ class Mem0GraphLLMSemanticRuntime:
         client: LLMClient,
         relation_entity_reference_mode: str = ENTITY_REFERENCE_MODE_NAME,
         drift_policy: str = DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+        profiler: AgentMemoryProfiler | None = None,
     ) -> None:
-        self._helper = _JSONLLMHelper(client=client)
+        self._helper = _JSONLLMHelper(
+            client=client,
+            workflow_name="mem0.graph",
+            profiler=profiler,
+        )
         self._relation_entity_reference_mode = normalize_entity_reference_mode(
             relation_entity_reference_mode,
             field_name="relation_entity_reference_mode",
@@ -302,7 +367,10 @@ class Mem0GraphLLMSemanticRuntime:
             '{"entities":[{"entity":"...","entity_type":"..."}]}\n'
             f"messages={_format_json(list(messages))}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="extract_entities",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("extract_entities payload must be object")
         entities = payload.get("entities")
@@ -364,7 +432,10 @@ class Mem0GraphLLMSemanticRuntime:
                 f"entities={_format_json(entities_payload)}\n"
                 f"allowed_entity_names={_format_json(allowed_names)}"
             )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="extract_relations",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("extract_relations payload must be object")
         relations = payload.get("entities")
@@ -472,7 +543,10 @@ class Mem0GraphLLMSemanticRuntime:
             f"entity={_format_json({'entity_name': entity.entity_name, 'entity_type': entity.entity_type})}\n"
             f"candidates={_format_json(candidates_payload)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="resolve_entity",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_entity payload must be object")
         return Mem0GraphEntityResolution(
@@ -509,7 +583,10 @@ class Mem0GraphLLMSemanticRuntime:
             f"relation={_format_json({'source': relation.source_entity_name, 'destination': relation.destination_entity_name, 'relationship': relation.relationship})}\n"
             f"candidates={_format_json(candidates_payload)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="resolve_relation",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_relation payload must be object")
         return Mem0GraphRelationResolution(
@@ -540,6 +617,7 @@ class ZepLLMSemanticRuntime:
         max_edge_entities: int | None = None,
         edge_entity_reference_mode: str = ENTITY_REFERENCE_MODE_NAME,
         drift_policy: str = DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+        profiler: AgentMemoryProfiler | None = None,
     ) -> None:
         if max_message_chars is not None and int(max_message_chars) <= 0:
             raise ValueError("max_message_chars must be > 0 when provided")
@@ -549,9 +627,17 @@ class ZepLLMSemanticRuntime:
             raise ValueError("max_recent_episode_chars must be > 0 when provided")
         if max_edge_entities is not None and int(max_edge_entities) <= 0:
             raise ValueError("max_edge_entities must be > 0 when provided")
-        self._helper = _JSONLLMHelper(client=client)
+        self._helper = _JSONLLMHelper(
+            client=client,
+            workflow_name="zep",
+            profiler=profiler,
+        )
         self._summary_helper = (
-            _JSONLLMHelper(client=summary_client)
+            _JSONLLMHelper(
+                client=summary_client,
+                workflow_name="zep.summary",
+                profiler=profiler,
+            )
             if summary_client is not None
             else self._helper
         )
@@ -632,7 +718,10 @@ class ZepLLMSemanticRuntime:
             f"message={_format_json(bounded_message)}\n"
             f"recent_episodes={_format_json(recent_payload)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="extract_entities",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("extract_entities payload must be object")
         entities = payload.get("entities")
@@ -682,7 +771,10 @@ class ZepLLMSemanticRuntime:
             f"recent_episodes={_format_json(recent_payload)}\n"
             f"candidates={_format_json(candidates_payload)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="resolve_entity",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_entity payload must be object")
         decision = _as_text(payload.get("decision"), field_name="decision")
@@ -729,7 +821,10 @@ class ZepLLMSemanticRuntime:
             f"message={_format_json(bounded_message)}\n"
             f"recent_episodes={_format_json(recent_payload)}"
         )
-        payload = await self._summary_helper.call_json(prompt=request_prompt)
+        payload = await self._summary_helper.call_json(
+            prompt=request_prompt,
+            step_name="summarize_entity",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("summarize_entity payload must be object")
         return _as_text(payload.get("summary"), field_name="summary")
@@ -796,7 +891,10 @@ class ZepLLMSemanticRuntime:
                 f"allowed_entity_names={_format_json(allowed_names)}\n"
                 f"recent_episodes={_format_json(recent_payload)}"
             )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="extract_edges",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("extract_edges payload must be object")
         edges = payload.get("edges")
@@ -910,7 +1008,10 @@ class ZepLLMSemanticRuntime:
             f"recent_episodes={_format_json(recent_payload)}\n"
             f"candidates={_format_json(candidates_payload)}"
         )
-        payload = await self._helper.call_json(prompt=request_prompt)
+        payload = await self._helper.call_json(
+            prompt=request_prompt,
+            step_name="resolve_edge",
+        )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_edge payload must be object")
         return ZepEdgeResolution(

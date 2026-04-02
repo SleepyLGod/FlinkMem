@@ -7,11 +7,13 @@ import asyncio
 import json
 import os
 import pathlib
+import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Iterator, Mapping, Sequence
 
 from pyflink.semantic_runtime.llm_client import LLMClientConfig, create_llm_client
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
@@ -45,6 +47,9 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.llm_semanti
     Mem0BasicLLMSemanticRuntime,
     Mem0GraphLLMSemanticRuntime,
     ZepLLMSemanticRuntime,
+)
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.profiling import (
+    AgentMemoryProfiler,
 )
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
     DRIFT_POLICY_UPSTREAM_COMPATIBLE,
@@ -89,6 +94,8 @@ DEFAULT_INPUT_SCOPE_POLICY = "none"
 VALID_INPUT_SCOPE_POLICIES = frozenset({"none", "sliding", "session"})
 DEFAULT_INPUT_SCOPE_SLIDING_SIZE = 8
 DEFAULT_INPUT_SCOPE_SESSION_GAP_MS = 30 * 60 * 1_000
+DEFAULT_PROFILE_ENABLED = "0"
+DEFAULT_PROFILE_OUTPUT = "artifact"
 
 
 def _resolve_repo_root(*, start: pathlib.Path) -> pathlib.Path:
@@ -116,6 +123,21 @@ class ReplayEvent:
     scope_messages: Sequence[ConversationMessage]
 
 
+@contextmanager
+def _profile_stage(
+    *,
+    profiler: AgentMemoryProfiler | None,
+    workflow: str,
+    stage: str,
+) -> Iterator[None]:
+    """Run one stage under profiler when enabled, else no-op."""
+    if profiler is None or not profiler.enabled:
+        yield
+        return
+    with profiler.stage(workflow=workflow, stage=stage):
+        yield
+
+
 def _load_repo_env(*, repo_root: pathlib.Path) -> None:
     env_candidates = [
         repo_root / ".env",
@@ -137,6 +159,27 @@ def _load_repo_env(*, repo_root: pathlib.Path) -> None:
             normalized_value = value.strip().strip("'").strip('"')
             if key not in os.environ:
                 os.environ[key] = normalized_value
+
+
+def _to_bool_flag(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "bool-like flag must be one of "
+        "{'1','0','true','false','yes','no','on','off'}"
+    )
+
+
+def _build_profiler() -> AgentMemoryProfiler:
+    enabled_raw = os.getenv("AGENT_MEMORY_PROFILE_ENABLED", DEFAULT_PROFILE_ENABLED)
+    output_mode = os.getenv("AGENT_MEMORY_PROFILE_OUTPUT", DEFAULT_PROFILE_OUTPUT).strip()
+    return AgentMemoryProfiler(
+        enabled=_to_bool_flag(enabled_raw),
+        output_mode=output_mode,
+    )
 
 
 def _create_ollama_embedding_fn(
@@ -470,48 +513,63 @@ async def _run_evermemos_workflow(
     dataset_messages: Sequence[ConversationMessage],
     llm_config: LLMClientConfig,
     embedding_fn,
+    profiler: AgentMemoryProfiler | None = None,
 ) -> Mapping[str, Any]:
     ordered_messages = _iter_ordered_messages(dataset_messages)
-    backend_config = EverMemOSBackendConfig.from_env()
-    clients = create_evermemos_external_clients(backend_config=backend_config)
-    operator_runtime = EverMemOSOperatorRuntime(
-        llm_config=llm_config,
-        config=EverMemOSOperatorRuntimeConfig.from_env(),
-    )
-    embedding_dim = len(list(embedding_fn("embedding dimension probe")))
-    topic_assigner = EverMemOSTopicAssigner(
-        config=EverMemOSTopicAssignerConfig(embedding_dim=embedding_dim),
-        llm_config=llm_config,
-        encoder=_OllamaTextEncoder(embedding_fn=embedding_fn, embedding_dim=embedding_dim),
-    )
+    clients = None
+    operator_runtime = None
+    topic_assigner = None
+    with _profile_stage(profiler=profiler, workflow="evermemos", stage="init"):
+        backend_config = EverMemOSBackendConfig.from_env()
+        clients = create_evermemos_external_clients(backend_config=backend_config)
+        operator_runtime = EverMemOSOperatorRuntime(
+            llm_config=llm_config,
+            config=EverMemOSOperatorRuntimeConfig.from_env(),
+            profiler=profiler,
+        )
+        embedding_dim = len(list(embedding_fn("embedding dimension probe")))
+        topic_assigner = EverMemOSTopicAssigner(
+            config=EverMemOSTopicAssignerConfig(embedding_dim=embedding_dim),
+            llm_config=llm_config,
+            encoder=_OllamaTextEncoder(
+                embedding_fn=embedding_fn,
+                embedding_dim=embedding_dim,
+            ),
+        )
     try:
-        bundle = build_evermemos_external_bundle(
-            mongo_database=clients.mongo_database,
-            backend_config=backend_config,
-            elasticsearch_client=clients.elasticsearch_client,
-            milvus_client=clients.milvus_client,
-            embedding_fn=embedding_fn,
-        )
-        workflow = EverMemOSInsertionWorkflow(
-            config=EverMemOSWorkflowConfig(profile_min_memcells=1),
-            semantic_runtime=operator_runtime,
-            token_counter=_token_counter,
-            conversation_status_store=bundle.conversation_status_store,
-            conversation_buffer_store=bundle.conversation_buffer_store,
-            memcell_store=bundle.memcell_store,
-            memory_artifact_store=bundle.memory_artifact_store,
-            topic_state_store=bundle.topic_state_store,
-            topic_assigner=topic_assigner,
-            profile_store=bundle.profile_store,
-        )
+        with _profile_stage(profiler=profiler, workflow="evermemos", stage="build_bundle"):
+            bundle = build_evermemos_external_bundle(
+                mongo_database=clients.mongo_database,
+                backend_config=backend_config,
+                elasticsearch_client=clients.elasticsearch_client,
+                milvus_client=clients.milvus_client,
+                embedding_fn=embedding_fn,
+            )
+            workflow = EverMemOSInsertionWorkflow(
+                config=EverMemOSWorkflowConfig(profile_min_memcells=1),
+                semantic_runtime=operator_runtime,
+                token_counter=_token_counter,
+                conversation_status_store=bundle.conversation_status_store,
+                conversation_buffer_store=bundle.conversation_buffer_store,
+                memcell_store=bundle.memcell_store,
+                memory_artifact_store=bundle.memory_artifact_store,
+                topic_state_store=bundle.topic_state_store,
+                topic_assigner=topic_assigner,
+                profile_store=bundle.profile_store,
+            )
         first_group_id = ordered_messages[0].group_id
         results = []
         for message in ordered_messages:
-            result = await workflow.memorize(
-                group_id=first_group_id,
-                scene="assistant",
-                new_messages=[message],
-            )
+            with _profile_stage(
+                profiler=profiler,
+                workflow="evermemos",
+                stage="memorize_event",
+            ):
+                result = await workflow.memorize(
+                    group_id=first_group_id,
+                    scene="assistant",
+                    new_messages=[message],
+                )
             results.append(result)
         if not results:
             raise RuntimeError("evermemos replay produced no result")
@@ -551,9 +609,12 @@ async def _run_evermemos_workflow(
             "distill_calls": operator_runtime.distill_calls,
         }
     finally:
-        await _close_component(topic_assigner)
-        await _close_component(operator_runtime)
-        clients.close()
+        if topic_assigner is not None:
+            await _close_component(topic_assigner)
+        if operator_runtime is not None:
+            await _close_component(operator_runtime)
+        if clients is not None:
+            clients.close()
 
 
 async def _run_mem0_workflow(
@@ -563,74 +624,80 @@ async def _run_mem0_workflow(
     llm_config: LLMClientConfig,
     embedding_fn,
     input_scope_policy: str,
+    profiler: AgentMemoryProfiler | None = None,
 ) -> Mapping[str, Any]:
     ordered_messages = _iter_ordered_messages(dataset_messages)
     replay_events = _build_replay_events(
         ordered_messages=ordered_messages,
         scope_policy=input_scope_policy,
     )
-    backend_config = Mem0BackendConfig.from_env()
-    clients = create_mem0_external_clients(backend_config=backend_config)
-    mem0_llm_config = _build_workflow_llm_config(
-        workflow_name="mem0",
-        fallback=llm_config,
-    )
-    llm_client = create_llm_client(mem0_llm_config)
-    mem0_basic_fact_resolve_concurrency = int(
-        os.getenv(
-            "MEM0_BASIC_FACT_RESOLVE_CONCURRENCY",
-            str(Mem0BasicConfig().fact_resolve_concurrency),
+    clients = None
+    llm_client = None
+    with _profile_stage(profiler=profiler, workflow="mem0", stage="init"):
+        backend_config = Mem0BackendConfig.from_env()
+        clients = create_mem0_external_clients(backend_config=backend_config)
+        mem0_llm_config = _build_workflow_llm_config(
+            workflow_name="mem0",
+            fallback=llm_config,
         )
-    )
-    mem0_basic_fact_write_group_concurrency = int(
-        os.getenv(
-            "MEM0_BASIC_FACT_WRITE_GROUP_CONCURRENCY",
-            str(Mem0BasicConfig().fact_write_group_concurrency),
+        llm_client = create_llm_client(mem0_llm_config)
+        mem0_basic_fact_resolve_concurrency = int(
+            os.getenv(
+                "MEM0_BASIC_FACT_RESOLVE_CONCURRENCY",
+                str(Mem0BasicConfig().fact_resolve_concurrency),
+            )
         )
-    )
-    mem0_graph_entity_resolve_concurrency = int(
-        os.getenv(
-            "MEM0_GRAPH_ENTITY_RESOLVE_CONCURRENCY",
-            str(Mem0GraphConfig().entity_resolve_concurrency),
+        mem0_basic_fact_write_group_concurrency = int(
+            os.getenv(
+                "MEM0_BASIC_FACT_WRITE_GROUP_CONCURRENCY",
+                str(Mem0BasicConfig().fact_write_group_concurrency),
+            )
         )
-    )
-    mem0_graph_entity_upsert_group_concurrency = int(
-        os.getenv(
-            "MEM0_GRAPH_ENTITY_UPSERT_GROUP_CONCURRENCY",
-            str(Mem0GraphConfig().entity_upsert_group_concurrency),
+        mem0_graph_entity_resolve_concurrency = int(
+            os.getenv(
+                "MEM0_GRAPH_ENTITY_RESOLVE_CONCURRENCY",
+                str(Mem0GraphConfig().entity_resolve_concurrency),
+            )
         )
-    )
-    mem0_graph_relation_resolve_concurrency = int(
-        os.getenv(
-            "MEM0_GRAPH_RELATION_RESOLVE_CONCURRENCY",
-            str(Mem0GraphConfig().relation_resolve_concurrency),
+        mem0_graph_entity_upsert_group_concurrency = int(
+            os.getenv(
+                "MEM0_GRAPH_ENTITY_UPSERT_GROUP_CONCURRENCY",
+                str(Mem0GraphConfig().entity_upsert_group_concurrency),
+            )
         )
-    )
-    mem0_graph_relation_write_group_concurrency = int(
-        os.getenv(
-            "MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY",
-            str(Mem0GraphConfig().relation_write_group_concurrency),
+        mem0_graph_relation_resolve_concurrency = int(
+            os.getenv(
+                "MEM0_GRAPH_RELATION_RESOLVE_CONCURRENCY",
+                str(Mem0GraphConfig().relation_resolve_concurrency),
+            )
         )
-    )
-    mem0_relation_reference_mode = os.getenv(
-        "MEM0_RELATION_REFERENCE_MODE",
-        DEFAULT_MEM0_RELATION_REFERENCE_MODE,
-    ).strip()
-    mem0_drift_policy = os.getenv(
-        "MEM0_DRIFT_POLICY",
-        DEFAULT_MEM0_DRIFT_POLICY,
-    ).strip()
+        mem0_graph_relation_write_group_concurrency = int(
+            os.getenv(
+                "MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY",
+                str(Mem0GraphConfig().relation_write_group_concurrency),
+            )
+        )
+        mem0_relation_reference_mode = os.getenv(
+            "MEM0_RELATION_REFERENCE_MODE",
+            DEFAULT_MEM0_RELATION_REFERENCE_MODE,
+        ).strip()
+        mem0_drift_policy = os.getenv(
+            "MEM0_DRIFT_POLICY",
+            DEFAULT_MEM0_DRIFT_POLICY,
+        ).strip()
     try:
-        bundle = build_mem0_external_bundle(
-            backend_config=backend_config,
-            embedding_fn=embedding_fn,
-            neo4j_driver=clients.neo4j_driver,
-        )
+        with _profile_stage(profiler=profiler, workflow="mem0", stage="build_bundle"):
+            bundle = build_mem0_external_bundle(
+                backend_config=backend_config,
+                embedding_fn=embedding_fn,
+                neo4j_driver=clients.neo4j_driver,
+            )
         group_id = f"mem0:{ordered_messages[0].group_id}"
 
         basic_runtime = Mem0BasicLLMSemanticRuntime(
             client=llm_client,
             drift_policy=mem0_drift_policy,
+            profiler=profiler,
         )
         basic_workflow = Mem0BasicWorkflow(
             config=Mem0BasicConfig(
@@ -648,20 +715,26 @@ async def _run_mem0_workflow(
         basic_deleted = 0
         basic_noop = 0
         for event in replay_events:
-            basic_add_result = await basic_workflow.add(
-                group_id=group_id,
-                messages=[str(event.message.content)],
-            )
+            with _profile_stage(
+                profiler=profiler,
+                workflow="mem0",
+                stage="basic_add_event",
+            ):
+                basic_add_result = await basic_workflow.add(
+                    group_id=group_id,
+                    messages=[str(event.message.content)],
+                )
             basic_extracted_fact_count += int(basic_add_result.extracted_fact_count)
             basic_added += int(basic_add_result.added)
             basic_updated += int(basic_add_result.updated)
             basic_deleted += int(basic_add_result.deleted)
             basic_noop += int(basic_add_result.noop)
-        basic_search_result = await basic_workflow.search(
-            group_id=group_id,
-            query=benchmark_query,
-            top_k=3,
-        )
+        with _profile_stage(profiler=profiler, workflow="mem0", stage="basic_search"):
+            basic_search_result = await basic_workflow.search(
+                group_id=group_id,
+                query=benchmark_query,
+                top_k=3,
+            )
 
         if bundle.graph_store is None:
             raise ValueError("mem0 graph_store must be enabled for graph workflow run")
@@ -674,6 +747,7 @@ async def _run_mem0_workflow(
             client=llm_client,
             relation_entity_reference_mode=mem0_relation_reference_mode,
             drift_policy=mem0_drift_policy,
+            profiler=profiler,
         )
         graph_workflow = Mem0GraphWorkflow(
             config=Mem0GraphConfig(
@@ -700,10 +774,15 @@ async def _run_mem0_workflow(
         graph_updated_relations = 0
         graph_deleted_relations = 0
         for event in replay_events:
-            graph_add_result = await graph_workflow.add(
-                group_id=group_id,
-                messages=[str(event.message.content)],
-            )
+            with _profile_stage(
+                profiler=profiler,
+                workflow="mem0",
+                stage="graph_add_event",
+            ):
+                graph_add_result = await graph_workflow.add(
+                    group_id=group_id,
+                    messages=[str(event.message.content)],
+                )
             graph_extracted_entity_count += int(graph_add_result.extracted_entity_count)
             graph_extracted_relation_count += int(
                 graph_add_result.extracted_relation_count
@@ -712,11 +791,12 @@ async def _run_mem0_workflow(
             graph_added_relations += int(graph_add_result.added_relations)
             graph_updated_relations += int(graph_add_result.updated_relations)
             graph_deleted_relations += int(graph_add_result.deleted_relations)
-        graph_search_result = await graph_workflow.search(
-            group_id=group_id,
-            query=benchmark_query,
-            top_k=3,
-        )
+        with _profile_stage(profiler=profiler, workflow="mem0", stage="graph_search"):
+            graph_search_result = await graph_workflow.search(
+                group_id=group_id,
+                query=benchmark_query,
+                top_k=3,
+            )
 
         return {
             "basic": {
@@ -742,8 +822,10 @@ async def _run_mem0_workflow(
             "max_scope_size": max(len(event.scope_messages) for event in replay_events),
         }
     finally:
-        await _close_component(llm_client)
-        clients.close()
+        if llm_client is not None:
+            await _close_component(llm_client)
+        if clients is not None:
+            clients.close()
 
 
 async def _run_zep_workflow(
@@ -751,123 +833,135 @@ async def _run_zep_workflow(
     dataset_messages: Sequence[ConversationMessage],
     llm_config: LLMClientConfig,
     input_scope_policy: str,
+    profiler: AgentMemoryProfiler | None = None,
 ) -> Mapping[str, Any]:
     ordered_messages = _iter_ordered_messages(dataset_messages)
     replay_events = _build_replay_events(
         ordered_messages=ordered_messages,
         scope_policy=input_scope_policy,
     )
-    backend_config = ZepBackendConfig.from_env()
-    clients = create_zep_external_clients(backend_config=backend_config)
-    zep_llm_config = _build_workflow_llm_config(
-        workflow_name="zep",
-        fallback=llm_config,
-    )
-    zep_summary_llm_config = _build_prefixed_llm_config(
-        prefix="ZEP_SUMMARY_LLM_",
-        fallback=zep_llm_config,
-    )
-    llm_client = create_llm_client(zep_llm_config)
-    if zep_summary_llm_config == zep_llm_config:
-        summary_llm_client = llm_client
-    else:
-        summary_llm_client = create_llm_client(zep_summary_llm_config)
-    zep_prompt_message_max_chars = int(
-        os.getenv(
-            "ZEP_PROMPT_MESSAGE_MAX_CHARS",
-            str(DEFAULT_ZEP_PROMPT_MESSAGE_MAX_CHARS),
+    clients = None
+    llm_client = None
+    summary_llm_client = None
+    with _profile_stage(profiler=profiler, workflow="zep", stage="init"):
+        backend_config = ZepBackendConfig.from_env()
+        clients = create_zep_external_clients(backend_config=backend_config)
+        zep_llm_config = _build_workflow_llm_config(
+            workflow_name="zep",
+            fallback=llm_config,
         )
-    )
-    zep_prompt_max_recent_episodes = int(
-        os.getenv(
-            "ZEP_PROMPT_MAX_RECENT_EPISODES",
-            str(DEFAULT_ZEP_PROMPT_MAX_RECENT_EPISODES),
+        zep_summary_llm_config = _build_prefixed_llm_config(
+            prefix="ZEP_SUMMARY_LLM_",
+            fallback=zep_llm_config,
         )
-    )
-    zep_prompt_recent_episode_max_chars = int(
-        os.getenv(
-            "ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS",
-            str(DEFAULT_ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS),
+        llm_client = create_llm_client(zep_llm_config)
+        if zep_summary_llm_config == zep_llm_config:
+            summary_llm_client = llm_client
+        else:
+            summary_llm_client = create_llm_client(zep_summary_llm_config)
+        zep_prompt_message_max_chars = int(
+            os.getenv(
+                "ZEP_PROMPT_MESSAGE_MAX_CHARS",
+                str(DEFAULT_ZEP_PROMPT_MESSAGE_MAX_CHARS),
+            )
         )
-    )
-    zep_prompt_max_edge_entities = int(
-        os.getenv(
-            "ZEP_PROMPT_MAX_EDGE_ENTITIES",
-            str(DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES),
+        zep_prompt_max_recent_episodes = int(
+            os.getenv(
+                "ZEP_PROMPT_MAX_RECENT_EPISODES",
+                str(DEFAULT_ZEP_PROMPT_MAX_RECENT_EPISODES),
+            )
         )
-    )
-    zep_edge_reference_mode = os.getenv(
-        "ZEP_EDGE_REFERENCE_MODE",
-        DEFAULT_ZEP_EDGE_REFERENCE_MODE,
-    ).strip()
-    zep_drift_policy = os.getenv(
-        "ZEP_DRIFT_POLICY",
-        DEFAULT_ZEP_DRIFT_POLICY,
-    ).strip()
-    zep_entity_resolve_concurrency = int(
-        os.getenv(
-            "ZEP_ENTITY_RESOLVE_CONCURRENCY",
-            str(ZepWorkflowConfig().entity_resolve_concurrency),
+        zep_prompt_recent_episode_max_chars = int(
+            os.getenv(
+                "ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS",
+                str(DEFAULT_ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS),
+            )
         )
-    )
-    zep_entity_upsert_group_concurrency = int(
-        os.getenv(
-            "ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY",
-            str(ZepWorkflowConfig().entity_upsert_group_concurrency),
+        zep_prompt_max_edge_entities = int(
+            os.getenv(
+                "ZEP_PROMPT_MAX_EDGE_ENTITIES",
+                str(DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES),
+            )
         )
-    )
-    zep_entity_summary_concurrency = int(
-        os.getenv(
-            "ZEP_ENTITY_SUMMARY_CONCURRENCY",
-            str(ZepWorkflowConfig().entity_summary_concurrency),
+        zep_edge_reference_mode = os.getenv(
+            "ZEP_EDGE_REFERENCE_MODE",
+            DEFAULT_ZEP_EDGE_REFERENCE_MODE,
+        ).strip()
+        zep_drift_policy = os.getenv(
+            "ZEP_DRIFT_POLICY",
+            DEFAULT_ZEP_DRIFT_POLICY,
+        ).strip()
+        zep_entity_resolve_concurrency = int(
+            os.getenv(
+                "ZEP_ENTITY_RESOLVE_CONCURRENCY",
+                str(ZepWorkflowConfig().entity_resolve_concurrency),
+            )
         )
-    )
-    zep_edge_resolve_concurrency = int(
-        os.getenv(
-            "ZEP_EDGE_RESOLVE_CONCURRENCY",
-            str(ZepWorkflowConfig().edge_resolve_concurrency),
+        zep_entity_upsert_group_concurrency = int(
+            os.getenv(
+                "ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY",
+                str(ZepWorkflowConfig().entity_upsert_group_concurrency),
+            )
         )
-    )
-    zep_edge_write_group_concurrency = int(
-        os.getenv(
-            "ZEP_EDGE_WRITE_GROUP_CONCURRENCY",
-            str(ZepWorkflowConfig().edge_write_group_concurrency),
+        zep_entity_summary_concurrency = int(
+            os.getenv(
+                "ZEP_ENTITY_SUMMARY_CONCURRENCY",
+                str(ZepWorkflowConfig().entity_summary_concurrency),
+            )
         )
-    )
+        zep_edge_resolve_concurrency = int(
+            os.getenv(
+                "ZEP_EDGE_RESOLVE_CONCURRENCY",
+                str(ZepWorkflowConfig().edge_resolve_concurrency),
+            )
+        )
+        zep_edge_write_group_concurrency = int(
+            os.getenv(
+                "ZEP_EDGE_WRITE_GROUP_CONCURRENCY",
+                str(ZepWorkflowConfig().edge_write_group_concurrency),
+            )
+        )
     try:
-        bundle = build_zep_external_bundle(
-            backend_config=backend_config,
-            neo4j_driver=clients.neo4j_driver,
-        )
-        runtime = ZepLLMSemanticRuntime(
-            client=llm_client,
-            summary_client=summary_llm_client,
-            max_message_chars=zep_prompt_message_max_chars,
-            max_recent_episodes=zep_prompt_max_recent_episodes,
-            max_recent_episode_chars=zep_prompt_recent_episode_max_chars,
-            max_edge_entities=zep_prompt_max_edge_entities,
-            edge_entity_reference_mode=zep_edge_reference_mode,
-            drift_policy=zep_drift_policy,
-        )
-        workflow = ZepAddEpisodeWorkflow(
-            config=ZepWorkflowConfig(
-                entity_resolve_concurrency=zep_entity_resolve_concurrency,
-                entity_upsert_group_concurrency=zep_entity_upsert_group_concurrency,
-                entity_summary_concurrency=zep_entity_summary_concurrency,
-                edge_resolve_concurrency=zep_edge_resolve_concurrency,
-                edge_write_group_concurrency=zep_edge_write_group_concurrency,
-            ),
-            semantic_runtime=runtime,
-            graph_store=bundle.graph_store,
-        )
+        with _profile_stage(profiler=profiler, workflow="zep", stage="build_bundle"):
+            bundle = build_zep_external_bundle(
+                backend_config=backend_config,
+                neo4j_driver=clients.neo4j_driver,
+            )
+            runtime = ZepLLMSemanticRuntime(
+                client=llm_client,
+                summary_client=summary_llm_client,
+                max_message_chars=zep_prompt_message_max_chars,
+                max_recent_episodes=zep_prompt_max_recent_episodes,
+                max_recent_episode_chars=zep_prompt_recent_episode_max_chars,
+                max_edge_entities=zep_prompt_max_edge_entities,
+                edge_entity_reference_mode=zep_edge_reference_mode,
+                drift_policy=zep_drift_policy,
+                profiler=profiler,
+            )
+            workflow = ZepAddEpisodeWorkflow(
+                config=ZepWorkflowConfig(
+                    entity_resolve_concurrency=zep_entity_resolve_concurrency,
+                    entity_upsert_group_concurrency=zep_entity_upsert_group_concurrency,
+                    entity_summary_concurrency=zep_entity_summary_concurrency,
+                    edge_resolve_concurrency=zep_edge_resolve_concurrency,
+                    edge_write_group_concurrency=zep_edge_write_group_concurrency,
+                ),
+                semantic_runtime=runtime,
+                graph_store=bundle.graph_store,
+            )
         group_id = f"zep:{ordered_messages[0].group_id}"
         results = []
         for event in replay_events:
-            result = await workflow.add_episode(
-                group_id=group_id,
-                message=str(event.message.content),
-                valid_at_ms=int(event.message.timestamp_ms),
-            )
+            with _profile_stage(
+                profiler=profiler,
+                workflow="zep",
+                stage="add_episode_event",
+            ):
+                result = await workflow.add_episode(
+                    group_id=group_id,
+                    message=str(event.message.content),
+                    valid_at_ms=int(event.message.timestamp_ms),
+                )
             results.append(result)
         if not results:
             raise RuntimeError("zep replay produced no result")
@@ -894,10 +988,12 @@ async def _run_zep_workflow(
             "max_scope_size": max(len(event.scope_messages) for event in replay_events),
         }
     finally:
-        if summary_llm_client is not llm_client:
+        if summary_llm_client is not None and summary_llm_client is not llm_client:
             await _close_component(summary_llm_client)
-        await _close_component(llm_client)
-        clients.close()
+        if llm_client is not None:
+            await _close_component(llm_client)
+        if clients is not None:
+            clients.close()
 
 
 def _resolve_dataset_path(*, dataset_source: str, dataset_path: str | None) -> str:
@@ -917,7 +1013,11 @@ def _resolve_dataset_path(*, dataset_source: str, dataset_path: str | None) -> s
     )
 
 
-async def _main_async(args: argparse.Namespace) -> Mapping[str, Any]:
+async def _main_async(
+    args: argparse.Namespace,
+    *,
+    profiler: AgentMemoryProfiler,
+) -> Mapping[str, Any]:
     _load_repo_env(repo_root=REPO_ROOT)
     dataset_path = _resolve_dataset_path(
         dataset_source=args.dataset_source,
@@ -994,29 +1094,51 @@ async def _main_async(args: argparse.Namespace) -> Mapping[str, Any]:
     if unknown:
         raise ValueError(f"unknown workflows: {sorted(unknown)!r}")
     if "evermemos" in selected:
-        output["evermemos"] = await _run_evermemos_workflow(
-            dataset_messages=dataset_messages,
-            llm_config=llm_config,
-            embedding_fn=embedding_fn,
-        )
+        with _profile_stage(
+            profiler=profiler,
+            workflow="runner",
+            stage="workflow.evermemos.total",
+        ):
+            output["evermemos"] = await _run_evermemos_workflow(
+                dataset_messages=dataset_messages,
+                llm_config=llm_config,
+                embedding_fn=embedding_fn,
+                profiler=profiler,
+            )
     if "mem0" in selected:
         if not benchmark_query:
             raise ValueError(
                 "mem0 workflow requires non-empty dataset metadata.question as retrieval query"
             )
-        output["mem0"] = await _run_mem0_workflow(
-            dataset_messages=dataset_messages,
-            benchmark_query=benchmark_query,
-            llm_config=llm_config,
-            embedding_fn=embedding_fn,
-            input_scope_policy=input_scope_policy,
-        )
+        with _profile_stage(
+            profiler=profiler,
+            workflow="runner",
+            stage="workflow.mem0.total",
+        ):
+            output["mem0"] = await _run_mem0_workflow(
+                dataset_messages=dataset_messages,
+                benchmark_query=benchmark_query,
+                llm_config=llm_config,
+                embedding_fn=embedding_fn,
+                input_scope_policy=input_scope_policy,
+                profiler=profiler,
+            )
     if "zep" in selected:
-        output["zep"] = await _run_zep_workflow(
-            dataset_messages=dataset_messages,
-            llm_config=llm_config,
-            input_scope_policy=input_scope_policy,
-        )
+        with _profile_stage(
+            profiler=profiler,
+            workflow="runner",
+            stage="workflow.zep.total",
+        ):
+            output["zep"] = await _run_zep_workflow(
+                dataset_messages=dataset_messages,
+                llm_config=llm_config,
+                input_scope_policy=input_scope_policy,
+                profiler=profiler,
+            )
+    if profiler.enabled:
+        output["profiling"] = dict(profiler.build_output())
+        output["profiling"]["enabled"] = True
+        output["profiling"]["output_mode"] = profiler.output_mode
     return output
 
 
@@ -1058,7 +1180,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _write_artifact(*, artifact_dir: str | None, output: Mapping[str, Any]) -> None:
+def _write_artifact(
+    *,
+    artifact_dir: str | None,
+    output: Mapping[str, Any],
+    profiler: AgentMemoryProfiler | None = None,
+) -> None:
     if artifact_dir is None:
         return
     path = pathlib.Path(artifact_dir)
@@ -1068,12 +1195,34 @@ def _write_artifact(*, artifact_dir: str | None, output: Mapping[str, Any]) -> N
         json.dumps(output, ensure_ascii=True, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    profiling_payload = output.get("profiling")
+    if (
+        profiler is not None
+        and profiler.should_emit_artifact()
+        and isinstance(profiling_payload, Mapping)
+    ):
+        profiling_target = path / "profiling.json"
+        profiling_target.write_text(
+            json.dumps(profiling_payload, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
 
 def main() -> None:
     args = _parse_args()
-    output = asyncio.run(_main_async(args))
-    _write_artifact(artifact_dir=args.artifact_dir, output=output)
+    profiler = _build_profiler()
+    if profiler.enabled and profiler.should_emit_stdout():
+        print(
+            "[profile] enabled "
+            f"(mode={profiler.output_mode}, fields=stage_aggregate,llm_aggregate,total_ms)",
+            file=sys.stderr,
+        )
+    output = asyncio.run(_main_async(args, profiler=profiler))
+    _write_artifact(
+        artifact_dir=args.artifact_dir,
+        output=output,
+        profiler=profiler,
+    )
     print(json.dumps(output, ensure_ascii=True, sort_keys=True))
 
 

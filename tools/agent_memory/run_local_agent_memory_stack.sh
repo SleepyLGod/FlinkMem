@@ -118,6 +118,8 @@ export SEM_RUNTIME_MODEL="${SEM_RUNTIME_MODEL:-deepseek-chat}"
 export SEM_RUNTIME_TIMEOUT_S="${SEM_RUNTIME_TIMEOUT_S:-120}"
 export SEM_RUNTIME_MAX_RETRIES="${SEM_RUNTIME_MAX_RETRIES:-4}"
 export SEM_RUNTIME_RETRY_BASE_DELAY_S="${SEM_RUNTIME_RETRY_BASE_DELAY_S:-0.5}"
+export AGENT_MEMORY_PROFILE_ENABLED="${AGENT_MEMORY_PROFILE_ENABLED:-0}"
+export AGENT_MEMORY_PROFILE_OUTPUT="${AGENT_MEMORY_PROFILE_OUTPUT:-artifact}"
 if [[ -z "${!SEM_RUNTIME_API_KEY_ENV:-}" ]]; then
   echo "Missing LLM API key env: ${SEM_RUNTIME_API_KEY_ENV}"
   exit 1
@@ -356,6 +358,7 @@ echo "[stack] mem0_llm_model=${MEM0_LLM_MODEL} zep_llm_model=${ZEP_LLM_MODEL} ze
 echo "[stack] mem0_relation_reference_mode=${MEM0_RELATION_REFERENCE_MODE} mem0_drift_policy=${MEM0_DRIFT_POLICY}"
 echo "[stack] zep_edge_reference_mode=${ZEP_EDGE_REFERENCE_MODE} zep_drift_policy=${ZEP_DRIFT_POLICY}"
 echo "[stack] embed_model=${MEM0_EMBEDDER_MODEL} embed_max_input_chars=${OLLAMA_EMBED_MAX_INPUT_CHARS}"
+echo "[stack] profiling_enabled=${AGENT_MEMORY_PROFILE_ENABLED} profiling_output=${AGENT_MEMORY_PROFILE_OUTPUT}"
 "${SMOKE_CMD[@]}" 2>&1 | tee "${ARTIFACT_DIR}/smoke_stdout.log"
 
 echo "[stack] smoke run completed; cleanup will run automatically"

@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from pyflink.semantic_runtime.llm_client import (
     LLMClient,
@@ -23,6 +24,9 @@ from pyflink.semantic_runtime.runtime.steps import (
     evaluate_all_history_sem_continuity,
     evaluate_sem_agg_summary_update,
     evaluate_sem_score,
+)
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.profiling import (
+    AgentMemoryProfiler,
 )
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     BoundaryDecision,
@@ -119,10 +123,12 @@ class EverMemOSOperatorRuntime:
         llm_config: LLMClientConfig,
         config: Optional[EverMemOSOperatorRuntimeConfig] = None,
         client_factory: Optional[Callable[[LLMClientConfig], LLMClient]] = None,
+        profiler: AgentMemoryProfiler | None = None,
     ) -> None:
         self._llm_config = llm_config
         self._config = config or EverMemOSOperatorRuntimeConfig()
         self._client_factory = client_factory or create_llm_client
+        self._profiler = profiler
         self.detect_boundary_calls: int = 0
         self.decompose_calls: int = 0
         self.distill_calls: int = 0
@@ -193,43 +199,49 @@ class EverMemOSOperatorRuntime:
         scene: str,
     ) -> BoundaryDecision:
         """Detect conversation boundary using configured semantic strategy."""
-        self.detect_boundary_calls += 1
-        if not new_messages:
-            raise ValueError("detect_boundary requires non-empty new_messages")
+        with self._profile_stage(stage="detect_boundary"):
+            self.detect_boundary_calls += 1
+            if not new_messages:
+                raise ValueError("detect_boundary requires non-empty new_messages")
 
-        if self._config.boundary_strategy == "all_history":
-            assert self._all_history_client is not None
-            result = await evaluate_all_history_sem_continuity(
-                client=self._all_history_client,
-                llm_config=self._llm_config,
-                active_window_events=[self._to_sem_window_event(item) for item in history_messages],
-                current_event=self._to_sem_window_event(new_messages[-1]),
+            if self._config.boundary_strategy == "all_history":
+                assert self._all_history_client is not None
+                with self._profile_stage(stage="op.boundary_all_history"):
+                    result = await evaluate_all_history_sem_continuity(
+                        client=self._all_history_client,
+                        llm_config=self._llm_config,
+                        active_window_events=[self._to_sem_window_event(item) for item in history_messages],
+                        current_event=self._to_sem_window_event(new_messages[-1]),
+                    )
+                continue_window = bool(result["continue_window"])
+                return BoundaryDecision(
+                    should_end=not continue_window,
+                    should_wait=continue_window,
+                    reasoning=str(result["reason"]),
+                    confidence=float(result["confidence"]),
+                    forced=False,
+                )
+
+            assert self._boundary_filter is not None
+            payload = {
+                "history_messages": [self._to_message_payload(item) for item in history_messages],
+                "new_messages": [self._to_message_payload(item) for item in new_messages],
+                "time_gap_ms": time_gap_ms,
+                "scene": scene,
+            }
+            parsed = await self._invoke_json(
+                self._boundary_filter,
+                payload,
+                step_name="boundary_sem_filter",
             )
-            continue_window = bool(result["continue_window"])
+            decision = bool(parsed["decision"])
             return BoundaryDecision(
-                should_end=not continue_window,
-                should_wait=continue_window,
-                reasoning=str(result["reason"]),
-                confidence=float(result["confidence"]),
+                should_end=decision,
+                should_wait=not decision,
+                reasoning=str(parsed["reason"]),
+                confidence=float(parsed["confidence"]),
                 forced=False,
             )
-
-        assert self._boundary_filter is not None
-        payload = {
-            "history_messages": [self._to_message_payload(item) for item in history_messages],
-            "new_messages": [self._to_message_payload(item) for item in new_messages],
-            "time_gap_ms": time_gap_ms,
-            "scene": scene,
-        }
-        parsed = await self._invoke_json(self._boundary_filter, payload)
-        decision = bool(parsed["decision"])
-        return BoundaryDecision(
-            should_end=decision,
-            should_wait=not decision,
-            reasoning=str(parsed["reason"]),
-            confidence=float(parsed["confidence"]),
-            forced=False,
-        )
 
     async def decompose_memcell(
         self,
@@ -238,41 +250,58 @@ class EverMemOSOperatorRuntime:
         scene: str,
     ) -> DecompositionArtifacts:
         """Decompose MemCell with sem_map predicates aligned to EverMemOS flow."""
-        self.decompose_calls += 1
-        payload = {
-            "group_id": memcell.group_id,
-            "scene": scene,
-            "participants": list(memcell.participants),
-            "messages": [self._to_message_payload(item) for item in memcell.original_messages],
-        }
-        episode_task = self._invoke_json(self._episode_map, payload)
-        subject_task = self._invoke_json(self._subject_map, payload)
-
-        if scene == "assistant":
-            foresight_task = self._invoke_json(self._foresight_map, payload)
-            event_log_task = self._invoke_json(self._event_log_map, payload)
-            episode_row, subject_row, foresight_row, event_log_row = await asyncio.gather(
-                episode_task,
-                subject_task,
-                foresight_task,
-                event_log_task,
+        with self._profile_stage(stage="decompose_memcell"):
+            self.decompose_calls += 1
+            payload = {
+                "group_id": memcell.group_id,
+                "scene": scene,
+                "participants": list(memcell.participants),
+                "messages": [self._to_message_payload(item) for item in memcell.original_messages],
+            }
+            episode_task = self._invoke_json(
+                self._episode_map,
+                payload,
+                step_name="decompose_episode",
             )
-            foresights = self._normalize_foresights(foresight_row["foresights"])
-            event_logs = self._normalize_event_logs(event_log_row["event_logs"])
+            subject_task = self._invoke_json(
+                self._subject_map,
+                payload,
+                step_name="decompose_subject",
+            )
+
+            if scene == "assistant":
+                foresight_task = self._invoke_json(
+                    self._foresight_map,
+                    payload,
+                    step_name="decompose_foresight",
+                )
+                event_log_task = self._invoke_json(
+                    self._event_log_map,
+                    payload,
+                    step_name="decompose_event_log",
+                )
+                episode_row, subject_row, foresight_row, event_log_row = await asyncio.gather(
+                    episode_task,
+                    subject_task,
+                    foresight_task,
+                    event_log_task,
+                )
+                foresights = self._normalize_foresights(foresight_row["foresights"])
+                event_logs = self._normalize_event_logs(event_log_row["event_logs"])
+                return DecompositionArtifacts(
+                    episode=str(episode_row["episode"]),
+                    subject=str(subject_row["subject"]),
+                    foresights=foresights,
+                    event_logs=event_logs,
+                )
+
+            episode_row, subject_row = await asyncio.gather(episode_task, subject_task)
             return DecompositionArtifacts(
                 episode=str(episode_row["episode"]),
                 subject=str(subject_row["subject"]),
-                foresights=foresights,
-                event_logs=event_logs,
+                foresights=[],
+                event_logs=[],
             )
-
-        episode_row, subject_row = await asyncio.gather(episode_task, subject_task)
-        return DecompositionArtifacts(
-            episode=str(episode_row["episode"]),
-            subject=str(subject_row["subject"]),
-            foresights=[],
-            event_logs=[],
-        )
 
     async def distill_profiles(
         self,
@@ -282,26 +311,29 @@ class EverMemOSOperatorRuntime:
         scene: str,
     ) -> Mapping[str, Any]:
         """Distill profile updates using sem_agg summarization + sem_map structuring."""
-        self.distill_calls += 1
-        added_events = [self._to_cluster_event(item) for item in cluster_memcells]
-        agg_row = await evaluate_sem_agg_summary_update(
-            client=self._profile_agg_client,
-            mode=self._config.profile_agg_mode,
-            current_summary=json.dumps(old_profiles, ensure_ascii=False),
-            added_events=added_events,
-        )
-        profile_row = await self._invoke_json(
-            self._profile_map,
-            {
-                "old_profiles": dict(old_profiles),
-                "distilled_summary": str(agg_row["summary"]),
-                "scene": scene,
-            },
-        )
-        profiles = profile_row.get("profiles")
-        if not isinstance(profiles, dict):
-            raise ValueError("profile distill must return dict profiles")
-        return profiles
+        with self._profile_stage(stage="distill_profiles"):
+            self.distill_calls += 1
+            added_events = [self._to_cluster_event(item) for item in cluster_memcells]
+            with self._profile_stage(stage="op.profile_agg_summary"):
+                agg_row = await evaluate_sem_agg_summary_update(
+                    client=self._profile_agg_client,
+                    mode=self._config.profile_agg_mode,
+                    current_summary=json.dumps(old_profiles, ensure_ascii=False),
+                    added_events=added_events,
+                )
+            profile_row = await self._invoke_json(
+                self._profile_map,
+                {
+                    "old_profiles": dict(old_profiles),
+                    "distilled_summary": str(agg_row["summary"]),
+                    "scene": scene,
+                },
+                step_name="profile_distill_map",
+            )
+            profiles = profile_row.get("profiles")
+            if not isinstance(profiles, dict):
+                raise ValueError("profile distill must return dict profiles")
+            return profiles
 
     def _init_boundary_runtime(self) -> None:
         if self._config.boundary_strategy == "all_history":
@@ -343,14 +375,69 @@ class EverMemOSOperatorRuntime:
         self,
         fn: SemMapFunction | SemFilterFunction,
         payload: Dict[str, Any],
+        *,
+        step_name: str,
     ) -> Dict[str, Any]:
-        rows = await fn.async_invoke(payload)
-        if len(rows) != 1:
-            raise RuntimeError("semantic operator invocation must return exactly one row")
-        parsed = json.loads(rows[0])
-        if not isinstance(parsed, dict):
-            raise ValueError("semantic operator invocation must return one JSON object")
-        return parsed
+        with self._profile_stage(stage=f"op.{step_name}"):
+            try:
+                rows = await fn.async_invoke(payload)
+            except Exception as error:
+                self._record_llm_error(step_name=step_name, error=error)
+                raise
+            if len(rows) != 1:
+                raise RuntimeError("semantic operator invocation must return exactly one row")
+            try:
+                parsed = json.loads(rows[0])
+            except Exception as error:
+                self._record_llm_error(step_name=step_name, error=error)
+                raise
+            if not isinstance(parsed, dict):
+                raise ValueError("semantic operator invocation must return one JSON object")
+            self._record_llm_metrics(step_name=step_name, parsed=parsed)
+            return parsed
+
+    @contextmanager
+    def _profile_stage(self, *, stage: str) -> Iterator[None]:
+        if self._profiler is None or not self._profiler.enabled:
+            yield
+            return
+        with self._profiler.stage(workflow="evermemos", stage=stage):
+            yield
+
+    def _record_llm_metrics(self, *, step_name: str, parsed: Dict[str, Any]) -> None:
+        if self._profiler is None or not self._profiler.enabled:
+            return
+        metrics = parsed.get("_metrics")
+        if not isinstance(metrics, dict):
+            return
+        latency = metrics.get("latency_ms")
+        attempts = metrics.get("attempts")
+        if not isinstance(latency, (int, float)):
+            return
+        if not isinstance(attempts, int):
+            attempts = 1
+        self._profiler.record_llm_success(
+            workflow="evermemos",
+            step=step_name,
+            latency_ms=float(latency),
+            attempts=int(attempts),
+        )
+
+    def _record_llm_error(self, *, step_name: str, error: Exception) -> None:
+        if self._profiler is None or not self._profiler.enabled:
+            return
+        message = str(error).casefold()
+        if "timeout" in message:
+            error_type = "timeout"
+        elif "payload" in message or "json" in message or "transferencodingerror" in message:
+            error_type = "payload"
+        else:
+            error_type = "other"
+        self._profiler.record_llm_error(
+            workflow="evermemos",
+            step=step_name,
+            error_type=error_type,
+        )
 
     def _normalize_foresights(self, values: Any) -> List[ForesightArtifact]:
         if not isinstance(values, list):
