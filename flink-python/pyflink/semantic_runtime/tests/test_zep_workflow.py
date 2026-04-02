@@ -334,6 +334,48 @@ def test_zep_add_episode_rejects_existing_entity_id_outside_candidates() -> None
         assert "not present in candidates" in str(exc)
 
 
+def test_zep_add_episode_upstream_mode_downgrades_invalid_existing_target() -> None:
+    class _InvalidEntityResolutionRuntime(_ScriptedSemanticRuntime):
+        async def resolve_entity(
+            self,
+            *,
+            extracted_entity: ZepExtractedEntity,
+            candidates: Sequence[ZepEntityCandidate],
+            message: str,
+            recent_episodes: Sequence[ZepEpisodeCandidate],
+            prompt: str,
+        ) -> ZepEntityResolution:
+            _ = (candidates, message, recent_episodes, prompt)
+            if extracted_entity.entity_name == "Alice":
+                return ZepEntityResolution(
+                    decision="EXISTING",
+                    entity_name="Alice",
+                    target_entity_id="e-not-in-candidates",
+                )
+            return ZepEntityResolution(
+                decision="NEW",
+                entity_name=extracted_entity.entity_name,
+            )
+
+    workflow = ZepAddEpisodeWorkflow(
+        config=ZepWorkflowConfig(),
+        semantic_runtime=_InvalidEntityResolutionRuntime(
+            drift_policy=DRIFT_POLICY_UPSTREAM_COMPATIBLE
+        ),
+        graph_store=_ScriptedGraphStore(),
+    )
+
+    result = asyncio.run(
+        workflow.add_episode(
+            group_id="g1",
+            message="Alice met Bob and talked about work",
+            valid_at_ms=1234,
+        )
+    )
+    assert result.resolved_entity_count == 2
+    assert result.added_edge_count == 1
+
+
 def test_zep_add_episode_summarizes_after_edge_writes() -> None:
     ordering_state: Dict[str, bool] = {"edge_written": False}
 

@@ -275,6 +275,12 @@ class ZepAddEpisodeWorkflow:
         if resolution.decision == "EXISTING":
             existing_entity_id = str(resolution.target_entity_id)
             if existing_entity_id not in candidate_entity_ids:
+                if self._is_upstream_compatible_drift_policy():
+                    existing_entity_id = None
+                    return _ResolvedEntityPlan(
+                        entity=entity,
+                        existing_entity_id=existing_entity_id,
+                    )
                 raise ValueError(
                     "resolve_entity returned EXISTING target_entity_id "
                     f"not present in candidates: entity_name={entity.entity_name!r} "

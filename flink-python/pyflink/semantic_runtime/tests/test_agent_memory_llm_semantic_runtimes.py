@@ -269,7 +269,115 @@ def test_mem0_extract_relations_skips_out_of_range_index_in_upstream_mode() -> N
     assert result == []
 
 
-def test_zep_resolve_entity_requires_target_for_existing() -> None:
+def test_mem0_resolve_entity_upstream_mode_downgrades_same_without_target() -> None:
+    runtime = Mem0GraphLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "decision": "SAME",
+                        "entity_name": "Alice",
+                        "target_entity_id": None,
+                    }
+                )
+            ]
+        )
+    )
+    result = asyncio.run(
+        runtime.resolve_entity(
+            entity=Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+            candidates=[],
+            prompt="resolve entity",
+        )
+    )
+    assert result.decision == "DIFFERENT"
+    assert result.target_entity_id is None
+
+
+def test_mem0_resolve_entity_fail_fast_requires_target_for_same() -> None:
+    runtime = Mem0GraphLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "decision": "SAME",
+                        "entity_name": "Alice",
+                        "target_entity_id": None,
+                    }
+                )
+            ]
+        ),
+        drift_policy=DRIFT_POLICY_FAIL_FAST,
+    )
+    try:
+        asyncio.run(
+            runtime.resolve_entity(
+                entity=Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+                candidates=[],
+                prompt="resolve entity",
+            )
+        )
+    except ValueError as exc:
+        assert "decision=SAME requires non-empty target_entity_id" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for SAME without target_entity_id")
+
+
+def test_mem0_resolve_entity_upstream_mode_ignores_target_for_different() -> None:
+    runtime = Mem0GraphLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "decision": "DIFFERENT",
+                        "entity_name": "Alice",
+                        "target_entity_id": "e1",
+                    }
+                )
+            ]
+        )
+    )
+    result = asyncio.run(
+        runtime.resolve_entity(
+            entity=Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+            candidates=[],
+            prompt="resolve entity",
+        )
+    )
+    assert result.decision == "DIFFERENT"
+    assert result.target_entity_id is None
+
+
+def test_mem0_resolve_entity_fail_fast_rejects_target_for_different() -> None:
+    runtime = Mem0GraphLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "decision": "DIFFERENT",
+                        "entity_name": "Alice",
+                        "target_entity_id": "e1",
+                    }
+                )
+            ]
+        ),
+        drift_policy=DRIFT_POLICY_FAIL_FAST,
+    )
+    try:
+        asyncio.run(
+            runtime.resolve_entity(
+                entity=Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person"),
+                candidates=[],
+                prompt="resolve entity",
+            )
+        )
+    except ValueError as exc:
+        assert "decision=DIFFERENT requires null target_entity_id" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for DIFFERENT with non-null target_entity_id")
+
+
+def test_zep_resolve_entity_upstream_mode_downgrades_missing_existing_target() -> None:
     runtime = ZepLLMSemanticRuntime(
         client=_ScriptedLLMClient(
             responses=[
@@ -282,6 +390,34 @@ def test_zep_resolve_entity_requires_target_for_existing() -> None:
                 )
             ]
         )
+    )
+    result = asyncio.run(
+        runtime.resolve_entity(
+            extracted_entity=ZepExtractedEntity(entity_name="Alice", type_id="person"),
+            candidates=[],
+            message="Alice likes tea",
+            recent_episodes=[],
+            prompt="resolve entity",
+        )
+    )
+    assert result.decision == "NEW"
+    assert result.target_entity_id is None
+
+
+def test_zep_resolve_entity_fail_fast_requires_target_for_existing() -> None:
+    runtime = ZepLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "decision": "EXISTING",
+                        "entity_name": "Alice",
+                        "target_entity_id": None,
+                    }
+                )
+            ]
+        ),
+        drift_policy=DRIFT_POLICY_FAIL_FAST,
     )
     try:
         asyncio.run(
@@ -299,7 +435,7 @@ def test_zep_resolve_entity_requires_target_for_existing() -> None:
     raise AssertionError("Expected ValueError for EXISTING without target_entity_id")
 
 
-def test_zep_resolve_entity_rejects_target_for_new() -> None:
+def test_zep_resolve_entity_upstream_mode_ignores_target_for_new() -> None:
     runtime = ZepLLMSemanticRuntime(
         client=_ScriptedLLMClient(
             responses=[
@@ -312,6 +448,34 @@ def test_zep_resolve_entity_rejects_target_for_new() -> None:
                 )
             ]
         )
+    )
+    result = asyncio.run(
+        runtime.resolve_entity(
+            extracted_entity=ZepExtractedEntity(entity_name="Alice", type_id="person"),
+            candidates=[],
+            message="Alice likes tea",
+            recent_episodes=[],
+            prompt="resolve entity",
+        )
+    )
+    assert result.decision == "NEW"
+    assert result.target_entity_id is None
+
+
+def test_zep_resolve_entity_fail_fast_rejects_target_for_new() -> None:
+    runtime = ZepLLMSemanticRuntime(
+        client=_ScriptedLLMClient(
+            responses=[
+                json.dumps(
+                    {
+                        "decision": "NEW",
+                        "entity_name": "Alice",
+                        "target_entity_id": "e1",
+                    }
+                )
+            ]
+        ),
+        drift_policy=DRIFT_POLICY_FAIL_FAST,
     )
     try:
         asyncio.run(

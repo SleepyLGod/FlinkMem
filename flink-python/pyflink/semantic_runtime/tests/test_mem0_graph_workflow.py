@@ -617,6 +617,50 @@ def test_mem0_graph_add_rejects_same_target_entity_id_outside_candidates() -> No
     raise AssertionError("Expected ValueError for SAME target_entity_id outside candidates")
 
 
+def test_mem0_graph_add_upstream_mode_downgrades_same_target_outside_candidates() -> None:
+    store = _InMemoryGraphStore()
+    runtime = _ScriptedGraphSemanticRuntime(
+        entities=[Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person")],
+        relations=[],
+        entity_resolutions={
+            "Alice": Mem0GraphEntityResolution(
+                decision="SAME",
+                entity_name="Alice",
+                target_entity_id="e_missing",
+            )
+        },
+        relation_resolutions={},
+        drift_policy=DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    )
+    entity_searcher = _ScriptedEntitySearcher(
+        {
+            "Alice": [
+                Mem0GraphEntityCandidate(
+                    entity_id="e_existing",
+                    entity_name="Alice",
+                    entity_type="person",
+                    score=0.91,
+                    source="vector",
+                )
+            ]
+        }
+    )
+
+    workflow = Mem0GraphWorkflow(
+        config=Mem0GraphConfig(),
+        semantic_runtime=runtime,
+        graph_store=store,
+        entity_searcher=entity_searcher,
+        relation_searcher=_ScriptedRelationSearcher({}),
+    )
+
+    result = asyncio.run(workflow.add(group_id="g1", messages=["Alice says hello"]))
+    assert result.upserted_entities == 1
+    assert len(store.entities) == 1
+    stored_row = next(iter(store.entities.values()))
+    assert stored_row["entity_name"] == "Alice"
+
+
 def test_mem0_graph_add_rejects_relation_entity_outside_resolved_set() -> None:
     store = _InMemoryGraphStore()
     runtime = _ScriptedGraphSemanticRuntime(

@@ -549,10 +549,35 @@ class Mem0GraphLLMSemanticRuntime:
         )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_entity payload must be object")
+        decision = _as_text(payload.get("decision"), field_name="decision")
+        entity_name = _as_text(payload.get("entity_name"), field_name="entity_name")
+        target_entity_id = _as_str_or_none(payload.get("target_entity_id"))
+        fail_fast = not is_upstream_compatible_drift_policy(self._drift_policy)
+        if decision == "SAME":
+            if target_entity_id is None:
+                if fail_fast:
+                    raise ValueError(
+                        "resolve_entity decision=SAME requires non-empty target_entity_id"
+                    )
+                decision = "DIFFERENT"
+        elif decision == "DIFFERENT":
+            if target_entity_id is not None:
+                if fail_fast:
+                    raise ValueError(
+                        "resolve_entity decision=DIFFERENT requires null target_entity_id"
+                    )
+                target_entity_id = None
+        elif fail_fast:
+            raise ValueError(
+                "resolve_entity decision must be one of {'SAME','DIFFERENT'}"
+            )
+        else:
+            decision = "DIFFERENT"
+            target_entity_id = None
         return Mem0GraphEntityResolution(
-            decision=_as_text(payload.get("decision"), field_name="decision"),
-            entity_name=_as_text(payload.get("entity_name"), field_name="entity_name"),
-            target_entity_id=_as_str_or_none(payload.get("target_entity_id")),
+            decision=decision,
+            entity_name=entity_name,
+            target_entity_id=target_entity_id,
             reason=str(payload.get("reason", "")),
             confidence=_as_float(payload.get("confidence", 0.0), field_name="confidence"),
         )
@@ -777,23 +802,31 @@ class ZepLLMSemanticRuntime:
         )
         if not isinstance(payload, Mapping):
             raise ValueError("resolve_entity payload must be object")
+        fail_fast = not is_upstream_compatible_drift_policy(self._drift_policy)
         decision = _as_text(payload.get("decision"), field_name="decision")
         entity_name = _as_text(payload.get("entity_name"), field_name="entity_name")
         target_entity_id = _as_str_or_none(payload.get("target_entity_id"))
         if decision == "EXISTING":
             if target_entity_id is None:
-                raise ValueError(
-                    "resolve_entity decision=EXISTING requires non-empty target_entity_id"
-                )
+                if fail_fast:
+                    raise ValueError(
+                        "resolve_entity decision=EXISTING requires non-empty target_entity_id"
+                    )
+                decision = "NEW"
         elif decision == "NEW":
             if target_entity_id is not None:
-                raise ValueError(
-                    "resolve_entity decision=NEW requires null target_entity_id"
-                )
+                if fail_fast:
+                    raise ValueError(
+                        "resolve_entity decision=NEW requires null target_entity_id"
+                    )
+                target_entity_id = None
         else:
-            raise ValueError(
-                "resolve_entity decision must be one of {'EXISTING','NEW'}"
-            )
+            if fail_fast:
+                raise ValueError(
+                    "resolve_entity decision must be one of {'EXISTING','NEW'}"
+                )
+            decision = "NEW"
+            target_entity_id = None
         return ZepEntityResolution(
             decision=decision,
             entity_name=entity_name,

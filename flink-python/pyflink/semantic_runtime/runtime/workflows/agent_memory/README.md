@@ -378,6 +378,8 @@ Profiling outputs when enabled:
   - `upstream_compatible` (default): continue on endpoint drift
     - zep: unresolved edge endpoints are skipped
     - mem0 graph: unresolved relation endpoints are materialized as placeholder entities before relation resolution
+    - zep: `resolve_entity` returning `EXISTING` with invalid/missing target is downgraded to `NEW`
+    - mem0 graph: `resolve_entity` returning `SAME` with invalid/missing target is downgraded to `DIFFERENT`
   - `fail_fast`: unresolved/malformed endpoint rows fail immediately
 - Mem0 smoke retrieval query uses benchmark question (`metadata.question`) to align with retrieval semantics and avoid passing long raw messages directly into embedding recall.
 - Zep Neo4j fulltext indexes are bootstrapped by runtime on startup (`node_name_and_summary`, `edge_name_and_fact`), so explicit manual index creation is not required.
@@ -403,6 +405,21 @@ Profiling outputs when enabled:
   - Source-aligned baseline: `MEM0_RELATION_REFERENCE_MODE=name` + `MEM0_DRIFT_POLICY=upstream_compatible`.
 - Zep/Graphiti upstream extraction is also name-oriented, but invalid edge endpoints are typically skipped with warnings in parts of upstream flow.
   - Source-aligned baseline: `ZEP_EDGE_REFERENCE_MODE=name` + `ZEP_DRIFT_POLICY=upstream_compatible`.
+- Verified upstream-compatible fallback semantics (source code aligned):
+  - Mem0 upstream (`mem0/memory/graph_memory.py`, `mem0/memory/utils.py`):
+    - relation rows are normalized by `remove_spaces_from_entities` and malformed rows are dropped.
+    - graph insertion does not require relation endpoints to be pre-resolved candidates; missing endpoint types fall back to `__User__` and nodes are still merged/upserted.
+  - Graphiti upstream (`graphiti_core/utils/maintenance/node_operations.py`, `edge_operations.py`):
+    - invalid `duplicate_candidate_id` is treated as no duplicate (warning + continue).
+    - extracted edges with unknown source/target names are skipped with warnings.
+    - invalid duplicate/contradiction indexes from LLM are filtered out with warnings.
+- Local reconstruction policy mapping:
+  - `upstream_compatible`:
+    - mem0 graph: invalid `SAME target_entity_id` degrades to new-entity upsert path; unresolved relation endpoints are placeholder-upserted.
+    - zep: invalid `EXISTING target_entity_id` degrades to new-entity upsert path; unresolved edge endpoints are dropped.
+    - LLM runtime keeps processing on malformed entity-resolution payloads by normalizing to upstream-compatible defaults.
+  - `fail_fast`:
+    - the same malformed payloads/endpoint drifts raise immediately and stop the run.
 - Explicit failure-driven evaluation:
   - keep `*_REFERENCE_MODE=name|index` as needed
   - set `*_DRIFT_POLICY=fail_fast`
