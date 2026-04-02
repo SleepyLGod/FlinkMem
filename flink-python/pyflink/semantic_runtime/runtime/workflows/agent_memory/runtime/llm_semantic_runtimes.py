@@ -12,6 +12,15 @@ from pyflink.semantic_runtime.runtime.json_output import parse_llm_json_object
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     RetrievedMemory,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_FAIL_FAST,
+    DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    ENTITY_REFERENCE_MODE_NAME,
+    is_upstream_compatible_drift_policy,
+    normalize_drift_policy,
+    normalize_entity_reference_mode,
+    uses_index_entity_reference_mode,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.contracts import (
     Mem0FactResolution,
     Mem0GraphEntityCandidate,
@@ -92,8 +101,22 @@ class _JSONLLMHelper:
 class Mem0BasicLLMSemanticRuntime:
     """LLM-backed Mem0 Basic semantic runtime."""
 
-    def __init__(self, *, client: LLMClient) -> None:
+    def __init__(
+        self,
+        *,
+        client: LLMClient,
+        drift_policy: str = DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    ) -> None:
         self._helper = _JSONLLMHelper(client=client)
+        self._drift_policy = normalize_drift_policy(
+            drift_policy,
+            field_name="drift_policy",
+        )
+
+    @property
+    def drift_policy(self) -> str:
+        """Configured drift policy."""
+        return self._drift_policy
 
     async def extract_facts(
         self,
@@ -165,38 +188,74 @@ class Mem0BasicLLMSemanticRuntime:
 
         resolutions: list[Mem0FactResolution | None] = [None] * len(facts)
         seen_indexes: set[int] = set()
+        fail_fast = not is_upstream_compatible_drift_policy(self._drift_policy)
         for item in decisions:
             if not isinstance(item, Mapping):
-                raise ValueError("resolve_facts decision row must be object")
-            fact_index = _as_int(item.get("fact_index"), field_name="fact_index")
+                if fail_fast:
+                    raise ValueError("resolve_facts decision row must be object")
+                continue
+            try:
+                fact_index = _as_int(item.get("fact_index"), field_name="fact_index")
+            except Exception:
+                if fail_fast:
+                    raise
+                continue
             if fact_index < 0 or fact_index >= len(facts):
-                raise ValueError(
-                    f"resolve_facts returned out-of-range fact_index={fact_index}"
-                )
+                if fail_fast:
+                    raise ValueError(
+                        f"resolve_facts returned out-of-range fact_index={fact_index}"
+                    )
+                continue
             if fact_index in seen_indexes:
-                raise ValueError(
-                    f"resolve_facts returned duplicate fact_index={fact_index}"
-                )
-            seen_indexes.add(fact_index)
+                if fail_fast:
+                    raise ValueError(
+                        f"resolve_facts returned duplicate fact_index={fact_index}"
+                    )
+                continue
             expected_fact = _as_text(facts[fact_index], field_name="facts[]")
-            resolutions[fact_index] = Mem0FactResolution(
-                action=_as_text(item.get("action"), field_name="action"),
-                fact=expected_fact,
-                target_memory_id=_as_str_or_none(item.get("target_memory_id")),
-                content=_as_str_or_none(item.get("content")),
-                reason=str(item.get("reason", "")),
-                confidence=_as_float(item.get("confidence", 0.0), field_name="confidence"),
-            )
-        if len(seen_indexes) != len(facts):
+            try:
+                resolution = Mem0FactResolution(
+                    action=_as_text(item.get("action"), field_name="action"),
+                    fact=expected_fact,
+                    target_memory_id=_as_str_or_none(item.get("target_memory_id")),
+                    content=_as_str_or_none(item.get("content")),
+                    reason=str(item.get("reason", "")),
+                    confidence=_as_float(
+                        item.get("confidence", 0.0),
+                        field_name="confidence",
+                    ),
+                )
+            except Exception:
+                if fail_fast:
+                    raise
+                resolution = Mem0FactResolution(
+                    action="NONE",
+                    fact=expected_fact,
+                    reason="upstream_compatible_invalid_decision",
+                    confidence=0.0,
+                )
+            resolutions[fact_index] = resolution
+            seen_indexes.add(fact_index)
+        if fail_fast and len(seen_indexes) != len(facts):
             raise ValueError(
                 "resolve_facts must return exactly one decision per input fact"
             )
         output: list[Mem0FactResolution] = []
         for index, resolution in enumerate(resolutions):
             if resolution is None:
-                raise RuntimeError(
-                    f"resolve_facts produced no resolution for fact_index={index}"
+                if fail_fast:
+                    raise RuntimeError(
+                        f"resolve_facts produced no resolution for fact_index={index}"
+                    )
+                output.append(
+                    Mem0FactResolution(
+                        action="NONE",
+                        fact=_as_text(facts[index], field_name="facts[]"),
+                        reason="upstream_compatible_missing_decision",
+                        confidence=0.0,
+                    )
                 )
+                continue
             output.append(resolution)
         return output
 
@@ -208,14 +267,28 @@ class Mem0GraphLLMSemanticRuntime:
         self,
         *,
         client: LLMClient,
-        relation_entity_reference_mode: str = "name",
+        relation_entity_reference_mode: str = ENTITY_REFERENCE_MODE_NAME,
+        drift_policy: str = DRIFT_POLICY_UPSTREAM_COMPATIBLE,
     ) -> None:
-        if relation_entity_reference_mode not in {"name", "index"}:
-            raise ValueError(
-                "relation_entity_reference_mode must be one of {'name', 'index'}"
-            )
         self._helper = _JSONLLMHelper(client=client)
-        self._relation_entity_reference_mode = str(relation_entity_reference_mode)
+        self._relation_entity_reference_mode = normalize_entity_reference_mode(
+            relation_entity_reference_mode,
+            field_name="relation_entity_reference_mode",
+        )
+        self._drift_policy = normalize_drift_policy(
+            drift_policy,
+            field_name="drift_policy",
+        )
+
+    @property
+    def relation_entity_reference_mode(self) -> str:
+        """Configured relation endpoint reference mode."""
+        return self._relation_entity_reference_mode
+
+    @property
+    def drift_policy(self) -> str:
+        """Configured drift policy."""
+        return self._drift_policy
 
     async def extract_entities(
         self,
@@ -265,7 +338,8 @@ class Mem0GraphLLMSemanticRuntime:
         ]
         if not allowed_names:
             raise ValueError("extract_relations requires non-empty allowed_entity_names")
-        if self._relation_entity_reference_mode == "index":
+        fail_fast = not is_upstream_compatible_drift_policy(self._drift_policy)
+        if uses_index_entity_reference_mode(self._relation_entity_reference_mode):
             request_prompt = (
                 f"{prompt}\n"
                 "Return ONLY JSON schema:\n"
@@ -276,11 +350,16 @@ class Mem0GraphLLMSemanticRuntime:
                 f"allowed_entity_names={_format_json(allowed_names)}"
             )
         else:
+            endpoint_rule = (
+                "source and destination MUST be exact members of allowed_entity_names."
+                if fail_fast
+                else "source and destination SHOULD prefer allowed_entity_names."
+            )
             request_prompt = (
                 f"{prompt}\n"
                 "Return ONLY JSON schema:\n"
                 '{"entities":[{"source":"...","relationship":"...","destination":"..."}]}\n'
-                "source and destination MUST be exact members of allowed_entity_names.\n"
+                f"{endpoint_rule}\n"
                 f"messages={_format_json(list(messages))}\n"
                 f"entities={_format_json(entities_payload)}\n"
                 f"allowed_entity_names={_format_json(allowed_names)}"
@@ -295,51 +374,78 @@ class Mem0GraphLLMSemanticRuntime:
         allowed_name_set = set(allowed_names)
         for item in relations:
             if not isinstance(item, Mapping):
-                raise ValueError("relation row must be object")
-            if self._relation_entity_reference_mode == "index":
-                source_index = _as_int(item.get("source_index"), field_name="source_index")
-                destination_index = _as_int(
-                    item.get("destination_index"),
-                    field_name="destination_index",
-                )
+                if fail_fast:
+                    raise ValueError("relation row must be object")
+                continue
+            if uses_index_entity_reference_mode(self._relation_entity_reference_mode):
+                try:
+                    source_index = _as_int(
+                        item.get("source_index"),
+                        field_name="source_index",
+                    )
+                    destination_index = _as_int(
+                        item.get("destination_index"),
+                        field_name="destination_index",
+                    )
+                except Exception:
+                    if fail_fast:
+                        raise
+                    continue
                 if source_index < 0 or source_index >= len(allowed_names):
-                    raise ValueError(
-                        "extract_relations returned source_index out of range: "
-                        f"{source_index}"
-                    )
+                    if fail_fast:
+                        raise ValueError(
+                            "extract_relations returned source_index out of range: "
+                            f"{source_index}"
+                        )
+                    continue
                 if destination_index < 0 or destination_index >= len(allowed_names):
-                    raise ValueError(
-                        "extract_relations returned destination_index out of range: "
-                        f"{destination_index}"
-                    )
+                    if fail_fast:
+                        raise ValueError(
+                            "extract_relations returned destination_index out of range: "
+                            f"{destination_index}"
+                        )
+                    continue
                 source_canonical = allowed_names[source_index]
                 destination_canonical = allowed_names[destination_index]
             else:
-                source_canonical = _as_text(
-                    item.get("source"),
-                    field_name="source",
-                )
-                destination_canonical = _as_text(
-                    item.get("destination"),
-                    field_name="destination",
-                )
-                if source_canonical not in allowed_name_set:
+                try:
+                    source_canonical = _as_text(
+                        item.get("source"),
+                        field_name="source",
+                    )
+                    destination_canonical = _as_text(
+                        item.get("destination"),
+                        field_name="destination",
+                    )
+                except Exception:
+                    if fail_fast:
+                        raise
+                    continue
+                if fail_fast and source_canonical not in allowed_name_set:
                     raise ValueError(
                         "extract_relations produced source not in allowed_entity_names: "
                         f"{source_canonical!r}"
                     )
-                if destination_canonical not in allowed_name_set:
+                if fail_fast and destination_canonical not in allowed_name_set:
                     raise ValueError(
                         "extract_relations produced destination not in allowed_entity_names: "
                         f"{destination_canonical!r}"
                     )
-            output.append(
-                Mem0GraphExtractedRelation(
-                    source_entity_name=source_canonical,
-                    relationship=_as_text(item.get("relationship"), field_name="relationship"),
-                    destination_entity_name=destination_canonical,
+            try:
+                output.append(
+                    Mem0GraphExtractedRelation(
+                        source_entity_name=source_canonical,
+                        relationship=_as_text(
+                            item.get("relationship"),
+                            field_name="relationship",
+                        ),
+                        destination_entity_name=destination_canonical,
+                    )
                 )
-            )
+            except Exception:
+                if fail_fast:
+                    raise
+                continue
         return output
 
     async def resolve_entity(
@@ -432,7 +538,8 @@ class ZepLLMSemanticRuntime:
         max_recent_episodes: int | None = None,
         max_recent_episode_chars: int | None = None,
         max_edge_entities: int | None = None,
-        edge_entity_reference_mode: str = "name",
+        edge_entity_reference_mode: str = ENTITY_REFERENCE_MODE_NAME,
+        drift_policy: str = DRIFT_POLICY_UPSTREAM_COMPATIBLE,
     ) -> None:
         if max_message_chars is not None and int(max_message_chars) <= 0:
             raise ValueError("max_message_chars must be > 0 when provided")
@@ -442,10 +549,6 @@ class ZepLLMSemanticRuntime:
             raise ValueError("max_recent_episode_chars must be > 0 when provided")
         if max_edge_entities is not None and int(max_edge_entities) <= 0:
             raise ValueError("max_edge_entities must be > 0 when provided")
-        if edge_entity_reference_mode not in {"name", "index"}:
-            raise ValueError(
-                "edge_entity_reference_mode must be one of {'name', 'index'}"
-            )
         self._helper = _JSONLLMHelper(client=client)
         self._summary_helper = (
             _JSONLLMHelper(client=summary_client)
@@ -466,7 +569,24 @@ class ZepLLMSemanticRuntime:
         self._max_edge_entities = (
             int(max_edge_entities) if max_edge_entities is not None else None
         )
-        self._edge_entity_reference_mode = str(edge_entity_reference_mode)
+        self._edge_entity_reference_mode = normalize_entity_reference_mode(
+            edge_entity_reference_mode,
+            field_name="edge_entity_reference_mode",
+        )
+        self._drift_policy = normalize_drift_policy(
+            drift_policy,
+            field_name="drift_policy",
+        )
+
+    @property
+    def edge_entity_reference_mode(self) -> str:
+        """Configured edge endpoint reference mode."""
+        return self._edge_entity_reference_mode
+
+    @property
+    def drift_policy(self) -> str:
+        """Configured drift policy."""
+        return self._drift_policy
 
     def _bounded_text(self, text: str, *, max_chars: int | None) -> str:
         normalized = _as_text(text, field_name="text")
@@ -645,7 +765,8 @@ class ZepLLMSemanticRuntime:
         allowed_name_set = set(allowed_names)
         if not allowed_name_set:
             raise ValueError("extract_edges requires non-empty allowed_entity_names")
-        if self._edge_entity_reference_mode == "index":
+        fail_fast = not is_upstream_compatible_drift_policy(self._drift_policy)
+        if uses_index_entity_reference_mode(self._edge_entity_reference_mode):
             request_prompt = (
                 f"{prompt}\n"
                 "Return ONLY JSON schema:\n"
@@ -657,11 +778,19 @@ class ZepLLMSemanticRuntime:
                 f"recent_episodes={_format_json(recent_payload)}"
             )
         else:
+            endpoint_rule = (
+                "source_entity_name and destination_entity_name MUST be exact members of allowed_entity_names."
+                if fail_fast
+                else (
+                    "source_entity_name and destination_entity_name SHOULD prefer "
+                    "allowed_entity_names."
+                )
+            )
             request_prompt = (
                 f"{prompt}\n"
                 "Return ONLY JSON schema:\n"
                 '{"edges":[{"source_entity_name":"...","destination_entity_name":"...","relation":"...","fact":"..."}]}\n'
-                "source_entity_name and destination_entity_name MUST be exact members of allowed_entity_names.\n"
+                f"{endpoint_rule}\n"
                 f"message={_format_json(bounded_message)}\n"
                 f"entities={_format_json(entities_payload)}\n"
                 f"allowed_entity_names={_format_json(allowed_names)}\n"
@@ -676,52 +805,76 @@ class ZepLLMSemanticRuntime:
         output: list[ZepExtractedEdge] = []
         for item in edges:
             if not isinstance(item, Mapping):
-                raise ValueError("edge row must be object")
-            if self._edge_entity_reference_mode == "index":
-                source_index = _as_int(item.get("source_index"), field_name="source_index")
-                destination_index = _as_int(
-                    item.get("destination_index"),
-                    field_name="destination_index",
-                )
+                if fail_fast:
+                    raise ValueError("edge row must be object")
+                continue
+            if uses_index_entity_reference_mode(self._edge_entity_reference_mode):
+                try:
+                    source_index = _as_int(
+                        item.get("source_index"),
+                        field_name="source_index",
+                    )
+                    destination_index = _as_int(
+                        item.get("destination_index"),
+                        field_name="destination_index",
+                    )
+                except Exception:
+                    if fail_fast:
+                        raise
+                    continue
                 if source_index < 0 or source_index >= len(allowed_names):
-                    raise ValueError(
-                        "extract_edges produced source_index out of range: "
-                        f"{source_index}"
-                    )
+                    if fail_fast:
+                        raise ValueError(
+                            "extract_edges produced source_index out of range: "
+                            f"{source_index}"
+                        )
+                    continue
                 if destination_index < 0 or destination_index >= len(allowed_names):
-                    raise ValueError(
-                        "extract_edges produced destination_index out of range: "
-                        f"{destination_index}"
-                    )
+                    if fail_fast:
+                        raise ValueError(
+                            "extract_edges produced destination_index out of range: "
+                            f"{destination_index}"
+                        )
+                    continue
                 source_entity_name = allowed_names[source_index]
                 destination_entity_name = allowed_names[destination_index]
             else:
-                source_entity_name = _as_text(
-                    item.get("source_entity_name"),
-                    field_name="source_entity_name",
-                )
-                destination_entity_name = _as_text(
-                    item.get("destination_entity_name"),
-                    field_name="destination_entity_name",
-                )
-                if source_entity_name not in allowed_name_set:
+                try:
+                    source_entity_name = _as_text(
+                        item.get("source_entity_name"),
+                        field_name="source_entity_name",
+                    )
+                    destination_entity_name = _as_text(
+                        item.get("destination_entity_name"),
+                        field_name="destination_entity_name",
+                    )
+                except Exception:
+                    if fail_fast:
+                        raise
+                    continue
+                if fail_fast and source_entity_name not in allowed_name_set:
                     raise ValueError(
                         "extract_edges produced source_entity_name not in allowed_entity_names: "
                         f"{source_entity_name!r}"
                     )
-                if destination_entity_name not in allowed_name_set:
+                if fail_fast and destination_entity_name not in allowed_name_set:
                     raise ValueError(
                         "extract_edges produced destination_entity_name not in allowed_entity_names: "
                         f"{destination_entity_name!r}"
                     )
-            output.append(
-                ZepExtractedEdge(
-                    source_entity_name=source_entity_name,
-                    destination_entity_name=destination_entity_name,
-                    relation=_as_text(item.get("relation"), field_name="relation"),
-                    fact=_as_text(item.get("fact"), field_name="fact"),
+            try:
+                output.append(
+                    ZepExtractedEdge(
+                        source_entity_name=source_entity_name,
+                        destination_entity_name=destination_entity_name,
+                        relation=_as_text(item.get("relation"), field_name="relation"),
+                        fact=_as_text(item.get("fact"), field_name="fact"),
+                    )
                 )
-            )
+            except Exception:
+                if fail_fast:
+                    raise
+                continue
         return output
 
     async def resolve_edge(

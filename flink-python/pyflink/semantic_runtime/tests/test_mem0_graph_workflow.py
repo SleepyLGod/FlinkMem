@@ -35,6 +35,11 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.contracts impo
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.graph import (
     Mem0GraphWorkflow,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_FAIL_FAST,
+    DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    ENTITY_REFERENCE_MODE_NAME,
+)
 
 
 class _InMemoryGraphStore:
@@ -161,11 +166,15 @@ class _ScriptedGraphSemanticRuntime:
         relations: Sequence[Mem0GraphExtractedRelation],
         entity_resolutions: Dict[str, Mem0GraphEntityResolution],
         relation_resolutions: Dict[Tuple[str, str, str], Mem0GraphRelationResolution],
+        relation_entity_reference_mode: str = ENTITY_REFERENCE_MODE_NAME,
+        drift_policy: str = DRIFT_POLICY_FAIL_FAST,
     ) -> None:
         self._entities = list(entities)
         self._relations = list(relations)
         self._entity_resolutions = dict(entity_resolutions)
         self._relation_resolutions = dict(relation_resolutions)
+        self.relation_entity_reference_mode = relation_entity_reference_mode
+        self.drift_policy = drift_policy
         self.entity_extract_prompts: List[str] = []
         self.relation_extract_prompts: List[str] = []
         self.entity_identity_prompts: List[str] = []
@@ -686,3 +695,48 @@ def test_mem0_graph_add_accepts_relation_entity_with_case_whitespace_variation()
 
     result = asyncio.run(workflow.add(group_id="g1", messages=["Alice mentions Bob"]))
     assert result.added_relations == 1
+
+
+def test_mem0_graph_add_upstream_mode_upserts_missing_relation_endpoints() -> None:
+    store = _InMemoryGraphStore()
+    runtime = _ScriptedGraphSemanticRuntime(
+        entities=[Mem0GraphExtractedEntity(entity_name="Alice", entity_type="person")],
+        relations=[
+            Mem0GraphExtractedRelation(
+                source_entity_name="Alice",
+                relationship="mentions",
+                destination_entity_name="Bob",
+            )
+        ],
+        entity_resolutions={
+            "Alice": Mem0GraphEntityResolution(
+                decision="DIFFERENT",
+                entity_name="Alice",
+            )
+        },
+        relation_resolutions={
+            ("Alice", "mentions", "Bob"): Mem0GraphRelationResolution(
+                action="NEW",
+                source_entity_name="Alice",
+                destination_entity_name="Bob",
+                relationship="mentions",
+            )
+        },
+        relation_entity_reference_mode=ENTITY_REFERENCE_MODE_NAME,
+        drift_policy=DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    )
+    workflow = Mem0GraphWorkflow(
+        config=Mem0GraphConfig(),
+        semantic_runtime=runtime,
+        graph_store=store,
+        entity_searcher=_ScriptedEntitySearcher({}),
+        relation_searcher=_ScriptedRelationSearcher({}),
+    )
+
+    result = asyncio.run(workflow.add(group_id="g1", messages=["Alice mentions Bob"]))
+    assert result.added_relations == 1
+    assert result.upserted_entities == 2
+    assert "Bob" in {
+        row["entity_name"]
+        for row in store.entities.values()
+    }

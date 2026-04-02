@@ -270,13 +270,14 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
 ```bash
-# Zep robust edge extraction mode (index-based edge endpoints)
+# Zep fail-fast index endpoint mode
 cd /Users/von/Projects/FlinkMem
 PYTHON_BIN=/Users/von/Projects/FlinkMem/.isolation/venv/py312/bin/python \
 DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
 NEO4J_PASSWORD=secret123 \
 WORKFLOWS=zep \
-ZEP_EDGE_ENTITY_REFERENCE_MODE=index \
+ZEP_EDGE_REFERENCE_MODE=index \
+ZEP_DRIFT_POLICY=fail_fast \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
@@ -330,9 +331,11 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
   - `ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY` (DB write stage)
   - `ZEP_EDGE_RESOLVE_CONCURRENCY`
   - `ZEP_EDGE_WRITE_GROUP_CONCURRENCY`
-  - `ZEP_EDGE_ENTITY_REFERENCE_MODE=name|index` (default `name`)
-- Mem0 graph relation reference mode:
-  - `MEM0_RELATION_ENTITY_REFERENCE_MODE=name|index` (default `name`)
+  - `ZEP_EDGE_REFERENCE_MODE=name|index` (default `name`)
+  - `ZEP_DRIFT_POLICY=fail_fast|upstream_compatible` (default `upstream_compatible`)
+- Mem0 relation endpoint mode:
+  - `MEM0_RELATION_REFERENCE_MODE=name|index` (default `name`)
+  - `MEM0_DRIFT_POLICY=fail_fast|upstream_compatible` (default `upstream_compatible`)
 
 12. DeepSeek + Ollama status:
 
@@ -344,12 +347,17 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 - `OLLAMA_EMBED_MAX_INPUT_CHARS` is applied at smoke-runner embedding-call boundary (default follows `MEM0_EMBEDDER_MAX_INPUT_CHARS` in stack script).
 - For Zep throughput tuning, start with `ZEP_ENTITY_SUMMARY_CONCURRENCY=8` and keep
   `ZEP_ENTITY_UPSERT_GROUP_CONCURRENCY` lower when Neo4j write pressure becomes the bottleneck.
-- `ZEP_EDGE_ENTITY_REFERENCE_MODE` controls edge extraction contract:
-  - `name`: source/destination entity names (source-aligned behavior)
-  - `index`: source/destination indexes into `allowed_entity_names` (more robust against LLM name drift)
-- `MEM0_RELATION_ENTITY_REFERENCE_MODE` controls mem0 graph relation extraction contract:
-  - `name` (default): `source`/`destination` entity names (aligned with mem0 upstream relation tool shape)
-  - `index`: `source_index`/`destination_index` into `allowed_entity_names`
+- `ZEP_EDGE_REFERENCE_MODE` controls edge endpoint representation:
+  - `name`: model returns `source_entity_name`/`destination_entity_name`
+  - `index`: model returns `source_index`/`destination_index` into `allowed_entity_names`
+- `MEM0_RELATION_REFERENCE_MODE` controls relation endpoint representation:
+  - `name`: model returns `source`/`destination`
+  - `index`: model returns `source_index`/`destination_index`
+- `ZEP_DRIFT_POLICY` and `MEM0_DRIFT_POLICY` control drift handling:
+  - `upstream_compatible` (default): continue on endpoint drift
+    - zep: unresolved edge endpoints are skipped
+    - mem0 graph: unresolved relation endpoints are materialized as placeholder entities before relation resolution
+  - `fail_fast`: unresolved/malformed endpoint rows fail immediately
 - Mem0 smoke retrieval query uses benchmark question (`metadata.question`) to align with retrieval semantics and avoid passing long raw messages directly into embedding recall.
 - Zep Neo4j fulltext indexes are bootstrapped by runtime on startup (`node_name_and_summary`, `edge_name_and_fact`), so explicit manual index creation is not required.
 - Zep LLM prompt budget is bounded by environment knobs to avoid oversized `extract_edges` calls:
@@ -361,25 +369,25 @@ bash tools/agent_memory/run_local_agent_memory_stack.sh
 
 13. Real-run failure patterns (from recent logs):
 
-- Mem0 graph, `name` mode can fail hard when extracted relation endpoints are not exact members of `allowed_entity_names`.
+- Mem0 graph in `MEM0_DRIFT_POLICY=fail_fast` can fail hard when extracted relation endpoints are not exact members of `allowed_entity_names`.
   - Example failure shape: relation destination like `"stress relief"` while extracted entity list does not contain that exact surface form.
   - This is not a DB outage; it is an entity-reference contract mismatch at relation extraction.
-- Zep `name` mode can fail similarly when edge endpoints drift from extracted entity names.
-- Full combined run (`evermemos,mem0,zep`) can fail even when isolated runs pass, due to aggregate LLM + embedding load causing more retries/timeouts and more lexical drift in `name` mode.
+- Zep with `ZEP_DRIFT_POLICY=fail_fast` can fail similarly when edge endpoints drift from extracted entity names.
+- Full combined run (`evermemos,mem0,zep`) can fail even when isolated runs pass, due to aggregate LLM + embedding load causing more retries/timeouts and more lexical drift under fail-fast policy.
 - Neo4j startup warnings such as "label/property does not exist" are expected on empty graph startup and are not fatal by themselves.
 
 14. Upstream alignment notes (mem0 / zep):
 
 - Mem0 upstream graph extraction is name-oriented (`source`, `relationship`, `destination`) and relies on prompt/schema constraints plus normalization.
-  - Our default remains `MEM0_RELATION_ENTITY_REFERENCE_MODE=name` to stay source-aligned.
+  - Source-aligned baseline: `MEM0_RELATION_REFERENCE_MODE=name` + `MEM0_DRIFT_POLICY=upstream_compatible`.
 - Zep/Graphiti upstream extraction is also name-oriented, but invalid edge endpoints are typically skipped with warnings in parts of upstream flow.
-  - We intentionally keep strict failure by default in this repo ("let it crash") to expose drift during reconstruction/evaluation.
-- Optional robust mode is provided for experiments and high-variance remote LLM outputs:
-  - `MEM0_RELATION_ENTITY_REFERENCE_MODE=index`
-  - `ZEP_EDGE_ENTITY_REFERENCE_MODE=index`
+  - Source-aligned baseline: `ZEP_EDGE_REFERENCE_MODE=name` + `ZEP_DRIFT_POLICY=upstream_compatible`.
+- Explicit failure-driven evaluation:
+  - keep `*_REFERENCE_MODE=name|index` as needed
+  - set `*_DRIFT_POLICY=fail_fast`
 - Practical recommendation:
-  - Use `name` mode for strict source-parity experiments.
-  - Use `index` mode for throughput/stability experiments where lexical endpoint drift is frequent.
+  - Use `REFERENCE_MODE=name` + `DRIFT_POLICY=upstream_compatible` for apples-to-apples upstream reconstruction.
+  - Use `DRIFT_POLICY=fail_fast` for controlled failure-surface experiments.
 - Upstream references checked for this behavior:
   - mem0 relation extraction schema and graph flow:
     - `https://github.com/mem0ai/mem0/blob/main/mem0/graphs/tools.py`
@@ -435,17 +443,28 @@ Notes:
 - This first isolates EverMemOS and reduces prompt size to validate end-to-end connectivity.
 - Then raise `DATASET_MAX_MESSAGES` and add back `mem0,zep`.
 
-Troubleshooting (`name mode passes sometimes, full run fails with KeyError/ValueError on entity endpoints`):
+Troubleshooting (`endpoint drift mode passes sometimes, full run fails with KeyError/ValueError on entity endpoints`):
 
 ```bash
-# strict source-parity mode (default)
-MEM0_RELATION_ENTITY_REFERENCE_MODE=name \
-ZEP_EDGE_ENTITY_REFERENCE_MODE=name \
+# fail-fast with name endpoints
+MEM0_RELATION_REFERENCE_MODE=name \
+ZEP_EDGE_REFERENCE_MODE=name \
+MEM0_DRIFT_POLICY=fail_fast \
+ZEP_DRIFT_POLICY=fail_fast \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 
-# robust endpoint mode for unstable lexical outputs
-MEM0_RELATION_ENTITY_REFERENCE_MODE=index \
-ZEP_EDGE_ENTITY_REFERENCE_MODE=index \
+# fail-fast with index endpoints (for lexical instability experiments)
+MEM0_RELATION_REFERENCE_MODE=index \
+ZEP_EDGE_REFERENCE_MODE=index \
+MEM0_DRIFT_POLICY=fail_fast \
+ZEP_DRIFT_POLICY=fail_fast \
+bash tools/agent_memory/run_local_agent_memory_stack.sh
+
+# upstream-compatible mode (default)
+MEM0_RELATION_REFERENCE_MODE=name \
+ZEP_EDGE_REFERENCE_MODE=name \
+MEM0_DRIFT_POLICY=upstream_compatible \
+ZEP_DRIFT_POLICY=upstream_compatible \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
@@ -453,8 +472,8 @@ Notes:
 
 - If isolated runs pass but full run fails, first reduce `DATASET_MAX_MESSAGES` and split workflows (`WORKFLOWS=...`) to identify load-sensitive step(s).
 - Then decide mode by experiment goal:
-  - strict parity: keep `name`
-  - robust execution baseline: use `index`
+  - strict parity/failure-surface: use `*_DRIFT_POLICY=fail_fast`
+  - upstream reproduction baseline: use `*_DRIFT_POLICY=upstream_compatible`
 
 ## Design Rules
 
@@ -540,7 +559,8 @@ WORKFLOWS=mem0 \
 SEM_RUNTIME_MODEL=deepseek-chat \
 SEM_RUNTIME_TIMEOUT_S=60 \
 SEM_RUNTIME_MAX_RETRIES=3 \
-MEM0_RELATION_ENTITY_REFERENCE_MODE=name \
+MEM0_RELATION_REFERENCE_MODE=name \
+MEM0_DRIFT_POLICY=upstream_compatible \
 MEM0_EMBEDDER_MODEL=nomic-embed-text \
 MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
 OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
@@ -571,8 +591,10 @@ WORKFLOWS=evermemos,mem0,zep \
 SEM_RUNTIME_MODEL=deepseek-chat \
 SEM_RUNTIME_TIMEOUT_S=90 \
 SEM_RUNTIME_MAX_RETRIES=4 \
-MEM0_RELATION_ENTITY_REFERENCE_MODE=name \
-ZEP_EDGE_ENTITY_REFERENCE_MODE=name \
+MEM0_RELATION_REFERENCE_MODE=name \
+ZEP_EDGE_REFERENCE_MODE=name \
+MEM0_DRIFT_POLICY=upstream_compatible \
+ZEP_DRIFT_POLICY=upstream_compatible \
 MEM0_EMBEDDER_MODEL=nomic-embed-text \
 MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
 OLLAMA_EMBED_MAX_INPUT_CHARS=512 \
@@ -583,15 +605,17 @@ DOCKER_BIN=/Applications/Docker.app/Contents/Resources/bin/docker \
 bash tools/agent_memory/run_local_agent_memory_stack.sh
 ```
 
-4.1 Full workflows run (robust endpoint mode):
+4.1 Full workflows run (fail-fast index endpoint mode):
 
 ```bash
 WORKFLOWS=evermemos,mem0,zep \
 SEM_RUNTIME_MODEL=deepseek-chat \
 SEM_RUNTIME_TIMEOUT_S=90 \
 SEM_RUNTIME_MAX_RETRIES=4 \
-MEM0_RELATION_ENTITY_REFERENCE_MODE=index \
-ZEP_EDGE_ENTITY_REFERENCE_MODE=index \
+MEM0_RELATION_REFERENCE_MODE=index \
+ZEP_EDGE_REFERENCE_MODE=index \
+MEM0_DRIFT_POLICY=fail_fast \
+ZEP_DRIFT_POLICY=fail_fast \
 MEM0_EMBEDDER_MODEL=nomic-embed-text \
 MEM0_EMBEDDER_MAX_INPUT_CHARS=512 \
 OLLAMA_EMBED_MAX_INPUT_CHARS=512 \

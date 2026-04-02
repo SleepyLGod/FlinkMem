@@ -33,6 +33,11 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.contracts impor
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.workflow import (
     ZepAddEpisodeWorkflow,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_FAIL_FAST,
+    DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    ENTITY_REFERENCE_MODE_NAME,
+)
 
 
 class _ScriptedGraphStore:
@@ -149,7 +154,14 @@ class _ScriptedGraphStore:
 
 
 class _ScriptedSemanticRuntime:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        edge_entity_reference_mode: str = ENTITY_REFERENCE_MODE_NAME,
+        drift_policy: str = DRIFT_POLICY_FAIL_FAST,
+    ) -> None:
+        self.edge_entity_reference_mode = edge_entity_reference_mode
+        self.drift_policy = drift_policy
         self.entity_prompts: List[str] = []
         self.edge_prompts: List[str] = []
 
@@ -374,3 +386,46 @@ def test_zep_add_episode_summarizes_after_edge_writes() -> None:
     )
     assert result.added_edge_count == 1
     assert ordering_state["edge_written"] is True
+
+
+def test_zep_add_episode_upstream_mode_drops_invalid_edge_endpoints() -> None:
+    class _InvalidEdgeRuntime(_ScriptedSemanticRuntime):
+        async def extract_edges(
+            self,
+            *,
+            message: str,
+            resolved_entities: Sequence[ZepResolvedEntity],
+            allowed_entity_names: Sequence[str],
+            recent_episodes: Sequence[ZepEpisodeCandidate],
+            prompt: str,
+        ) -> Sequence[ZepExtractedEdge]:
+            _ = (message, resolved_entities, allowed_entity_names, recent_episodes, prompt)
+            return [
+                ZepExtractedEdge(
+                    source_entity_name="Carol",
+                    destination_entity_name="Bob",
+                    relation="met",
+                    fact="Carol met Bob",
+                )
+            ]
+
+    workflow = ZepAddEpisodeWorkflow(
+        config=ZepWorkflowConfig(),
+        semantic_runtime=_InvalidEdgeRuntime(
+            edge_entity_reference_mode=ENTITY_REFERENCE_MODE_NAME,
+            drift_policy=DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+        ),
+        graph_store=_ScriptedGraphStore(),
+    )
+
+    result = asyncio.run(
+        workflow.add_episode(
+            group_id="g1",
+            message="Alice met Bob and talked about work",
+            valid_at_ms=1234,
+        )
+    )
+    assert result.extracted_edge_count == 1
+    assert result.added_edge_count == 0
+    assert result.duplicate_edge_count == 0
+    assert result.contradicted_edge_count == 0

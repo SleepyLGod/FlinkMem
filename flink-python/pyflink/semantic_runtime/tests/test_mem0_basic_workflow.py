@@ -20,6 +20,9 @@ from typing import Dict, List, Optional, Sequence
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     RetrievedMemory,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.basic import (
     Mem0BasicWorkflow,
 )
@@ -373,3 +376,101 @@ def test_mem0_basic_llm_recall_backend_requires_llm_searcher() -> None:
         assert "llm_fact_searcher is required" in str(exc)
         return
     raise AssertionError("llm recall backend should require llm_fact_searcher")
+
+
+def test_mem0_basic_upstream_mode_tolerates_short_resolution_list() -> None:
+    class _ShortResolutionRuntime(_ScriptedSemanticRuntime):
+        def __init__(self) -> None:
+            super().__init__(
+                facts=["f1", "f2"],
+                resolutions={
+                    "f1": Mem0FactResolution(
+                        action="NONE",
+                        fact="f1",
+                        reason="ok",
+                        confidence=1.0,
+                    )
+                },
+            )
+            self.drift_policy = DRIFT_POLICY_UPSTREAM_COMPATIBLE
+
+        async def resolve_facts(
+            self,
+            *,
+            facts: Sequence[str],
+            candidates_by_fact: Sequence[Sequence[RetrievedMemory]],
+            prompt: str,
+        ) -> Sequence[Mem0FactResolution]:
+            _ = (facts, candidates_by_fact, prompt)
+            return [
+                Mem0FactResolution(
+                    action="NONE",
+                    fact="f1",
+                    reason="only one",
+                    confidence=1.0,
+                )
+            ]
+
+    workflow = Mem0BasicWorkflow(
+        config=Mem0BasicConfig(),
+        semantic_runtime=_ShortResolutionRuntime(),
+        fact_store=_InMemoryFactStore(),
+        fact_searcher=_ScriptedSearcher({}),
+    )
+    result = asyncio.run(
+        workflow.add(
+            group_id="g1",
+            messages=["message"],
+        )
+    )
+    assert result.extracted_fact_count == 2
+    assert result.noop == 2
+
+
+def test_mem0_basic_upstream_mode_tolerates_fact_mismatch() -> None:
+    class _MismatchedRuntime(_ScriptedSemanticRuntime):
+        def __init__(self) -> None:
+            super().__init__(
+                facts=["expected"],
+                resolutions={
+                    "expected": Mem0FactResolution(
+                        action="NONE",
+                        fact="expected",
+                        reason="ok",
+                        confidence=1.0,
+                    )
+                },
+            )
+            self.drift_policy = DRIFT_POLICY_UPSTREAM_COMPATIBLE
+
+        async def resolve_facts(
+            self,
+            *,
+            facts: Sequence[str],
+            candidates_by_fact: Sequence[Sequence[RetrievedMemory]],
+            prompt: str,
+        ) -> Sequence[Mem0FactResolution]:
+            _ = (facts, candidates_by_fact, prompt)
+            return [
+                Mem0FactResolution(
+                    action="NONE",
+                    fact="other",
+                    reason="mismatch",
+                    confidence=0.2,
+                )
+            ]
+
+    workflow = Mem0BasicWorkflow(
+        config=Mem0BasicConfig(),
+        semantic_runtime=_MismatchedRuntime(),
+        fact_store=_InMemoryFactStore(),
+        fact_searcher=_ScriptedSearcher({}),
+    )
+    result = asyncio.run(
+        workflow.add(
+            group_id="g1",
+            messages=["message"],
+        )
+    )
+    assert result.extracted_fact_count == 1
+    assert result.noop == 1

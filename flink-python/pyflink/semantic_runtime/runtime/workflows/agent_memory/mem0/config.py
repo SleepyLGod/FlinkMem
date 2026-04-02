@@ -22,6 +22,7 @@ DEFAULT_MEM0_GRAPH_ENTITY_RESOLVE_CONCURRENCY = 8
 DEFAULT_MEM0_GRAPH_ENTITY_UPSERT_GROUP_CONCURRENCY = 8
 DEFAULT_MEM0_GRAPH_RELATION_RESOLVE_CONCURRENCY = 8
 DEFAULT_MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY = 8
+DEFAULT_MEM0_GRAPH_UPSTREAM_PLACEHOLDER_ENTITY_TYPE = "unknown"
 
 # Source prompt references:
 # - https://raw.githubusercontent.com/mem0ai/mem0/main/mem0/configs/prompts.py
@@ -47,7 +48,7 @@ DEFAULT_MEM0_GRAPH_RELATION_EXTRACTION_PROMPT = (
     "{'entities': [{'source': '<entity_name>', "
     "'relationship': '<relationship>', "
     "'destination': '<entity_name>'}]}. "
-    "Use only entities that reference the provided allowed_entity_names list."
+    "Prefer entities from allowed_entity_names when possible."
 )
 DEFAULT_MEM0_GRAPH_ENTITY_IDENTITY_PROMPT = (
     "Given one extracted entity and one candidate graph entity, decide whether they refer "
@@ -133,6 +134,9 @@ class Mem0GraphConfig:
     relation_write_group_concurrency: int = (
         DEFAULT_MEM0_GRAPH_RELATION_WRITE_GROUP_CONCURRENCY
     )
+    upstream_placeholder_entity_type: str = (
+        DEFAULT_MEM0_GRAPH_UPSTREAM_PLACEHOLDER_ENTITY_TYPE
+    )
 
     def __post_init__(self) -> None:
         if not self.entity_extraction_prompt.strip():
@@ -167,3 +171,5 @@ class Mem0GraphConfig:
             raise ValueError("relation_resolve_concurrency must be > 0")
         if int(self.relation_write_group_concurrency) <= 0:
             raise ValueError("relation_write_group_concurrency must be > 0")
+        if not str(self.upstream_placeholder_entity_type).strip():
+            raise ValueError("upstream_placeholder_entity_type must be non-empty")

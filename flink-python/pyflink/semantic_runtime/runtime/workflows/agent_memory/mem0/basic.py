@@ -9,6 +9,11 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.concurrency 
     amap_grouped_serial_bounded,
     amap_ordered_bounded,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_FAIL_FAST,
+    is_upstream_compatible_drift_policy,
+    normalize_drift_policy,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.contracts import (
     RetrievedMemory,
 )
@@ -54,6 +59,17 @@ class Mem0BasicWorkflow:
         self._fact_store = fact_store
         self._fact_searcher = fact_searcher
         self._llm_fact_searcher = llm_fact_searcher
+
+    def _drift_policy(self) -> str:
+        policy = getattr(
+            self._semantic_runtime,
+            "drift_policy",
+            DRIFT_POLICY_FAIL_FAST,
+        )
+        return normalize_drift_policy(
+            policy,
+            field_name="drift_policy",
+        )
 
     async def add(
         self,
@@ -101,16 +117,37 @@ class Mem0BasicWorkflow:
                 prompt=self._config.fact_resolution_prompt,
             )
         )
+        fail_fast = not is_upstream_compatible_drift_policy(self._drift_policy())
         if len(resolutions) != len(facts):
-            raise ValueError(
-                "resolve_facts must return exactly one resolution per extracted fact"
-            )
+            if fail_fast:
+                raise ValueError(
+                    "resolve_facts must return exactly one resolution per extracted fact"
+                )
+            if len(resolutions) > len(facts):
+                resolutions = resolutions[: len(facts)]
+            else:
+                for index in range(len(resolutions), len(facts)):
+                    resolutions.append(
+                        Mem0FactResolution(
+                            action="NONE",
+                            fact=str(facts[index]),
+                            reason="upstream_compatible_missing_resolution",
+                            confidence=0.0,
+                        )
+                    )
         fact_plans: list[_FactPlan] = []
         for index, (fact, resolution) in enumerate(zip(facts, resolutions, strict=True)):
             if resolution.fact != fact:
-                raise ValueError(
-                    "resolve_facts returned fact mismatch at index="
-                    f"{index}: expected={fact!r} actual={resolution.fact!r}"
+                if fail_fast:
+                    raise ValueError(
+                        "resolve_facts returned fact mismatch at index="
+                        f"{index}: expected={fact!r} actual={resolution.fact!r}"
+                    )
+                resolution = Mem0FactResolution(
+                    action="NONE",
+                    fact=fact,
+                    reason="upstream_compatible_fact_mismatch",
+                    confidence=0.0,
                 )
             fact_plans.append(_FactPlan(fact=fact, resolution=resolution))
         operations = await amap_grouped_serial_bounded(

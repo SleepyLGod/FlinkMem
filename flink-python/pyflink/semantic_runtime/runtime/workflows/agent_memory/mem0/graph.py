@@ -30,6 +30,11 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.mem0.interfaces imp
     Mem0GraphSemanticRuntime,
     Mem0GraphStore,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_FAIL_FAST,
+    is_upstream_compatible_drift_policy,
+    normalize_drift_policy,
+)
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,23 @@ class Mem0GraphWorkflow:
                 prompt=self._config.relation_extraction_prompt,
             )
         )
+        upstream_placeholder_rows: list[Tuple[str, str]] = []
+        if self._is_upstream_compatible_drift_policy():
+            upstream_placeholder_rows = await self._upsert_missing_relation_entities(
+                group_id=group_id,
+                relations=relations,
+                normalized_entity_ids=normalized_entity_ids,
+            )
+            for entity_name, entity_id in upstream_placeholder_rows:
+                entity_ids[entity_name] = entity_id
+                normalized_name = _normalize_entity_name_key(entity_name)
+                previous_entity_id = normalized_entity_ids.get(normalized_name)
+                if previous_entity_id is not None and previous_entity_id != entity_id:
+                    raise ValueError(
+                        "ambiguous normalized entity name maps to multiple entity ids: "
+                        f"{entity_name!r}"
+                    )
+                normalized_entity_ids[normalized_name] = entity_id
 
         relation_plans = await amap_ordered_bounded(
             items=relations,
@@ -181,12 +203,76 @@ class Mem0GraphWorkflow:
         return Mem0GraphAddResult(
             extracted_entity_count=len(entities),
             extracted_relation_count=len(relations),
-            upserted_entities=len(entities),
+            upserted_entities=len(entity_rows) + len(upstream_placeholder_rows),
             added_relations=added_relations,
             updated_relations=updated_relations,
             deleted_relations=deleted_relations,
             operations=operations,
         )
+
+    def _drift_policy(self) -> str:
+        policy = getattr(
+            self._semantic_runtime,
+            "drift_policy",
+            DRIFT_POLICY_FAIL_FAST,
+        )
+        return normalize_drift_policy(
+            policy,
+            field_name="drift_policy",
+        )
+
+    def _is_upstream_compatible_drift_policy(self) -> bool:
+        return is_upstream_compatible_drift_policy(self._drift_policy())
+
+    async def _upsert_missing_relation_entities(
+        self,
+        *,
+        group_id: str,
+        relations: Sequence[Mem0GraphExtractedRelation],
+        normalized_entity_ids: Dict[str, str],
+    ) -> Sequence[Tuple[str, str]]:
+        pending_names: list[str] = []
+        seen_pending_normalized: set[str] = set()
+        for relation in relations:
+            for entity_name in (
+                relation.source_entity_name,
+                relation.destination_entity_name,
+            ):
+                normalized_name = _normalize_entity_name_key(entity_name)
+                if normalized_name in normalized_entity_ids:
+                    continue
+                if normalized_name in seen_pending_normalized:
+                    continue
+                seen_pending_normalized.add(normalized_name)
+                pending_names.append(entity_name)
+        if not pending_names:
+            return []
+        return await amap_grouped_serial_bounded(
+            items=pending_names,
+            group_key=lambda index, entity_name: _normalize_entity_name_key(entity_name),
+            concurrency=self._config.entity_upsert_group_concurrency,
+            worker=lambda index, entity_name: self._upsert_placeholder_entity(
+                index=index,
+                group_id=group_id,
+                entity_name=entity_name,
+            ),
+        )
+
+    async def _upsert_placeholder_entity(
+        self,
+        *,
+        index: int,
+        group_id: str,
+        entity_name: str,
+    ) -> Tuple[str, str]:
+        _ = index
+        entity_id = await self._graph_store.upsert_entity(
+            group_id=group_id,
+            entity_name=entity_name,
+            entity_type=self._config.upstream_placeholder_entity_type,
+            existing_entity_id=None,
+        )
+        return (entity_name, entity_id)
 
     async def search(
         self,
@@ -286,11 +372,21 @@ class Mem0GraphWorkflow:
             relation.destination_entity_name
         )
         if normalized_source not in normalized_entity_ids:
+            if self._is_upstream_compatible_drift_policy():
+                raise RuntimeError(
+                    "upstream-compatible relation endpoint pre-resolution failed for "
+                    f"source={relation.source_entity_name!r}"
+                )
             raise ValueError(
                 "extract_relations returned source entity outside resolved set: "
                 f"{relation.source_entity_name!r}"
             )
         if normalized_destination not in normalized_entity_ids:
+            if self._is_upstream_compatible_drift_policy():
+                raise RuntimeError(
+                    "upstream-compatible relation endpoint pre-resolution failed for "
+                    f"destination={relation.destination_entity_name!r}"
+                )
             raise ValueError(
                 "extract_relations returned destination entity outside resolved set: "
                 f"{relation.destination_entity_name!r}"

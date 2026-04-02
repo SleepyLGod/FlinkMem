@@ -23,6 +23,11 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep.interfaces impo
     ZepGraphStore,
     ZepSemanticRuntime,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_FAIL_FAST,
+    is_upstream_compatible_drift_policy,
+    normalize_drift_policy,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,13 @@ class _SummaryWritePlan:
 
     persisted_entity: ZepResolvedEntity
     summary: str
+
+
+@dataclass(frozen=True)
+class _SkippedEdgePlan:
+    """Marker for one extracted edge intentionally skipped before resolution."""
+
+    reason: str
 
 
 def _normalize_entity_name_key(value: str) -> str:
@@ -158,7 +170,7 @@ class ZepAddEpisodeWorkflow:
             )
         )
 
-        edge_plans = await amap_ordered_bounded(
+        edge_plan_candidates = await amap_ordered_bounded(
             items=extracted_edges,
             concurrency=self._config.edge_resolve_concurrency,
             worker=lambda index, edge: self._resolve_edge_plan(
@@ -170,6 +182,11 @@ class ZepAddEpisodeWorkflow:
                 normalized_entity_name_to_id=normalized_entity_name_to_id,
             ),
         )
+        edge_plans: list[_ResolvedEdgePlan] = []
+        for plan in edge_plan_candidates:
+            if isinstance(plan, _SkippedEdgePlan):
+                continue
+            edge_plans.append(plan)
         edge_actions = await amap_grouped_serial_bounded(
             items=edge_plans,
             group_key=self._edge_write_group_key,
@@ -354,6 +371,20 @@ class ZepAddEpisodeWorkflow:
             raise ValueError("entity_name must be non-empty for provisional summary")
         return summary
 
+    def _drift_policy(self) -> str:
+        policy = getattr(
+            self._semantic_runtime,
+            "drift_policy",
+            DRIFT_POLICY_FAIL_FAST,
+        )
+        return normalize_drift_policy(
+            policy,
+            field_name="drift_policy",
+        )
+
+    def _is_upstream_compatible_drift_policy(self) -> bool:
+        return is_upstream_compatible_drift_policy(self._drift_policy())
+
     async def _resolve_edge_plan(
         self,
         *,
@@ -363,16 +394,22 @@ class ZepAddEpisodeWorkflow:
         message: str,
         recent_episodes: List[ZepEpisodeCandidate],
         normalized_entity_name_to_id: Dict[str, str],
-    ) -> _ResolvedEdgePlan:
+    ) -> _ResolvedEdgePlan | _SkippedEdgePlan:
         _ = index
         source_name = _normalize_entity_name_key(edge.source_entity_name)
         destination_name = _normalize_entity_name_key(edge.destination_entity_name)
         if source_name not in normalized_entity_name_to_id:
+            if self._is_upstream_compatible_drift_policy():
+                return _SkippedEdgePlan(reason="source endpoint outside resolved set")
             raise ValueError(
                 "extract_edges returned source entity outside resolved set: "
                 f"{edge.source_entity_name!r}"
             )
         if destination_name not in normalized_entity_name_to_id:
+            if self._is_upstream_compatible_drift_policy():
+                return _SkippedEdgePlan(
+                    reason="destination endpoint outside resolved set"
+                )
             raise ValueError(
                 "extract_edges returned destination entity outside resolved set: "
                 f"{edge.destination_entity_name!r}"

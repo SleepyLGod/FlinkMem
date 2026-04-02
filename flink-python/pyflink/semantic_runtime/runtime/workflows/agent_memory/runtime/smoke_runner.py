@@ -46,6 +46,10 @@ from pyflink.semantic_runtime.runtime.workflows.agent_memory.runtime.llm_semanti
     Mem0GraphLLMSemanticRuntime,
     ZepLLMSemanticRuntime,
 )
+from pyflink.semantic_runtime.runtime.workflows.agent_memory.common.entity_reference_mode import (
+    DRIFT_POLICY_UPSTREAM_COMPATIBLE,
+    ENTITY_REFERENCE_MODE_NAME,
+)
 from pyflink.semantic_runtime.runtime.workflows.agent_memory.zep import (
     ZepAddEpisodeWorkflow,
     ZepBackendConfig,
@@ -77,8 +81,10 @@ DEFAULT_ZEP_PROMPT_MESSAGE_MAX_CHARS = 1_200
 DEFAULT_ZEP_PROMPT_MAX_RECENT_EPISODES = 3
 DEFAULT_ZEP_PROMPT_RECENT_EPISODE_MAX_CHARS = 400
 DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES = 16
-DEFAULT_ZEP_EDGE_ENTITY_REFERENCE_MODE = "name"
-DEFAULT_MEM0_RELATION_ENTITY_REFERENCE_MODE = "name"
+DEFAULT_ZEP_EDGE_REFERENCE_MODE = ENTITY_REFERENCE_MODE_NAME
+DEFAULT_ZEP_DRIFT_POLICY = DRIFT_POLICY_UPSTREAM_COMPATIBLE
+DEFAULT_MEM0_RELATION_REFERENCE_MODE = ENTITY_REFERENCE_MODE_NAME
+DEFAULT_MEM0_DRIFT_POLICY = DRIFT_POLICY_UPSTREAM_COMPATIBLE
 DEFAULT_INPUT_SCOPE_POLICY = "none"
 VALID_INPUT_SCOPE_POLICIES = frozenset({"none", "sliding", "session"})
 DEFAULT_INPUT_SCOPE_SLIDING_SIZE = 8
@@ -606,9 +612,13 @@ async def _run_mem0_workflow(
             str(Mem0GraphConfig().relation_write_group_concurrency),
         )
     )
-    mem0_relation_entity_reference_mode = os.getenv(
-        "MEM0_RELATION_ENTITY_REFERENCE_MODE",
-        DEFAULT_MEM0_RELATION_ENTITY_REFERENCE_MODE,
+    mem0_relation_reference_mode = os.getenv(
+        "MEM0_RELATION_REFERENCE_MODE",
+        DEFAULT_MEM0_RELATION_REFERENCE_MODE,
+    ).strip()
+    mem0_drift_policy = os.getenv(
+        "MEM0_DRIFT_POLICY",
+        DEFAULT_MEM0_DRIFT_POLICY,
     ).strip()
     try:
         bundle = build_mem0_external_bundle(
@@ -618,7 +628,10 @@ async def _run_mem0_workflow(
         )
         group_id = f"mem0:{ordered_messages[0].group_id}"
 
-        basic_runtime = Mem0BasicLLMSemanticRuntime(client=llm_client)
+        basic_runtime = Mem0BasicLLMSemanticRuntime(
+            client=llm_client,
+            drift_policy=mem0_drift_policy,
+        )
         basic_workflow = Mem0BasicWorkflow(
             config=Mem0BasicConfig(
                 recall_backend="embedding",
@@ -659,7 +672,8 @@ async def _run_mem0_workflow(
 
         graph_runtime = Mem0GraphLLMSemanticRuntime(
             client=llm_client,
-            relation_entity_reference_mode=mem0_relation_entity_reference_mode,
+            relation_entity_reference_mode=mem0_relation_reference_mode,
+            drift_policy=mem0_drift_policy,
         )
         graph_workflow = Mem0GraphWorkflow(
             config=Mem0GraphConfig(
@@ -782,9 +796,13 @@ async def _run_zep_workflow(
             str(DEFAULT_ZEP_PROMPT_MAX_EDGE_ENTITIES),
         )
     )
-    zep_edge_entity_reference_mode = os.getenv(
-        "ZEP_EDGE_ENTITY_REFERENCE_MODE",
-        DEFAULT_ZEP_EDGE_ENTITY_REFERENCE_MODE,
+    zep_edge_reference_mode = os.getenv(
+        "ZEP_EDGE_REFERENCE_MODE",
+        DEFAULT_ZEP_EDGE_REFERENCE_MODE,
+    ).strip()
+    zep_drift_policy = os.getenv(
+        "ZEP_DRIFT_POLICY",
+        DEFAULT_ZEP_DRIFT_POLICY,
     ).strip()
     zep_entity_resolve_concurrency = int(
         os.getenv(
@@ -828,7 +846,8 @@ async def _run_zep_workflow(
             max_recent_episodes=zep_prompt_max_recent_episodes,
             max_recent_episode_chars=zep_prompt_recent_episode_max_chars,
             max_edge_entities=zep_prompt_max_edge_entities,
-            edge_entity_reference_mode=zep_edge_entity_reference_mode,
+            edge_entity_reference_mode=zep_edge_reference_mode,
+            drift_policy=zep_drift_policy,
         )
         workflow = ZepAddEpisodeWorkflow(
             config=ZepWorkflowConfig(
