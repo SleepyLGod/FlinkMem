@@ -1,266 +1,166 @@
-# A Benchmarking Plan for a Stream-Based Agent Memory System
+# Agent Memory Benchmark Plan (Unified)
 
 ## Purpose
 
-This document turns the earlier discussion into a concrete benchmark design for evaluating a **stream-based agent memory system**—especially one with a Flink-like processing model—using **LongMemEval** as the semantic workload source and an additional **systems harness** for replay, tracing, token accounting, and local/API model execution.
+This document is the single source of truth for benchmarking agent-memory systems in this repository.
 
-The core idea is simple:
+Core principle:
 
-- **Do not treat LongMemEval as a complete systems benchmark out of the box.**
-- **Treat it as the semantic workload layer** (long-horizon chat histories, timestamps, evidence labels, questions, and answers).
-- **Add a replay/scheduling/observability layer** to measure the properties that matter for a production memory system: concurrency, throughput, end-to-end latency, token cost, freshness, and prompt redundancy.
+- Primary objective: **performance and cost**
+- Secondary objective: **quality as a guardrail**
 
----
-
-## 1. What We Actually Want to Measure
-
-The benchmark should target an **agent memory system**, not only a question-answering pipeline. In this project, “agent memory” is best modeled as:
-
-1. An **append-only, time-series stream of raw interaction data**.
-2. A **memory workflow** that transforms raw interactions into more concise and accurate memory artifacts.
-3. A **retrieval + reading path** that uses those artifacts to answer future questions.
-
-Under this definition, the benchmark must evaluate five classes of properties:
-
-### 1.1 Performance under multi-user, high-concurrency conditions
-
-We want to measure:
-
-- multi-user throughput
-- write-path throughput and latency
-- query throughput and latency
-- scaling behavior as users, models, GPUs, and workers increase
-- queueing and backpressure behavior
-
-### 1.2 Token usage at every stage
-
-This is essential because later optimizations may reduce token usage—especially during **memory insertion**. The benchmark should therefore record token consumption at each stage rather than only the final generation stage.
-
-### 1.3 Profiling and observability
-
-The system should be easy to profile. That means:
-
-- stage-level latency breakdowns
-- distributed traces
-- counters/histograms for system health
-- per-request metadata for debugging bottlenecks
-
-### 1.4 Time semantics
-
-LongMemEval already contains timestamps, and those timestamps should be used meaningfully rather than simply replaying sessions in order. For a stream-like memory system, **event time** and **processing time** should be separated.
-
-### 1.5 Flexible execution backends
-
-The benchmark should run both:
-
-- against hosted APIs
-- against local open-weight models
-- across multiple models / multiple GPUs / possibly multiple nodes
-
-### 1.6 Full final-prompt logging
-
-Every final prompt sent to a model should be logged for later analysis of:
-
-- repeated scaffolding
-- redundant retrieved memory
-- wasteful instructions
-- recurring prompt patterns across workloads
+The benchmark is defined by a **data protocol** and a **metric protocol**. It does not copy any single benchmark's pipeline logic as-is.
 
 ---
 
-## 2. Why LongMemEval Is a Good Base—But Not Enough by Itself
+## Locked Decisions
 
-LongMemEval is a strong foundation because it was designed specifically for **long-term memory in chat assistants**. The paper frames the problem in terms of three execution stages—**indexing, retrieval, and reading**—which maps well to a stream-based memory system.[^1]
-
-The public dataset and repository also expose a clean instance structure. Each evaluation sample includes fields such as:
-
-- `question_id`
-- `question_type`
-- `question`
-- `answer`
-- `question_date`
-- `haystack_session_ids`
-- `haystack_dates`
-- `haystack_sessions`
-- `answer_session_ids`
-
-The repository documents that `answer_session_ids` identify the evidence sessions used for session-level recall evaluation, and that the released benchmark files include `longmemeval_oracle.json`, `longmemeval_s_cleaned.json`, and `longmemeval_m_cleaned.json`.[^2]
-
-This makes LongMemEval useful for:
-
-- correctness evaluation
-- retrieval evaluation
-- timestamp-aware workloads
-- testing knowledge updates and temporal reasoning
-
-However, LongMemEval is **not** a full systems benchmark. It gives you the **semantic content of the workload**, but not the missing systems layer:
-
-- no multi-user global scheduler
-- no concurrency model
-- no replay clock model
-- no queue/backpressure instrumentation
-- no token ledger by stage
-- no standardized profiling pipeline
-
-So the right design is:
-
-> **Keep LongMemEval intact as the semantic benchmark layer, and wrap it in a systems benchmark harness.**
+1. `v1` is mandatory and must complete before cross-domain expansion.
+2. `v1` headline conclusions come only from conversational apples-to-apples comparison.
+3. `Track C` (cross-domain streaming workloads) is protocol-frozen now and implemented after `v1`.
+4. `MemoryAgentBench` is out-of-scope for now.
+5. `LoCoMo main-track` is optional (`v1.5`) and not a blocker for `v2`.
 
 ---
 
-## 3. The Key Design Decision: Keep Two Layers Separate
+## Benchmark Contract
 
-The benchmark should have **two cleanly separated layers**.
+### Data Contract
 
-## 3.1 Layer A: Semantic workload layer
+Each run must define all three inputs:
 
-This layer is essentially LongMemEval itself.
+1. `ingest_stream`: append/update events fed into memory workflows.
+2. `eval_query_set`: query set with gold labels/evidence when available.
+3. `replay_policy`: user/tenant concurrency, arrival model, and time scaling.
 
-Its job is to define:
+### Metric Contract
 
-- the chat history
-- the timestamps
-- the query
-- the gold answer
-- the evidence labels
-- the question type
+Two metric profiles are mandatory:
 
-This layer should remain as close as possible to the original benchmark so that results remain comparable to prior LongMemEval results.[^1][^2]
+1. `perf_cost_core`
+   - write/read throughput
+   - p50/p95/p99 latency
+   - token usage by stage
+   - monetary cost
+   - scaling behavior under concurrency
+2. `quality_guardrail`
+   - answer accuracy (or task success)
+   - retrieval quality when applicable (`Recall@k`, `NDCG@k`)
+   - degradation under load
 
-## 3.2 Layer B: Systems replay and observability layer
+Hard rule: no speedup/cost claim is valid if quality drops below the configured guardrail threshold.
 
-This is the layer you add.
+### Time Contract (Triple Clock)
 
-Its job is to define:
+1. `event_time`: semantic time from dataset records.
+2. `replay_time`: benchmark harness injection time.
+3. `processing_time`: wall-clock execution time in system.
 
-- how many users exist simultaneously
-- how user streams interleave
-- when events arrive in replay time
-- when questions are issued
-- which model backend handles each stage
-- what tokens are spent at each step
-- how metrics and traces are collected
+All freshness and staleness claims must explicitly specify which clock pair is used.
 
-This separation is crucial. If you overload the original LongMemEval schema with runtime-specific fields, you lose comparability and make experimentation harder.
+### Replay Modes
 
----
-
-## 4. Proposed Time Model: Use Dual Time (or Triple Time)
-
-Because the memory system is stream-based, timestamps should not be treated as decoration.
-
-The benchmark should explicitly support **at least two clocks**, and ideally three:
-
-### 4.1 Event time
-
-This comes from LongMemEval itself:
-
-- `haystack_dates`
-- `question_date`
-
-It represents the **semantic time** of the interaction.
-
-This matters for:
-
-- temporal reasoning
-- knowledge update precedence
-- time-aware retrieval
-- retention logic
-- window semantics
-- staleness analysis
-
-LongMemEval explicitly includes temporal reasoning and time-aware mechanisms in its design and codebase, which is a strong signal that timestamps should remain first-class in your system benchmark as well.[^1][^2]
-
-### 4.2 Replay time
-
-This is the time generated by the benchmark harness.
-
-It controls when events are injected into the system during the experiment. It can be:
-
-- order-only replay
-- scaled replay
-- burst replay
-- stress replay
-
-Examples:
-
-- 1 month of semantic time compressed into 5 seconds of replay time
-- 100 users all issuing queries within the same replay window
-- append-heavy bursts followed by read-heavy bursts
-
-### 4.3 Processing time
-
-This is the wall-clock time at which the system actually processes the event.
-
-It is what you use to measure:
-
-- queueing delays
-- backpressure
-- end-to-end latency
-- write visibility lag
-- update propagation lag
-
-## 4.4 Recommendation
-
-For a Flink-like memory system, I recommend the following:
-
-- **Event time**: used for semantic correctness and memory freshness semantics
-- **Replay time**: used for benchmark control and concurrency generation
-- **Processing time**: used for performance measurement
-
-That gives you the ability to ask meaningful systems questions such as:
-
-- How long after an append does the memory become visible to queries?
-- Does event-time ordering remain correct under backlog or burst load?
-- How often are queries answered with stale memory?
+1. `terminal_query`: replay history, then issue final query.
+2. `mixed_online`: append and query interleaved.
+3. `update_sensitive`: trigger follow-up query after update events.
+4. `burst_stress`: concentrated arrivals for overload/scaling behavior.
 
 ---
 
-## 5. Replay Modes the Benchmark Should Support
+## Track Structure
 
-A useful systems benchmark should not have only one workload mode. I recommend four:
+### Track A (Main, Apples-to-Apples)
 
-### 5.1 Terminal query mode
+Purpose: primary comparison track for this project.
 
-This is the closest to the original LongMemEval setting.
+- Domain: conversational long-term memory
+- Data requirement: both `ingest_stream` and `eval_query_set`
+- Output: perf/cost + quality guardrail
 
-- replay all history sessions for a user
-- then issue the final question
+`v1` is Track A only.
 
-Use this to preserve comparability with the original benchmark.
+### Track B (Perf Stress)
 
-### 5.2 Mixed online mode
+Purpose: stress write/update/index paths where labels are weak or absent.
 
-- append sessions and queries are interleaved
-- some questions arrive before the entire history has been replayed
+- Data requirement: strong `ingest_stream`; labels optional
+- Output: perf/cost/freshness stress behavior, no primary accuracy claim
 
-Use this to simulate real assistants that are queried continuously while memory is still being updated.
+### Track C (Cross-Domain Streaming Agent Memory)
 
-### 5.3 Update-sensitive mode
+Purpose: evaluate agent-memory behavior beyond chatbot-only workloads.
 
-This mode should emphasize LongMemEval’s **knowledge-update** questions.[^1]
+- Domains: monitoring, financial analysis, event streams
+- Data requirement: stream-native workloads; labels may be task-specific or augmented
+- Output: perf/cost primary, task quality as domain-specific guardrail
 
-- when a memory update occurs
-- immediately trigger a follow-up query
-
-Use this to measure freshness and update propagation lag.
-
-### 5.4 Burst/stress mode
-
-- many users arrive concurrently
-- append or query events are packed into a short replay window
-
-Use this for scaling and throughput testing.
+Status: protocol frozen now; implementation starts after `v1`.
 
 ---
 
-## 6. Metrics: What the Benchmark Must Measure
+## Dataset Capability Matrix
 
-The benchmark should report at least five families of metrics.
+| Dataset / Source | Has Ingest Stream | Has Gold QA / Evidence | Has Event Time | Recommended Track | Notes |
+|---|---:|---:|---:|---|---|
+| LongMemEval (cleaned) | Yes | Yes | Yes (`haystack_dates`, `question_date`) | Track A | Main v1 dataset. |
+| Local `locomo.json` snapshot in this repo | Yes | No (dialog-only snapshot) | Weak/derived | Track B | Good for perf-only ingest stress unless full QA annotations are added. |
+| LoCoMo (official full release) | Yes | Yes (`qa`, `evidence`) | Yes (session timestamps) | Track A or B | Optional `v1.5`; not required before v2. |
+| CP-inspired FNSPID pipeline data | Yes | Task labels available (pipeline-defined) | Yes | Track C | Financial/news monitoring style workload. |
+| CP-inspired MiDe22 pipeline data | Yes | Task labels available (event monitoring metrics) | Yes | Track C | Misinformation/event monitoring style workload. |
+| StreamBench | Mixed | Yes (task dependent) | Task dependent | Track C (later) | Good for continual-improvement tasks; schema is heterogeneous. |
+| MemoryArena | Session-like tasks | Yes | Task dependent | Track C (later) | Agentic multi-session tasks, not direct chat-memory insertion format. |
+| LogHub | Yes (strong) | Usually no memory-QA labels | Yes | Track B/C (later) | Strong systems stress source; label augmentation required for quality claims. |
+| GDELT | Yes (strong) | No direct memory-QA labels | Yes (time-native) | Track B/C (later) | High-volume event stream; requires task/label design for quality claims. |
 
-## 6.1 System performance metrics
+---
 
-### Write path
+## v1 Scope (Must Complete First)
+
+`v1` delivers Track A only with LongMemEval.
+
+Required outputs:
+
+1. apples-to-apples perf/cost comparison under fixed configs
+2. quality guardrail report in the same run
+3. stage-level token/cost accounting
+4. reproducible replay profile and run artifacts
+
+Out-of-scope for `v1`:
+
+1. cross-domain streaming conclusions
+2. mixed single-score ranking across tracks
+3. Track C implementation
+
+---
+
+## Track C Protocol (Frozen for Post-v1 Implementation)
+
+Track C must reuse the same benchmark contract as Track A/B:
+
+1. `ingest_stream`
+2. `eval_query_set`
+3. `replay_policy`
+4. `perf_cost_core`
+5. `quality_guardrail`
+
+Initial post-v1 target workloads:
+
+1. FNSPID-aligned financial/news monitoring
+2. MiDe22-aligned event monitoring
+
+Optional later expansions:
+
+1. StreamBench subsets
+2. MemoryArena subsets
+3. LogHub and GDELT stress tracks (with explicit label augmentation policy)
+
+---
+
+## Metric Taxonomy (Detailed)
+
+### 1) System Performance
+
+Write path:
 
 - `append_qps`
 - `append_latency_ms`
@@ -270,7 +170,7 @@ The benchmark should report at least five families of metrics.
 - `index_write_latency_ms`
 - `memory_visibility_lag_ms`
 
-### Read path
+Read path:
 
 - `retrieval_latency_ms`
 - `rerank_latency_ms`
@@ -278,7 +178,7 @@ The benchmark should report at least five families of metrics.
 - `generation_latency_ms`
 - `e2e_query_latency_ms`
 
-### Global
+Global:
 
 - `throughput_sessions_per_sec`
 - `throughput_queries_per_sec`
@@ -288,13 +188,9 @@ The benchmark should report at least five families of metrics.
 - `max_sustainable_qps_under_sla`
 - `scaling_efficiency`
 
-## 6.2 Token accounting metrics
+### 2) Token and Cost Accounting
 
-This is non-negotiable if you want to study token-saving optimizations.
-
-Recommended counters per request/event:
-
-### Write path tokens
+Write path tokens:
 
 - `tokens_extract`
 - `tokens_summarize`
@@ -302,7 +198,7 @@ Recommended counters per request/event:
 - `tokens_embed`
 - `tokens_index_augmentation`
 
-### Read path tokens
+Read path tokens:
 
 - `tokens_query_expansion`
 - `tokens_retrieval_context`
@@ -310,13 +206,11 @@ Recommended counters per request/event:
 - `tokens_reader_input`
 - `tokens_reader_output`
 
-### Evaluation tokens
+Evaluation tokens:
 
 - `tokens_judge`
 
-This should usually be tracked separately from online serving cost, because it belongs to the evaluation harness rather than the online memory system.
-
-### Derived metrics
+Derived:
 
 - `tokens_per_inserted_session`
 - `tokens_per_answered_query`
@@ -324,35 +218,17 @@ This should usually be tracked separately from online serving cost, because it b
 - `token_reduction_ratio_vs_baseline`
 - `write_tokens_vs_read_tokens_ratio`
 
-## 6.3 Correctness guardrails
-
-Even though the focus is performance, the benchmark still needs correctness guardrails so that speedups and token savings remain interpretable.
-
-Recommended metrics:
-
-- end-to-end answer correctness
-- retrieval `Recall@k`
-- retrieval `NDCG@k`
-- per-question-type accuracy
-- accuracy under load
-
-LongMemEval’s paper and code explicitly support retrieval-oriented evaluation in addition to final answer evaluation.[^1][^2]
-
-## 6.4 Freshness and stream-specific metrics
-
-These are especially important for a streaming memory system.
+### 3) Freshness and Stream Metrics
 
 - `memory_visible_after_ms`
 - `update_visible_after_ms`
 - `staleness_lag_ms`
 - `queries_answered_with_stale_memory`
 - `late_event_count`
-- `watermark_delay_ms` (if your system uses watermark semantics)
+- `watermark_delay_ms` (if applicable)
 - `compaction_lag_ms`
 
-## 6.5 Prompt redundancy and waste metrics
-
-Because you want to log every final generated prompt, you should also quantify prompt waste.
+### 4) Prompt Redundancy Metrics
 
 - `final_prompt_tokens`
 - `retrieved_memory_tokens`
@@ -365,192 +241,11 @@ Because you want to log every final generated prompt, you should also quantify p
 
 ---
 
-## 7. Recommended Observability Stack
+## Logging and Artifact Schemas
 
-A stream-based memory system should be observable by design.
+### Prompt Log (Mandatory)
 
-I recommend the following stack:
-
-- **OpenTelemetry** for instrumentation and spans
-- **Prometheus** for metrics collection and time-series analysis
-- **Jaeger** for distributed trace visualization
-
-### 7.1 Why OpenTelemetry
-
-The OpenTelemetry Python documentation explicitly defines instrumentation as the act of adding observability code yourself, using the SDK and API to emit telemetry from your application.[^3]
-
-That makes it a strong fit for a custom stream-processing memory system where you want explicit spans around stages like:
-
-- append ingestion
-- fact extraction
-- summarization
-- embedding
-- index write
-- retrieval
-- reranking
-- prompt assembly
-- generation
-
-### 7.2 Why Prometheus
-
-Prometheus uses a multi-dimensional data model where every time series is identified by a metric name and key-value labels.[^4][^5]
-
-That is ideal for slicing benchmark metrics by:
-
-- user
-- tenant
-- model
-- GPU
-- provider
-- stage
-- workload mode
-- question type
-
-### 7.3 Why Jaeger
-
-Jaeger is an open-source distributed tracing system used to monitor workflows, identify bottlenecks, track root causes, and analyze service dependencies.[^6]
-
-That makes it especially useful when requests flow through multiple components, such as:
-
-- replay driver
-- memory writer
-- summarization model
-- embedding service
-- vector index
-- reader model
-- evaluation service
-
----
-
-## 8. A Practical Span Model for Profiling
-
-I recommend two root trace types.
-
-## 8.1 Append trace
-
-Each memory insertion event should generate a root span such as:
-
-- `append_root`
-  - `parse_session`
-  - `extract_facts`
-  - `summarize_session`
-  - `embed_memory`
-  - `write_index`
-  - `optional_compaction`
-
-## 8.2 Query trace
-
-Each user question should generate a root span such as:
-
-- `query_root`
-  - `retrieve_memory`
-  - `rerank_memory`
-  - `assemble_prompt`
-  - `llm_generate`
-  - `postprocess`
-  - `evaluate_answer`
-
-## 8.3 Span attributes that should always exist
-
-At minimum:
-
-- `trace_id`
-- `user_id`
-- `tenant_id`
-- `session_id`
-- `question_id`
-- `question_type`
-- `model_name`
-- `provider`
-- `gpu_id`
-- `token_in`
-- `token_out`
-- `event_time`
-- `processing_time`
-- `workload_mode`
-
-This gives you the ability to diagnose not only whether the system is slow, but also:
-
-- which question types are slow
-- whether a specific model backend is the bottleneck
-- whether GPU placement matters
-- whether write-path or read-path dominates latency
-
----
-
-## 9. Local Execution, Multiple Models, Multiple GPUs
-
-The benchmark should not be tied to remote APIs.
-
-## 9.1 Why vLLM is a strong default for local serving
-
-vLLM provides an **OpenAI-compatible server**, which is ideal for unifying remote and local execution behind the same client interface.[^7]
-
-It also exposes metrics via a `/metrics` endpoint. The vLLM metrics documentation describes both:
-
-- **server-level metrics**
-- **request-level metrics**
-
-and earlier vLLM documentation explicitly notes that the OpenAI-compatible server exposes metrics through `/metrics`.[^8][^9]
-
-This makes vLLM a strong fit for:
-
-- local open-weight readers
-- local summarization/extraction models
-- token accounting and request telemetry
-- Prometheus-based monitoring
-
-## 9.2 Why Ray Serve is a strong outer orchestration layer
-
-Ray Serve supports multi-model serving, autoscaling, and model multiplexing.[^10][^11]
-
-This is helpful when:
-
-- different stages use different models
-- multiple GPU pools exist
-- sparse traffic should share replicas efficiently
-- the benchmark needs to scale from single-node to multi-node serving
-
-## 9.3 Recommendation
-
-Do **not** write a scheduler from scratch at the beginning.
-
-Instead:
-
-- define a unified provider interface for generation and embedding
-- use hosted APIs when needed
-- use **vLLM** for local single-node serving
-- use **Ray Serve + vLLM** for multi-model, multi-GPU, or multi-node experiments
-
-That gives you a much cleaner experimental stack:
-
-- same workload format
-- same token ledger
-- same tracing pipeline
-- interchangeable execution backends
-
----
-
-## 10. Prompt Logging Should Be a First-Class Output
-
-You explicitly want to “log every final generated prompt” to observe patterns and redundancy. This is the right instinct.
-
-The benchmark should log the **exact final prompt** sent to the model, not just the prompt template name.
-
-Each prompt log entry should contain:
-
-- timestamp
-- trace id
-- user id
-- session id / question id
-- model and provider
-- retrieval candidates and scores
-- final rendered prompt text
-- token counts
-- prompt hash
-- normalized prompt hash
-
-### Suggested prompt log schema
+Each final prompt record should include at least:
 
 ```json
 {
@@ -573,207 +268,135 @@ Each prompt log entry should contain:
 }
 ```
 
-### Why this matters
+### Run Artifacts (Mandatory)
 
-It enables several useful analyses:
+1. benchmark definition (`workload/replay/model/system config`)
+2. per-event runtime log (`jsonl`)
+3. metrics export (`timeseries`)
+4. prompt log (`full prompt + hashes`)
+5. optional trace export (`otlp/jaeger`)
 
-- whether the same memory chunks recur across many requests
-- whether templates are consistently overlong
-- whether retrieval repeatedly brings back overlapping evidence
-- whether token-saving optimizations reduce real prompt redundancy or merely shift it elsewhere
+### Minimal Benchmark Config Schema
 
----
-
-## 11. The Benchmark Harness Should Add a Workload Trace Layer
-
-A clean design is to keep the original LongMemEval sample untouched and add a wrapper object.
-
-### Suggested structure
-
-```json
-{
-  "instance_id": "longmemeval_m_00123",
-  "user_id": "u_0042",
-  "benchmark_source": "longmemeval_m_cleaned",
-  "semantic_instance": {
-    "question_id": "...",
-    "question_type": "...",
-    "question": "...",
-    "answer": "...",
-    "question_date": "...",
-    "haystack_session_ids": ["s1", "s2"],
-    "haystack_dates": ["...", "..."],
-    "haystack_sessions": [[...], [...]],
-    "answer_session_ids": ["s2"]
-  },
-  "event_trace": [
-    {
-      "event_id": "e1",
-      "event_type": "append_session",
-      "session_id": "s1",
-      "event_time": "2025-01-01T10:00:00Z",
-      "replay_time_ms": 0
-    },
-    {
-      "event_id": "e2",
-      "event_type": "append_session",
-      "session_id": "s2",
-      "event_time": "2025-01-05T12:00:00Z",
-      "replay_time_ms": 20
-    },
-    {
-      "event_id": "eq",
-      "event_type": "query",
-      "question_id": "...",
-      "event_time": "2025-02-01T09:00:00Z",
-      "replay_time_ms": 1000
-    }
-  ],
-  "workload_meta": {
-    "mode": "terminal",
-    "tenant_id": "tenant_a",
-    "arrival_policy": "poisson",
-    "priority": "normal"
-  }
-}
+```yaml
+benchmark:
+  track_id: track_a
+  dataset_id: longmemeval_s_cleaned
+  replay_policy:
+    users: 64
+    tenants: 8
+    arrival: poisson
+    time_scale: 20x
+  metric_profile:
+    perf_cost_core: true
+    quality_guardrail: true
+  report_scope: within_track
 ```
 
-This structure preserves compatibility while giving you the systems metadata you actually need.
+---
+
+## Roadmap
+
+### v1 (Now)
+
+Deliver Track A only:
+
+- LongMemEval apples-to-apples runs
+- perf/cost core + quality guardrail
+- stable artifact pipeline
+
+### v2 (After v1)
+
+Implement Track C using protocol frozen in this doc:
+
+1. FNSPID-aligned financial/news monitoring workload
+2. MiDe22-aligned event monitoring workload
+
+Optional later expansion:
+
+1. StreamBench subsets
+2. MemoryArena subsets
+3. LogHub / GDELT stress tracks (with label augmentation where needed)
 
 ---
 
-## 12. Suggested Output Artifacts from Each Run
+## Reporting and Validity Rules
 
-Each benchmark run should emit at least four artifacts.
-
-## 12.1 Benchmark definition
-
-- workload config
-- replay config
-- model config
-- system config
-
-## 12.2 Per-event runtime log
-
-This should be an append-only JSONL file containing:
-
-- event ids
-- timestamps
-- stage latencies
-- token counts
-- resource identifiers
-- trace ids
-- correctness outputs
-
-## 12.3 Metrics backend outputs
-
-- Prometheus metrics scrape data
-- Grafana dashboards if desired
-
-## 12.4 Prompt logs
-
-- every final prompt
-- prompt hashes
-- normalized hashes
-
-Optional fifth artifact:
-
-## 12.5 Trace export
-
-- Jaeger traces or OTLP-exported spans for deep profiling
+1. Report results **within each track**. Do not combine Track A/B/C into one headline score.
+2. Separate online serving cost from offline judging/evaluation cost.
+3. Record metrics by:
+   - `track_id`
+   - `dataset_id`
+   - `workflow`
+   - `stage`
+   - `model/provider`
+   - `run_id`
+4. Explicitly disclose:
+   - `task drift`
+   - `label drift`
+   - `workload drift`
 
 ---
 
-## 13. A Minimal MVP Plan
+## Appendix A: Suggested Observability Stack (Non-Binding)
 
-A sensible implementation strategy is to build this in three phases.
+This section is guidance, not a mandatory requirement.
 
-## Phase 1: Single-node benchmark MVP
+1. OpenTelemetry for stage spans and trace propagation.
+2. Prometheus for metric collection.
+3. Jaeger or OTLP backend for distributed trace analysis.
 
-Goal: validate the end-to-end benchmark architecture.
+Suggested root spans:
 
-Recommended setup:
+1. `append_root`
+   - `parse_session`
+   - `extract_facts`
+   - `summarize_session`
+   - `embed_memory`
+   - `write_index`
+2. `query_root`
+   - `retrieve_memory`
+   - `rerank_memory`
+   - `assemble_prompt`
+   - `llm_generate`
+   - `evaluate_answer`
 
-- `LongMemEval-S`
-- replay wrapper with multiple users
-- one local vLLM server or one hosted API backend
-- token accounting
-- OpenTelemetry spans
-- Prometheus metrics
-- full prompt logging
+Suggested standard span attributes:
 
-Questions to answer in this phase:
-
-- Is the benchmark harness stable?
-- Are stage-level metrics recorded correctly?
-- Are prompt logs informative?
-- Is the token ledger complete enough for later optimization studies?
-
-## Phase 2: Streaming semantics and freshness
-
-Goal: make the benchmark truly suitable for a Flink-like memory system.
-
-Add:
-
-- dual/triple time semantics
-- update-sensitive query mode
-- watermark/late-event handling if relevant
-- freshness and staleness metrics
-- optional background compaction events
-
-Questions to answer in this phase:
-
-- How long does it take for memory updates to become visible?
-- Does the system answer with stale memory under burst load?
-- How does event-time logic behave under processing backlog?
-
-## Phase 3: Multi-model, multi-GPU, scaling experiments
-
-Goal: stress the serving and scheduling layer.
-
-Add:
-
-- Ray Serve orchestration
-- multiple model types for different stages
-- multiple GPUs / nodes
-- autoscaling and model multiplexing where appropriate
-
-Questions to answer in this phase:
-
-- How does throughput scale with more replicas or GPUs?
-- Is the bottleneck in memory insertion, retrieval, or final generation?
-- Which models dominate latency and token cost?
+- `trace_id`
+- `user_id`
+- `tenant_id`
+- `session_id`
+- `question_id`
+- `question_type`
+- `model_name`
+- `provider`
+- `token_in`
+- `token_out`
+- `event_time`
+- `processing_time`
+- `workload_mode`
 
 ---
 
-## 14. Bottom-Line Recommendations
+## Appendix B: Execution Backend Notes (Non-Binding)
 
-If the goal is to benchmark a stream-based agent memory system, my recommendations are:
+The benchmark protocol is backend-agnostic. Typical practical setup options:
 
-1. **Use LongMemEval as the semantic workload source, not as the entire systems benchmark.**[^1][^2]
-2. **Add a systems replay layer with multiple users, event traces, and configurable arrival models.**
-3. **Treat time seriously** by separating event time, replay time, and processing time.
-4. **Record token usage at every stage** so that future token-saving optimizations remain interpretable.
-5. **Make observability first-class** with OpenTelemetry, Prometheus, and Jaeger.[^3][^4][^6]
-6. **Log every final generated prompt**, including hashes and retrieval payload metadata.
-7. **Prefer vLLM for local serving** and **Ray Serve for higher-level orchestration**, rather than writing a scheduler from scratch.[^7][^8][^10][^11]
+1. hosted APIs for quick baseline runs
+2. local vLLM for open-weight local serving
+3. ray-serve-like orchestration for multi-model/multi-gpu experiments
 
-In one sentence:
-
-> Build a **systems benchmark harness on top of LongMemEval** that combines semantic correctness, streaming replay, stage-level token accounting, distributed tracing, and pluggable local/API model execution.
+These are implementation options, not benchmark-defining requirements.
 
 ---
 
 ## References
 
-[^1]: Di Wu et al., *LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory*, arXiv:2410.10813. https://arxiv.org/abs/2410.10813
-[^2]: LongMemEval GitHub repository and dataset schema documentation. https://github.com/xiaowu0162/LongMemEval
-[^3]: OpenTelemetry Python instrumentation documentation. https://opentelemetry.io/docs/languages/python/instrumentation/
-[^4]: Prometheus data model documentation. https://prometheus.io/docs/concepts/data_model/
-[^5]: Prometheus overview. https://prometheus.io/docs/introduction/overview/
-[^6]: Jaeger documentation. https://www.jaegertracing.io/docs/latest/
-[^7]: vLLM OpenAI-compatible server documentation. https://docs.vllm.ai/en/v0.8.3/serving/openai_compatible_server.html
-[^8]: vLLM metrics documentation. https://docs.vllm.ai/en/stable/design/metrics/
-[^9]: vLLM production metrics documentation. https://docs.vllm.ai/en/v0.6.3/serving/metrics.html
-[^10]: Ray Serve overview and documentation. https://docs.ray.io/en/latest/serve/index.html
-[^11]: Ray Serve model multiplexing documentation. https://docs.ray.io/en/latest/serve/model-multiplexing.html
+1. LongMemEval: https://github.com/xiaowu0162/LongMemEval
+2. LoCoMo: https://github.com/snap-research/locomo
+3. Continuous Prompts: https://arxiv.org/abs/2512.03389
+4. StreamBench: https://arxiv.org/abs/2406.08747
+5. MemoryArena: https://arxiv.org/abs/2602.16313
+6. LogHub: https://github.com/logpai/loghub
+7. GDELT: https://www.gdeltproject.org/data.html
